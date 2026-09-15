@@ -76,6 +76,7 @@ import {
   shouldFlushSilence,
   shouldListen,
   showsHearing,
+  statusPill,
   utteranceFrom,
   type ListenPath,
   type SpeechRecognitionLike,
@@ -669,15 +670,15 @@ export function LiveHub({
   const [hearing, setHearing] = useState(0)
   // When the person was last audibly talking, or `null` while the microphone
   // is shut. Written from the same place `level` is, and read only through
-  // `showsHearing` — the hold it feeds is what keeps the hearing panel and the
+  // `showsHearing` — the hold it feeds is what keeps the status pill and the
   // header aperture steady across a sentence instead of blinking once per
   // segment (mesa task 1073).
   const [voicedAt, setVoicedAt] = useState<number | null>(null)
-  // What actually drops the panel when the person goes quiet. `showsHearing`
+  // What actually drops the pill when the person goes quiet. `showsHearing`
   // is still the rule — this only guarantees a render at the moment its hold
   // clause goes false, because nothing else will: `setLevel` bails out on an
   // unchanged value, so a stream of digital silence (muted hardware, or a
-  // synthetic all-zero buffer) renders nothing at all and the panel would
+  // synthetic all-zero buffer) renders nothing at all and the pill would
   // stay latched open, the same bug we are fixing turned the other way
   // round. It re-arms on every newer stamp, which is cheap now the stamp
   // rides the meter's throttle, and the `at === voicedAt` guard means a
@@ -1507,7 +1508,7 @@ export function LiveHub({
       // And so does the hold (mesa task 1073). The effect below drops a stale
       // stamp on its own clock, but a torn-down capture — mesa speaking, a
       // pause, a mute, the conversation ending — is not a hold running out,
-      // it is the microphone closing, and the panel goes with it immediately
+      // it is the microphone closing, and the pill goes with it immediately
       // rather than a second later.
       setVoicedAt(null)
       node?.port.close?.()
@@ -2145,8 +2146,8 @@ export function LiveHub({
   // Whether the person is being heard right now — the recording so far, a
   // segment still on its way back from `auris`, or a frame audible recently
   // enough to still count (mesa task 1073). One predicate, `showsHearing`,
-  // for both this and the panel under the transcript, because they are the
-  // same question asked twice.
+  // for both this and the status pill above the composer, because they are
+  // the same question asked twice.
   //
   // The hold is what this used to be missing. `level >= onsetRms` is a single
   // audio frame, so it chattered between syllables, and the two signals it
@@ -2215,15 +2216,42 @@ export function LiveHub({
     draft,
     error: actionError,
   })
-  // What mesa is saying *right now*, for the preview panel above the composer.
-  // `sounding` is a ref because the run advances from a media event, ahead of
-  // any render — but `speaking` is state, set from the element's own `playing`
-  // and cleared everywhere the ref is, so a render that sees `speaking` sees a
-  // ref that has already been written.
+  // Whether mesa is saying something *right now*, for the status pill above
+  // the composer. `sounding` is a ref because the run advances from a media
+  // event, ahead of any render — but `speaking` is state, set from the
+  // element's own `playing` and cleared everywhere the ref is, so a render
+  // that sees `speaking` sees a ref that has already been written.
   const speakingTurn = speaking
     ? (turns.find((turn) => turn.id === sounding.current) ?? null)
     : null
   const speakingText = speakingTurn === null ? null : spokenText(speakingTurn)
+  // The one line above the composer (mesa task 1153, replacing task 1069's
+  // preview panel — which showed the words in flight, but at a fixed height
+  // that hid the end of them). `showsHearing` is the same visibility rule the
+  // panel had, hold included (mesa task 1073): none of the three raw signals
+  // covers the person's *first* sentence, which is heard for at least the
+  // VAD's hangover before a segment exists to be in flight, so a pill on the
+  // raw signals would appear only once a segment was posted and vanish again
+  // at every boundary. The hold off the last audible frame is what makes it
+  // steady, and it still drops when they go quiet: the timer beside
+  // `voicedAt`'s state clears the stamp exactly when the hold runs out, and
+  // the capture effect's cleanup clears it the moment the microphone closes.
+  const pill = statusPill({
+    speaking: speakingText !== null,
+    heard: showsHearing({
+      recording,
+      interim,
+      hearing,
+      voicedAt,
+      now: Date.now(),
+      holdMs: HEARING_HOLD_MS,
+    }),
+    // One-shot transcription has no partial result to show mid-segment
+    // (mesa task 957), so the note while a segment is on its way back from
+    // `auris` is the sign anything is happening; the browser path's own
+    // interim guess is the same sign, and reads as plain hearing.
+    transcribing: interim === '' && hearing > 0,
+  })
 
   return (
     <div className="live-hub">
@@ -2496,75 +2524,28 @@ export function LiveHub({
                 )}
               </div>
 
-              {/* What is being said right now, by whichever side is saying
-                  it (mesa task 1069) — one panel between the settled
-                  transcript and the box, since at any moment there is at most
-                  one thing in flight. mesa's own line ranks above the
-                  recording for `liveIndicator.ts`'s reason: while she speaks
-                  the microphone is shut, so a panel claiming to be hearing the
-                  person would be describing a microphone that is not open. */}
-              {speakingText !== null ? (
-                <div className="live-preview live-preview-mesa">
-                  <div className="live-preview-label">mesa</div>
-                  <div className="live-preview-body">{speakingText}</div>
-                </div>
-              ) : (
-                showsHearing({
-                  recording,
-                  interim,
-                  hearing,
-                  voicedAt,
-                  now: Date.now(),
-                  holdMs: HEARING_HOLD_MS,
-                }) && (
-                  /* The recording (task 889): every settled sentence since the
-                     switch went on, with whatever the engine is still guessing
-                     at on the end of it. Shown together because they are one
-                     thing to the person — what mesa will be told when they stop
-                     listening — and shown at all because a microphone recording
-                     out of sight is the thing this must never be.
-
-                     Shown on `showsHearing` (mesa task 1073) rather than on the
-                     three raw signals: none of them covers the person's *first*
-                     sentence, which is heard for at least the VAD's hangover
-                     before a segment exists to be in flight, so the panel used
-                     to appear only once a segment was posted and vanish again
-                     at every boundary. The hold off the last audible frame is
-                     what makes it steady, and it still drops when they go
-                     quiet: the timer beside `voicedAt`'s state clears the
-                     stamp exactly when the hold runs out, and the capture
-                     effect's cleanup clears it the moment the microphone
-                     closes. */
-                  <div className="live-preview live-preview-hearing">
-                    <div className="live-preview-label">hearing</div>
-                    <div className="live-preview-body">
-                      {recording}
-                      {recording !== '' && (interim !== '' || hearing > 0) ? ' ' : ''}
-                      {/* One live region, fed by whichever path is running
-                          (mesa task 957): the browser path's real interim guess
-                          (`interim !== ''`), or, since one-shot transcription
-                          has no partial result to show mid-segment, an
-                          in-flight note while a segment is on its way back from
-                          `auris` (`hearing > 0`). Either way it is announced
-                          once, while it is still news, for the same reason the
-                          original recognizer's guess was: a recording sitting
-                          on screen with no visible sign anything is happening
-                          reads as broken. */}
-                      {interim !== '' && (
-                        <span className="live-guessing" aria-live="polite">
-                          {interim}
-                        </span>
-                      )}
-                      {interim === '' && hearing > 0 && (
-                        <span className="live-guessing" aria-live="polite">
-                          transcribing…
-                        </span>
-                      )}
-                      <span className="live-caret" aria-hidden="true" />
-                    </div>
-                  </div>
-                )
-              )}
+              {/* What is happening right now, in one word or two (mesa task
+                  1153) — one pill between the settled transcript and the box,
+                  since at any moment there is at most one thing in flight.
+                  `statusPill` ranks mesa's own line above the person being
+                  heard for `liveIndicator.ts`'s reason: while she speaks the
+                  microphone is shut. The row is always rendered, at a fixed
+                  height, with the text hidden rather than the element gone:
+                  the composer must not jump as the pill comes and goes, and a
+                  live region that is *mounted* when its text changes is
+                  announced where a freshly mounted one often is not. */}
+              <div
+                className={`live-status-pill${
+                  pill === 'mesa speaking'
+                    ? ' live-status-mesa'
+                    : pill !== null
+                      ? ' live-status-hearing'
+                      : ''
+                }`}
+                aria-live="polite"
+              >
+                {pill ?? ''}
+              </div>
 
               <form
                 className="live-composer"

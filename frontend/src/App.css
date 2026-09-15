@@ -9497,91 +9497,33 @@ button:focus-visible,
   gap: 0.35rem;
 }
 
-/* What is being said right now (mesa task 1069), by whichever side is saying
-   it: the recording the microphone is holding, or the line mesa is speaking.
-   Its own panel between the settled transcript and the box, rather than the
-   loose text under the box it used to be — this is the one thing on the panel
-   that is still in flight, and it reads at the size a person glances at
-   rather than at caption size. The 10px chamfer, not the small one: it is a
-   panel, the same kind of box the transcript is. */
-.live-preview {
+/* What is happening right now (mesa task 1153), in one line: "mesa speaking",
+   "transcribing…" or "hearing", between the settled transcript and the box.
+   It replaces task 1069's preview panel, which showed the words in flight at
+   a fixed height that hid the end of them; the words are the transcript's
+   business once they settle, and this row only has to answer "is anything
+   happening". The height is reserved whether or not there is a word in it —
+   `min-height` on a row that is always rendered — so the composer never
+   jumps as the state comes and goes. Caption size and letter-spaced, the
+   voice of the panel's own labels. */
+.live-status-pill {
   flex: none;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  padding: 14px;
-  clip-path: var(--cut);
-  background: var(--panel);
-}
-
-/* Green while the microphone is holding it, cyan while mesa is saying it —
-   the two colours this surface already means by "the person" and "mesa". */
-.live-preview-hearing {
-  border: 1px solid rgba(43, 255, 156, 0.35);
-}
-
-.live-preview-mesa {
-  border: 1px solid rgba(0, 229, 255, 0.3);
-}
-
-.live-preview-label {
+  min-height: 20px;
+  line-height: 20px;
   font-size: 11px;
   letter-spacing: 1.6px;
   text-transform: uppercase;
+  color: var(--muted);
 }
 
-.live-preview-hearing .live-preview-label {
+/* Green while the microphone is the side at work, cyan while mesa is — the
+   two colours this surface already means by "the person" and "mesa". */
+.live-status-hearing {
   color: var(--green);
 }
 
-.live-preview-mesa .live-preview-label {
+.live-status-mesa {
   color: var(--cyan);
-}
-
-/* The recording (mesa tasks 873, 889): what the microphone has heard since the
-   switch went on, and what will be sent as one turn when it goes off. Upright
-   and in the bright text colour, because it *is* what was said — and capped
-   in height with its own scroll, since a recording runs for as long as the
-   person talks and must not push the capture box off the panel. */
-.live-preview-body {
-  font-size: 15px;
-  line-height: 1.6;
-  color: var(--text-h);
-  max-height: 8rem;
-  overflow-y: auto;
-  overflow-wrap: anywhere;
-}
-
-/* The blinking end of the line: the cheapest possible sign that this text is
-   still being added to, where the words themselves may sit unchanged for a
-   second at a time. Decoration — `aria-hidden` in the markup — so it is
-   allowed to be nothing but a rectangle. */
-.live-caret {
-  display: inline-block;
-  width: 1px;
-  height: 16px;
-  margin-left: 3px;
-  vertical-align: -3px;
-  background: var(--cyan);
-  animation: live-caret 1.1s step-end infinite;
-}
-
-@keyframes live-caret {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0;
-  }
-}
-
-/* Nothing in this panel is worth motion sickness: the caret simply stands
-   still, which still marks the end of the line. */
-@media (prefers-reduced-motion: reduce) {
-  .live-caret {
-    animation: none;
-  }
 }
 
 /* The box and the switch, on one line (mesa task 1069). */
@@ -9632,16 +9574,6 @@ button:focus-visible,
   flex: 1 1 100%;
   min-width: 0;
   font-size: 0.75rem;
-}
-
-/* The provisional tail of the recording (mesa task 956): once the recognizer's
-   own live guess, now either an in-flight "transcribing…" note while a
-   segment is on its way back from `auris`, or the rare non-empty `interim`
-   this component still carries for `heldFlush`'s sake. Italic and muted so it
-   reads as provisional next to the sentences before it, which are settled. */
-.live-guessing {
-  font-style: italic;
-  color: var(--muted);
 }
 
 /* Phone: the panel becomes a drawer, and the header is allowed to wrap
@@ -9773,10 +9705,6 @@ button:focus-visible,
 
   .live-transcript {
     padding: 0.5rem;
-  }
-
-  .live-preview {
-    padding: 10px;
   }
 
   /* Below the phone tier the name and description always stack, whatever

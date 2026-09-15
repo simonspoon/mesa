@@ -18,6 +18,7 @@ import {
   shouldFlushSilence,
   shouldListen,
   showsHearing,
+  statusPill,
   soundKey,
   utteranceFrom,
   type RecognitionResult,
@@ -641,5 +642,30 @@ describe('showsHearing', () => {
 
   it('shows nothing when nothing is being heard', () => {
     expect(showsHearing(base)).toBe(false)
+  })
+})
+
+describe('statusPill', () => {
+  it('says mesa is speaking, over anything the microphone claims', () => {
+    // The microphone is shut while she talks, so "hearing" would be
+    // describing a microphone that is not open.
+    expect(statusPill({ speaking: true, heard: false, transcribing: false })).toBe('mesa speaking')
+    expect(statusPill({ speaking: true, heard: true, transcribing: true })).toBe('mesa speaking')
+  })
+
+  it('says transcribing while a finished segment is in flight', () => {
+    expect(statusPill({ speaking: false, heard: true, transcribing: true })).toBe('transcribing…')
+  })
+
+  it('says hearing while the person is talking and nothing is in flight', () => {
+    expect(statusPill({ speaking: false, heard: true, transcribing: false })).toBe('hearing')
+  })
+
+  it('says nothing when nothing is happening', () => {
+    expect(statusPill({ speaking: false, heard: false, transcribing: false })).toBeNull()
+    // A segment cannot be in flight without the person counting as heard —
+    // `showsHearing` returns true for `hearing > 0` — but the pill still
+    // reads `heard` alone rather than inferring it.
+    expect(statusPill({ speaking: false, heard: false, transcribing: true })).toBeNull()
   })
 })

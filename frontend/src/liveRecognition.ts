@@ -314,6 +314,30 @@ export function showsHearing(input: {
 }
 
 /**
+ * What the one-line status pill above the composer says (mesa task 1153) —
+ * or `null` for nothing, which the pill renders as an empty row of the same
+ * height, so the composer never jumps as the state comes and goes.
+ *
+ * The ranking is `liveIndicator.ts`'s: mesa speaking outranks the person
+ * being heard, because the microphone is shut while she talks, so a pill
+ * claiming to be hearing the person would be describing a microphone that is
+ * not open. Under that, "transcribing…" while a finished segment is on its
+ * way back from `auris` (one-shot transcription has nothing to show
+ * mid-segment, so the note is the sign anything is happening), else plain
+ * "hearing" — `heard` being `showsHearing`'s verdict, hold included, so the
+ * pill is as steady across a sentence as the panel it replaced.
+ */
+export function statusPill(input: {
+  speaking: boolean
+  heard: boolean
+  transcribing: boolean
+}): 'mesa speaking' | 'transcribing…' | 'hearing' | null {
+  if (input.speaking) return 'mesa speaking'
+  if (!input.heard) return null
+  return input.transcribing ? 'transcribing…' : 'hearing'
+}
+
+/**
  * Whether an error the engine reported is the end of listening for this page,
  * or one of the ordinary interruptions it recovers from.
  *

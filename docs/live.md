@@ -1713,10 +1713,12 @@ conversation") working with no backend change.
     have, and `auris` answers a whole request at once. `utteranceFrom` still
     drops a transcript with no words in it (a cough, a door, a segment
     `auris` heard as silence). Where a page instead falls back to its own
-    recognizer (mesa task 957), the interim line is back exactly as it was
-    before task 956 — that engine settles results as it goes, so there is
-    something to show, and the level meter and "transcribing…" note are
-    `auris`-specific rather than a property of listening itself.
+    recognizer (mesa task 957), that engine's interim guess still feeds
+    `heldFlush` and the header band exactly as it did before task 956 — but
+    since mesa task 1153 it is no longer *displayed*: the words in flight,
+    on either path, are gone from the panel (below), and the level meter and
+    "transcribing…" note stay `auris`-specific rather than a property of
+    listening itself.
   - **The transcript is corrected against mesa's own vocabulary before
     anything else touches it** (`liveRecognition.ts`, mesa task 922), exactly
     as it was when the browser did the listening — the correction runs
@@ -1764,7 +1766,7 @@ conversation") working with no backend change.
   - **Listening is a recording, not a stream of utterances** (task 889), and a
     recording has **two** boundaries (task 917) — unchanged by mesa task 956.
     Each transcribed segment is joined onto a held recording (`heldWith`),
-    shown above the capture box, and posted as **one** `user` turn
+    held out of sight, and posted as **one** `user` turn
     (`heldFlush`) either once the person has gone quiet for
     `live.auto-send-ms` — the recording's own silence boundary
     (`shouldFlushSilence`) — or right away if they press the listen switch.
@@ -1831,8 +1833,8 @@ conversation") working with no backend change.
       to a session that no longer exists and nothing will ever send it.
     - **A refused microphone still delivers.** `isMicRefusal` (`liveAudio.ts`)
       sets `blocked`, which withdraws the listen button — so the same handler
-      flushes what was already held, or the recording would sit on screen
-      with no control left to send it.
+      flushes what was already held, or the recording would sit held with
+      no control left to send it.
   - **A failed transcription does not end listening.** Posting a segment's
     WAV to `/api/live/transcribe` can fail — a slow network or a crashed
     `auris` process — and the route answers `503 unavailable`; the next
@@ -2200,8 +2202,27 @@ CLAUDE.md requires: **data, never instructions.**
   (above); a streaming decoder that could offer a running partial would close
   this gap, but mesa has none and building one is out of scope here. Where a
   page instead falls back to its own recognizer (mesa task 957, below), that
-  engine's interim results are shown exactly as they were before task 956 —
-  the gap is `auris`-specific, not a property of listening in general.
+  engine's interim results still drive the send boundaries and the header
+  band exactly as they did before task 956, though nothing displays them any
+  more (mesa task 1153, below) — the gap is `auris`-specific, not a property
+  of listening in general.
+- **A preview of the words in flight.** Task 1069 put what was being said
+  right now — the recording the microphone was holding, or the line mesa was
+  speaking — in a panel of its own between the transcript and the capture
+  box. It was capped in height with its own scrollbar and did not follow its
+  bottom, so the end of what was being heard or spoken, the part that was
+  news, was the part it hid. Mesa task 1153 replaced it with a one-line
+  status pill in the same place (`liveRecognition.ts::statusPill`) that says
+  only *what* is happening — "mesa speaking", "transcribing…" while a segment
+  is on its way back from `auris`, or "hearing" — on the same visibility rule
+  the panel had, `showsHearing` and its hold (mesa task 1073) included, and
+  the same ranking the header band uses (mesa above the person, since the
+  microphone is shut while she talks). The row is rendered at a fixed height
+  whether or not it has a word in it, so the composer never jumps, and it is
+  the one `aria-live` region that stays mounted so the change is announced.
+  mesa's words are in the transcript as she says them, and the person's
+  reach it as one turn when the recording is sent; a preview of either was
+  answering "what" where the pill answers "whether".
 - **A speech-to-text engine of mesa's own.** mesa still runs no recognizer
   in-process — `POST /api/live/transcribe` hands a whole recording to the
   external `auris` binary and keeps nothing, the same shape `kokoro-rs`

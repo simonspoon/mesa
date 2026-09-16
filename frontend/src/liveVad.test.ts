@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_VAD, initialVad, vadCut, vadStep, type VadConfig, type VadState } from './liveVad'
+import { BARGE_IN_VAD, DEFAULT_VAD, initialVad, vadCut, vadStep, type VadConfig, type VadState } from './liveVad'
 
 const config: VadConfig = DEFAULT_VAD
 
@@ -105,5 +105,24 @@ describe('vadCut', () => {
     expect(vadCut(tooShort, custom)).toBeNull()
     const longEnough: VadState = { startedAt: 0, lastLoudAt: 1000 }
     expect(vadCut(longEnough, custom)).toEqual({ startedAt: 0, endedAt: 1000 })
+  })
+})
+
+describe('BARGE_IN_VAD', () => {
+  it('shares the levels and the too-short rule, and ends sooner and caps shorter', () => {
+    expect(BARGE_IN_VAD.onsetRms).toBe(DEFAULT_VAD.onsetRms)
+    expect(BARGE_IN_VAD.releaseRms).toBe(DEFAULT_VAD.releaseRms)
+    expect(BARGE_IN_VAD.minSpeechMs).toBe(DEFAULT_VAD.minSpeechMs)
+    expect(BARGE_IN_VAD.hangoverMs).toBeLessThan(DEFAULT_VAD.hangoverMs)
+    expect(BARGE_IN_VAD.maxSegmentMs).toBeLessThan(DEFAULT_VAD.maxSegmentMs)
+  })
+
+  it('ends a short phrase after its own hangover, not the default one', () => {
+    let state: VadState = initialVad()
+    state = vadStep(state, { rms: 0.05, at: 0 }, BARGE_IN_VAD).state
+    state = vadStep(state, { rms: 0.05, at: 500 }, BARGE_IN_VAD).state
+    expect(vadStep(state, { rms: 0, at: 500 + BARGE_IN_VAD.hangoverMs - 1 }, BARGE_IN_VAD).ended).toBeNull()
+    const ended = vadStep(state, { rms: 0, at: 500 + BARGE_IN_VAD.hangoverMs }, BARGE_IN_VAD).ended
+    expect(ended).toEqual({ startedAt: 0, endedAt: 500 })
   })
 })

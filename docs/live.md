@@ -2341,6 +2341,52 @@ conversation") working with no backend change.
   that button answers "is this conversation running", which pause does not
   change, and folding the two together would put "quiet for a minute" and
   "destroy the conversation" one mis-click apart.
+
+  **Pause by voice** (mesa task 1160). The same press fires when the person
+  *says* a short pause phrase — `pause`, `wait`, `wait a minute` / `second` /
+  `sec` / `moment`, `hold on`, `hold on a second` / `sec` / `minute` /
+  `moment`, `hold up` — optionally led by `mesa`, `hey mesa`, `okay` or `ok`
+  and trailed by `please`. The phrase is never sent to the agent and never
+  enters the held recording; **Resume stays a button**, and there is no agent
+  round trip of any kind. The detector is `livePausePhrase.ts::isPausePhrase`,
+  a pure whole-utterance match: the text is lower-cased, stripped of
+  punctuation and collapsed, then compared **as a whole** against that
+  grammar (lead-in, one trigger, tail; seven words at most). A sentence that
+  merely contains a trigger — "please don't pause the build", "I'll wait for
+  the tests", "hold up the release until Friday", "pause it and then run the
+  checks" — is ordinary speech and is held like any other. Both engines run
+  the check at the same point, after vocabulary correction and before
+  `mayHold`; a phrase heard while already paused is a no-op, and one whose
+  transcript resolves after the conversation has ended (a late final, or a
+  segment cut as the microphone closed) pauses nothing — the action is gated
+  on `live` at delivery time, so a stale phrase can never leave the *next*
+  conversation starting paused.
+
+  While mesa is **speaking**, the ordinary microphone is shut (`shouldListen`)
+  so she never hears her own reply — which also meant nothing said over her
+  could be heard, and "hold on" is exactly what a person says over her. So
+  the auris path runs a second, contained **barge-in** capture effect gated
+  on `shouldBargeIn` (`recognizesSpeech && speaking`, the exact complement of
+  `shouldListen`, so the two never overlap and each opens as the other
+  closes). It opens its own `getUserMedia` stream on the chosen device with
+  `echoCancellation`, `noiseSuppression` and `autoGainControl` set
+  explicitly — the main stream's constraints are untouched — runs the same
+  worklet and VAD with `BARGE_IN_VAD` (a 350 ms hangover and a 3 s cap, so
+  the whole trigger stays around a second), transcribes each segment through
+  `POST /api/live/transcribe` in order on its own promise (never the
+  recording's `SegmentChain`), and does **one** thing with the text: a pause
+  phrase pauses; anything else is dropped — never held, never sent, never
+  `markHeard`, never the level meter or the silence clock. A segment that
+  runs into the cap is dropped without transcribing. The echo posture is
+  those explicit constraints plus the whole-short-utterance rule: mesa's own
+  sentences are long, so a fragment that leaks past cancellation is not one
+  of these phrases. The pause itself is what ends the effect (`silence()`
+  clears `speaking`), and `paused` keeps the main microphone from reopening
+  in its place.
+
+  The browser-`SpeechRecognition` fallback has **no barge-in**: that
+  recognizer is torn down for the length of every reply, unchanged, so a
+  phrase is only detected while the page is listening between replies.
 - **`Listen` calls no route at all** — it exists purely to *be a gesture*, the
   thing a browser weighs its autoplay policy against, and it starts the run on
   whatever the conversation has already said. Two ordinary situations produce a

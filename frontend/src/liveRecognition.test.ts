@@ -16,6 +16,7 @@ import {
   recognitionCtor,
   recognizesSpeech,
   shouldFlushSilence,
+  shouldBargeIn,
   shouldListen,
   showsHearing,
   statusPill,
@@ -138,6 +139,48 @@ describe('recognizesSpeech', () => {
     const whileSpeaking = { ...open, speaking: true }
     expect(recognizesSpeech(whileSpeaking)).toBe(true)
     expect(shouldListen(whileSpeaking)).toBe(false)
+  })
+})
+
+describe('shouldBargeIn', () => {
+  const open = {
+    live: true,
+    joined: true,
+    supported: true,
+    blocked: false,
+    paused: false,
+    muted: false,
+    speaking: true,
+  } as const
+
+  it('opens exactly while the microphone is the way in and mesa is speaking', () => {
+    expect(shouldBargeIn(open)).toBe(true)
+    expect(shouldBargeIn({ ...open, speaking: false })).toBe(false)
+  })
+
+  it('is the complement of shouldListen over every input', () => {
+    // The two capture effects are gated on these two, so at most one of
+    // mesa's microphones is ever open.
+    for (const speaking of [true, false]) {
+      for (const paused of [true, false]) {
+        for (const muted of [true, false]) {
+          for (const live of [true, false]) {
+            const input = { ...open, speaking, paused, muted, live }
+            expect(shouldBargeIn(input) && shouldListen(input)).toBe(false)
+            expect(shouldBargeIn(input) || shouldListen(input)).toBe(recognizesSpeech(input))
+          }
+        }
+      }
+    }
+  })
+
+  it('never opens where the ordinary microphone would not', () => {
+    expect(shouldBargeIn({ ...open, live: false })).toBe(false)
+    expect(shouldBargeIn({ ...open, joined: false })).toBe(false)
+    expect(shouldBargeIn({ ...open, supported: false })).toBe(false)
+    expect(shouldBargeIn({ ...open, blocked: true })).toBe(false)
+    expect(shouldBargeIn({ ...open, paused: true })).toBe(false)
+    expect(shouldBargeIn({ ...open, muted: true })).toBe(false)
   })
 })
 

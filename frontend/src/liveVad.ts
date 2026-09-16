@@ -45,6 +45,21 @@ export const DEFAULT_VAD: VadConfig = {
 }
 
 /**
+ * The barge-in microphone's tuning (mesa task 1160): the same machine, run
+ * while mesa is speaking, listening for nothing but a short pause phrase.
+ * A shorter hangover ends the segment sooner after the last word, and a
+ * short maximum keeps the whole trigger — end of phrase, transcription,
+ * pause — around a second: anything that runs into the cap is not a pause
+ * phrase and is dropped untranscribed by the caller rather than cut and
+ * continued as `DEFAULT_VAD`'s cap is.
+ */
+export const BARGE_IN_VAD: VadConfig = {
+  ...DEFAULT_VAD,
+  hangoverMs: 350,
+  maxSegmentMs: 3000,
+}
+
+/**
  * How much audio before the onset rides along, so the first consonant is not
  * clipped — the caller (holding the rolling frame buffer) is what actually
  * applies this; the state machine itself only reports where speech began.

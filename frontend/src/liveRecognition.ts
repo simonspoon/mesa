@@ -235,6 +235,31 @@ export function shouldListen(input: {
 }
 
 /**
+ * Whether the **barge-in** microphone should be open right now (mesa task
+ * 1160) — the exact complement of `shouldListen` over the same inputs: the
+ * microphone is the way in *and* mesa is speaking. The two capture effects
+ * in `LiveHub` are gated on these two predicates, so at most one microphone
+ * of mesa's is ever open, and each opens the moment the other closes.
+ *
+ * What that microphone hears is used for one thing only: a spoken pause
+ * phrase (`livePausePhrase.ts`), so the person can stop mesa mid-sentence
+ * without reaching for the button. Anything else it hears is dropped — never
+ * held, never sent, never read as the person still talking — because while
+ * mesa is speaking the room contains her voice too.
+ */
+export function shouldBargeIn(input: {
+  live: boolean
+  joined: boolean
+  supported: boolean
+  blocked: boolean
+  paused: boolean
+  muted: boolean
+  speaking: boolean
+}): boolean {
+  return recognizesSpeech(input) && input.speaking
+}
+
+/**
  * Whether the recording should be sent because the person has gone quiet
  * (mesa task 917) — the second boundary a recording has, next to the listen
  * switch.

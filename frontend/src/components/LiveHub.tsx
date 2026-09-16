@@ -44,6 +44,7 @@ import {
 } from '../liveCapture'
 import { currentContext, sameContext, subscribeContext } from '../liveContext'
 import { mayHold, SegmentChain } from '../liveDrain'
+import { isPausePhrase } from '../livePausePhrase'
 import {
   audioInputs,
   chosenInput,
@@ -75,6 +76,7 @@ import {
   readResults,
   recognitionCtor,
   recognizesSpeech,
+  shouldBargeIn,
   shouldFlushSilence,
   shouldListen,
   showsHearing,
@@ -107,7 +109,7 @@ import {
   loadLiveSidebarWidth,
   saveLiveSidebarWidth,
 } from '../liveSidebarWidth'
-import { DEFAULT_VAD, initialVad, PRE_ROLL_MS, vadCut, vadStep } from '../liveVad'
+import { BARGE_IN_VAD, DEFAULT_VAD, initialVad, PRE_ROLL_MS, vadCut, vadStep } from '../liveVad'
 import {
   initialWatchdog,
   noticeInSpan,
@@ -1008,6 +1010,23 @@ export function LiveHub({
     setSpeaking(false)
   }, [releasePlayer])
 
+  /**
+   * The pause branch of `togglePause` (task 882), factored out because a
+   * spoken pause phrase (mesa task 1160, `livePausePhrase.ts`) performs the
+   * same press from inside a capture effect. Idempotent: a second "hold on"
+   * while already paused silences a player that is already silent and writes
+   * a `true` that is already there. The ref beside it is what the capture
+   * handlers call, since they fire long after the render that made it.
+   */
+  const pauseNow = useCallback(() => {
+    silence()
+    setPausedNow(true)
+  }, [silence, setPausedNow])
+  const pauseNowRef = useRef(pauseNow)
+  useEffect(() => {
+    pauseNowRef.current = pauseNow
+  }, [pauseNow])
+
   // ---- the keyboard (liveCapture.ts) ----
 
   // The one capture box, alive whether or not the panel shows: the closed
@@ -1199,6 +1218,18 @@ export function LiveHub({
       : DEFAULT_INPUT
 
   const wantsMic = shouldListen({
+    live,
+    joined: unlocked,
+    supported,
+    blocked,
+    paused,
+    muted,
+    speaking,
+  })
+  // The complement (mesa task 1160): the microphone is the way in *and* mesa
+  // is speaking. Gates the barge-in capture effect below, which hears the
+  // room for one thing only — a spoken pause phrase.
+  const wantsBargeIn = shouldBargeIn({
     live,
     joined: unlocked,
     supported,
@@ -1463,6 +1494,18 @@ export function LiveHub({
         // segment: the words it showed have just been recorded, and leaving
         // them under the box would read as a second sentence still coming.
         setInterimNow('')
+        // A spoken "hold on" is the Pause button, not a sentence for the
+        // agent (mesa task 1160): it is never held and never sent. Judged
+        // before `mayHold`, so a phrase is a no-op rather than a recording
+        // while already paused — and gated on the conversation still being
+        // live *at delivery*, the same refs `mayHold` reads, because this
+        // transcript may resolve after End (an `outlives` cut, most likely)
+        // and a pause written then would outlive the falling edge that
+        // clears it and start the next Go live silently paused.
+        if (isPausePhrase(text)) {
+          if (armed.current.live && !pausedRef.current) pauseNowRef.current()
+          return
+        }
         if (
           mayHold({
             live: armed.current.live,
@@ -1710,6 +1753,145 @@ export function LiveHub({
     }
   }, [wantsMic, transcribes, path, chosen, listInputs, markHeard, setInterimNow, setRecordingNow])
 
+  // Barge-in (mesa task 1160): the microphone while mesa is speaking. The
+  // effect above closes it for the length of every reply so she never hears
+  // herself, which also means nothing the person says over her can be heard
+  // — and "hold on" is exactly what a person says over her. This is a
+  // second, contained capture effect gated on `wantsBargeIn`, the exact
+  // complement of `wantsMic` (`shouldBargeIn` in `liveRecognition.ts`), so
+  // the two never run at once and each opens the moment the other closes.
+  //
+  // Everything about it is narrower than the effect above, on purpose:
+  //
+  // - It opens its **own** stream, with `echoCancellation`,
+  //   `noiseSuppression` and `autoGainControl` all set explicitly, because
+  //   the room contains mesa's own voice out of the speakers. The main
+  //   stream's constraints are untouched.
+  // - Its VAD is `BARGE_IN_VAD` — a shorter hangover and a 3s cap — so a
+  //   phrase is transcribed a beat after its last word, and a segment that
+  //   runs into the cap (a long sentence, or mesa's own reply leaking
+  //   through) is dropped **untranscribed** rather than cut and continued.
+  // - It does **one** thing with a transcript: `isPausePhrase` →
+  //   `pauseNow()`. Anything else is dropped — never held, never sent,
+  //   never `markHeard`, never the level meter, never the silence clock —
+  //   because nothing heard while mesa is speaking is a recording, and the
+  //   whole-short-utterance rule in `livePausePhrase.ts` is what keeps a
+  //   fragment of her sentence from ever matching.
+  // - Its segments transcribe in order on a run-local promise, not the
+  //   component's `SegmentChain`: that chain orders the *recording*, and
+  //   these segments never reach it.
+  // - A microphone failure here is silent. A refusal will be reported by the
+  //   main effect the moment she stops speaking, and a chosen device that
+  //   will not open falls back to the default once, exactly as it does there,
+  //   but with nothing to say about it.
+  //
+  // `pauseNow` itself is what ends this effect: `silence()` clears
+  // `speaking`, so `wantsBargeIn` goes false and the cleanup below runs, and
+  // `paused` keeps the main effect from reopening the microphone in its
+  // place.
+  useEffect(() => {
+    if (!wantsBargeIn || transcribes === null || path !== 'auris') return
+    let running = true
+    let stream: MediaStream | null = null
+    let ctx: AudioContext | null = null
+    let node: AudioWorkletNode | null = null
+    let source: MediaStreamAudioSourceNode | null = null
+    let blobUrl: string | null = null
+    let frames: CapturedFrame[] = []
+    let vad = initialVad()
+    let queue: Promise<void> = Promise.resolve()
+
+    const send = async (wav: Uint8Array) => {
+      try {
+        const { text: raw } = await transcribeAudio(toBase64(wav))
+        if (!running) return
+        const text = utteranceFrom(correctVocabulary(raw, vocabRef.current))
+        if (text !== null && isPausePhrase(text)) pauseNowRef.current()
+      } catch {
+        // Nothing to report: a segment that did not transcribe is a phrase
+        // that was not heard, and the button is still there.
+      }
+    }
+
+    const onFrame = (samples: Float32Array) => {
+      const at = Date.now()
+      frames.push({ at, samples })
+      const step = vadStep(vad, { rms: frameRms(samples), at }, BARGE_IN_VAD)
+      vad = step.state
+      if (step.ended !== null && ctx !== null) {
+        const { startedAt, endedAt } = step.ended
+        // Ran into the cap: not a pause phrase, whatever it was.
+        if (endedAt - startedAt < BARGE_IN_VAD.maxSegmentMs) {
+          const wav = wavFromFrames(frames, startedAt - PRE_ROLL_MS, endedAt, ctx.sampleRate)
+          if (wav.length > 44) queue = queue.then(() => send(wav))
+        }
+      }
+      frames = dropBefore(frames, (vad.startedAt ?? at) - PRE_ROLL_MS)
+    }
+
+    const open = async (deviceId: string) => {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          ...(deviceId === DEFAULT_INPUT ? {} : { deviceId: { exact: deviceId } }),
+        },
+      })
+      if (!running) {
+        stream.getTracks().forEach((t) => t.stop())
+        stream = null
+        return
+      }
+      try {
+        ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE })
+      } catch {
+        ctx = new AudioContext()
+      }
+      await ctx.resume()
+      if (!running) {
+        void ctx.close()
+        ctx = null
+        stream.getTracks().forEach((t) => t.stop())
+        stream = null
+        return
+      }
+      blobUrl = URL.createObjectURL(new Blob([PCM_WORKLET_SOURCE], { type: 'text/javascript' }))
+      await ctx.audioWorklet.addModule(blobUrl)
+      if (!running) return
+      node = new AudioWorkletNode(ctx, 'mesa-pcm')
+      source = ctx.createMediaStreamSource(stream)
+      source.connect(node)
+      node.port.onmessage = (e) => onFrame(e.data as Float32Array)
+    }
+
+    void (async () => {
+      try {
+        await open(chosen)
+      } catch {
+        if (!running || chosen === DEFAULT_INPUT) return
+        try {
+          await open(DEFAULT_INPUT)
+        } catch {
+          // Silent, see above.
+        }
+      }
+    })()
+
+    return () => {
+      running = false
+      // No `vadCut` here: an utterance still open when mesa stops speaking
+      // was not a short phrase that ended, and the main effect is opening
+      // its own microphone in this one's place.
+      node?.port.close?.()
+      node?.disconnect()
+      source?.disconnect()
+      void ctx?.close()
+      stream?.getTracks().forEach((t) => t.stop())
+      if (blobUrl) URL.revokeObjectURL(blobUrl)
+    }
+  }, [wantsBargeIn, transcribes, path, chosen])
+
   // The browser's own ears — this module's original path (mesa task 873),
   // restored rather than deleted by mesa task 956 and now the fallback for a
   // machine with no `auris` (mesa task 957): guarded on `path === 'browser'`
@@ -1862,6 +2044,17 @@ export function LiveHub({
           // event: the words it showed have just been recorded, and leaving
           // them under the box would read as a second sentence still coming.
           setInterimNow('')
+        }
+        // A spoken "hold on" is the Pause button, not a sentence for the
+        // agent (mesa task 1160) — the auris path's rule, applied to this
+        // engine's finals, with the same delivery-time gate: `stop()` can
+        // deliver this final after End, and a pause written then would start
+        // the next conversation paused. Only while listening: this engine is
+        // torn down for the length of every reply, so there is no barge-in
+        // here.
+        if (isPausePhrase(text)) {
+          if (armed.current.live && !pausedRef.current) pauseNowRef.current()
+          return
         }
         if (
           mayHold({
@@ -2260,8 +2453,7 @@ export function LiveHub({
    */
   function togglePause(button: LiveButton) {
     if (button.action === 'pause') {
-      silence()
-      setPausedNow(true)
+      pauseNow()
       return
     }
     setPausedNow(false)

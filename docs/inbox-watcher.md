@@ -59,11 +59,19 @@ tick constant. `--watch-inbox` alone never claims a task or dispatches
 `inbox_watcher_tick` in `src/api.rs`:
 
 - Lists the whole inbox (`Store::list_inbox_items(None)`), keeps the items
-  whose `kind` is `change-request` (mesa task 846 — a `task-summary` is an
+  that are **pending** — `api::inbox_item_pending`, the one definition: the
+  `kind` is `change-request` (mesa task 846 — a `task-summary` is an
   agent reporting to a person, so there is nothing to triage, and answering
   every close-out report with an agent is exactly what the kind exists to
   stop; the kind never changes, so the skip is permanent rather than a wait,
-  and a skipped item is not even claimed in the dedup set), then dispatches
+  and a skipped item is not even claimed in the dedup set) **and** the item is
+  not archived (mesa task 1192 — archiving with a reason is the triage
+  agent's own verdict on a duplicate, shipped or non-actionable request, and
+  the listing still carries the row; before this check the dispatch read
+  every listed change request as pending and only the in-memory dedup set
+  below held the archived ones back, which every server restart empties, so
+  every restart re-triaged every archived request; an un-archived item is
+  pending again and is picked up) — then dispatches
   **every** one of those this process has not already dispatched — all of them
   in the same tick. Unlike the todo watcher, which is naturally capped at one
   agent per project, the inbox is one **global** queue with no per-project
@@ -122,12 +130,50 @@ Without the set, that item would respawn an agent every tick, forever.
   would need a schema migration to store state about an entity whose whole
   design is "an item *is* the record".
 
+## The reaper — stopping a triage session once its item is triaged
+
+A triage session used to be never stopped (mesa task 1192): the watcher only
+ever started agents, so a session that had archived or assigned its item sat
+idle for hours per item. It is now reaped by the **todo-watcher's reaper**
+(`todo_reaper_tick`, mesa task 1057, `docs/todo-watcher.md`) — the same
+mechanism, not a second one. A successful dispatch records the short job id
+off `claude --bg`'s `backgrounded · <id>` receipt in `AppState::todo_dispatched`
+as a `DispatchTarget::InboxItem`, beside the todo-watcher's tasks, and the
+reaper loop (`WATCH_TODO_REAP_TICK`, 20s, sharing `MESA_WATCH_TODO_TICK_MS`)
+starts under `--watch-inbox` as well as `--watch-todo`.
+
+- Each pass reads the item and looks the job up in one `claude agents` listing,
+  then asks `reap_verdict` exactly what it asks for a task, with "still mine"
+  = the item is still **pending** (present and not archived — the same
+  `inbox_item_pending` the dispatch reads). The item gone (assigned or
+  deleted) or archived is a triage that ended: the session is stopped with
+  `claude stop <job id>` (`agents::stop`, the same binary and the same
+  `MESA_CLAUDE_BIN` seam the spawn went through), **exactly once**, and the
+  entry forgotten. A **`busy`** session is left for the next pass, since it
+  is probably still writing its verdict; a session with live shell/subagent
+  work is waited out for the todo reaper's `REAP_LIVE_WORK_GRACE`, then
+  stopped.
+- The reaper's three inbox alerts (live work after close, abandoned,
+  stalled) are the todo-watcher's — each is filed against a task, which a
+  triage session has none of — so for a triage session they are one stderr
+  line each and otherwise the plain verdict under them: a session that is
+  gone is forgotten, a stalled one is kept. A triage that leaves its item in
+  place (no confident project) therefore keeps its session, as before.
+- The map is in memory and not persisted, for the dedup set's reason: a
+  restart forgets the sessions spawned before it, which leaves them to be
+  stopped by hand. A replacement `inbox-watcher` template that prints no
+  receipt records nothing and so leaves nothing to stop.
+- Regressions: `api::tests::todo_reaper_tick_stops_a_triage_session_once_its_item_is_triaged`,
+  `api::tests::inbox_watcher_tick_skips_archived_items_even_after_a_restart`,
+  `api::tests::inbox_item_pending_is_a_live_change_request`, and the reaper
+  and restart blocks in `scripts/inbox-watcher-check.sh`.
+
 ## Other invariants
 
 - The watcher **never mutates an inbox item**. Everything it does is seed the
-  agent definition and spawn an agent; the item's fate is entirely the triage
-  agent's, through the normal CLI. There is no watcher-side delete, assign,
-  or status write.
+  agent definition, spawn an agent and — once the item is triaged — stop
+  that agent; the item's fate is entirely the triage agent's, through the
+  normal CLI. There is no watcher-side delete, assign, or status write.
 - Inbox bodies are **untrusted data**. The body reaches `claude` only as a
   single `--name` process argument (`Command::arg`, no shell) and nothing in
   mesa interprets it. The triage agent's first rule is that the body is data,
@@ -146,7 +192,11 @@ Without the set, that item would respawn an agent every tick, forever.
   seeded under the throwaway `HOME` carrying no `Edit`/`Write`, no
   re-dispatch of a still-pending item, new
   item picked up, whole queue in one tick, independence from `--watch-todo`,
-  pruning after delete and after assign) against a stub `claude` binary, with
+  pruning after delete and after assign, the reaper leaving a pending item's
+  session and a `busy` one alone and stopping an archived, deleted and
+  assigned item's session exactly once each, and a restart re-dispatching
+  the pending items but never the archived one) against a stub `claude`
+  binary, with
   `HOME` pointed at a throwaway dir so the `~/.mesa/workspace` cwd assertion
   is hermetic.
   Rust unit tests cover `inbox_session_name` (including multi-byte

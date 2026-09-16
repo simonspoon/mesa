@@ -208,12 +208,13 @@ struct AppState {
     /// fresh breach. Not persisted, for `cost_alerted`'s reason.
     cost_stopped: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Background job id → what it was dispatched for, for every session
-    /// the todo-watcher spawned in this server's lifetime and has not yet
-    /// reaped (mesa task 1057). The reaper's whole memory: a dispatched
-    /// session that has finished with its task sits idle for hours holding a
-    /// worktree, and nothing in the db records which session was started for
-    /// which task, so this map is what lets `todo_reaper_tick` stop exactly
-    /// the sessions mesa itself started.
+    /// the todo-watcher or the inbox-watcher spawned in this server's
+    /// lifetime and has not yet reaped (mesa tasks 1057, 1192). The reaper's
+    /// whole memory: a dispatched session that has finished with its task —
+    /// or its inbox item — sits idle for hours holding a worktree, and
+    /// nothing in the db records which session was started for which, so
+    /// this map is what lets `todo_reaper_tick` stop exactly the sessions
+    /// mesa itself started.
     ///
     /// In memory, like `inbox_dispatched` and `cost_stopped`, and deliberately
     /// not persisted: a restart forgets the sessions spawned before it, which
@@ -468,12 +469,15 @@ fn inbox_watcher_tick(state: &AppState) {
         dispatched.retain(|id| present.contains(id));
         items
             .iter()
-            // Only change requests are triaged (mesa task 846). A task summary
-            // is an agent reporting to a person: there is nothing to route,
-            // and dispatching one would turn every close-out report into a
-            // fresh agent. The kind is fixed at creation, so an item skipped
-            // here is skipped for good rather than waiting for a state change.
-            .filter(|item| item.kind == InboxKind::ChangeRequest)
+            // Only live change requests are triaged (mesa tasks 846, 1192). A
+            // task summary is an agent reporting to a person: there is
+            // nothing to route, and dispatching one would turn every
+            // close-out report into a fresh agent. The kind is fixed at
+            // creation, so an item skipped here is skipped for good rather
+            // than waiting for a state change. An archived request has been
+            // triaged already — archiving with a reason is the agent's own
+            // verdict — so it is not a candidate either, restart or not.
+            .filter(|item| inbox_item_pending(item))
             .filter(|item| dispatched.insert(item.id))
             .map(|item| (item.id, inbox_session_name(item)))
             .collect()
@@ -504,7 +508,7 @@ fn inbox_watcher_tick(state: &AppState) {
         // The command — including which agent triages an item — comes from
         // `~/.mesa/config.json`'s `inbox-watcher` entry, defaulting to
         // `claude --bg --agent inbox-triage … -- "Triage mesa inbox item <id>."`.
-        if let Err(e) = seeded.and_then(|_| {
+        match seeded.and_then(|_| {
             agents::spawn_bg(
                 config::INBOX_WATCHER,
                 &dispatch_dir,
@@ -514,14 +518,47 @@ fn inbox_watcher_tick(state: &AppState) {
                 &prompts,
             )
         }) {
-            eprintln!("inbox-watcher: spawn failed for inbox item {id}: {e}");
-            let mut dispatched = match state.inbox_dispatched.lock() {
-                Ok(d) => d,
-                Err(e) => e.into_inner(),
-            };
-            dispatched.remove(&id);
+            // The receipt's short job id is what the reaper stops the triage
+            // session with once the item is triaged (mesa task 1192) — the
+            // todo-watcher's own record, in the same map. No receipt, nothing
+            // to stop.
+            Ok(Some(job_id)) => {
+                let mut dispatched = match state.todo_dispatched.lock() {
+                    Ok(d) => d,
+                    Err(e) => e.into_inner(),
+                };
+                dispatched.insert(
+                    job_id,
+                    DispatchedSession::new(DispatchTarget::InboxItem(id), Instant::now()),
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("inbox-watcher: spawn failed for inbox item {id}: {e}");
+                let mut dispatched = match state.inbox_dispatched.lock() {
+                    Ok(d) => d,
+                    Err(e) => e.into_inner(),
+                };
+                dispatched.remove(&id);
+            }
         }
     }
+}
+
+/// Whether an inbox item is one the inbox-watcher should have triaged: a
+/// change request (mesa task 846) that is not archived (mesa task 1192). The
+/// one definition of "needs triage" — the dispatch reads it to pick items,
+/// and the reaper reads it to know when a triage session is finished with
+/// its item.
+///
+/// Archived is a state, not a kind: the triage agent's own verdict on a
+/// duplicate, shipped or non-actionable request is to archive it with a
+/// reason, and the item stays in the inbox listing. Before this predicate the
+/// dispatch read every listed change request as pending and relied on the
+/// in-memory dedup set alone to hold the archived ones back — which a server
+/// restart empties, so every restart re-triaged every archived request.
+fn inbox_item_pending(item: &InboxItem) -> bool {
+    item.kind == InboxKind::ChangeRequest && item.archived_at.is_none()
 }
 
 /// One cost-guard pass: read the live Claude Code sessions, evaluate the
@@ -1046,7 +1083,10 @@ fn todo_watcher_tick(state: &AppState) {
                         Ok(d) => d,
                         Err(e) => e.into_inner(),
                     };
-                    dispatched.insert(job_id, DispatchedSession::new(task_id, Instant::now()));
+                    dispatched.insert(
+                        job_id,
+                        DispatchedSession::new(DispatchTarget::Task(task_id), Instant::now()),
+                    );
                 }
             }
             Err(e) => {
@@ -1065,9 +1105,39 @@ fn todo_watcher_tick(state: &AppState) {
     }
 }
 
-/// One session the todo-watcher spawned, as `AppState::todo_dispatched`
-/// remembers it: the task it was dispatched onto, and whether a later
-/// dispatch onto that same task has since **superseded** it.
+/// What a dispatched session was started for: the todo-watcher's task, or
+/// the inbox-watcher's item (mesa task 1192). The reaper asks each the same
+/// question — is the session still working on it? — through
+/// [`todo_reaper_tick`]'s one `still mine` reading per entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchTarget {
+    Task(i64),
+    InboxItem(i64),
+}
+
+impl DispatchTarget {
+    /// The stderr prefix of the watcher that dispatched this session.
+    fn watcher(self) -> &'static str {
+        match self {
+            DispatchTarget::Task(_) => "todo-watcher",
+            DispatchTarget::InboxItem(_) => "inbox-watcher",
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DispatchTarget::Task(id) => write!(f, "task {id}"),
+            DispatchTarget::InboxItem(id) => write!(f, "inbox item {id}"),
+        }
+    }
+}
+
+/// One session the todo-watcher or the inbox-watcher spawned, as
+/// `AppState::todo_dispatched` remembers it: what it was dispatched onto,
+/// and whether a later dispatch onto that same task has since **superseded**
+/// it.
 ///
 /// A superseded session is finished with its task by construction — mesa
 /// started a second agent on it — so the reaper reads it as a closed task
@@ -1082,7 +1152,7 @@ fn todo_watcher_tick(state: &AppState) {
 /// filing is retried on the next pass rather than lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DispatchedSession {
-    task_id: i64,
+    target: DispatchTarget,
     superseded: bool,
     /// When the dispatch was recorded. A job the listing does not name yet is
     /// not judged abandoned until [`REAP_ABANDON_GRACE`] after this, since a
@@ -1104,9 +1174,9 @@ struct DispatchedSession {
 }
 
 impl DispatchedSession {
-    fn new(task_id: i64, now: Instant) -> Self {
+    fn new(target: DispatchTarget, now: Instant) -> Self {
         DispatchedSession {
-            task_id,
+            target,
             superseded: false,
             dispatched_at: now,
             work_since: None,
@@ -1314,14 +1384,25 @@ fn file_reaper_alert(
 }
 
 /// One reaper pass: stop the sessions the todo-watcher dispatched whose task
-/// has since closed (mesa task 1057).
+/// has since closed (mesa task 1057), and the sessions the inbox-watcher
+/// dispatched whose item has since been triaged (mesa task 1192).
 ///
-/// The watcher's dispatch is one-directional — it starts agents and never
+/// The watchers' dispatch is one-directional — it starts agents and never
 /// ends them — so a session whose task closed sits idle for hours holding a
 /// worktree, a simulator and a context window. This is the other end of that:
-/// `AppState::todo_dispatched` remembers `(job id → task id)` per spawn, and
-/// each pass asks the store what became of the task and `claude agents` what
-/// became of the session ([`reap_verdict`] decides).
+/// `AppState::todo_dispatched` remembers `(job id → target)` per spawn, and
+/// each pass asks the store what became of the target and `claude agents`
+/// what became of the session ([`reap_verdict`] decides).
+///
+/// An inbox item is read through the same verdict: it is "still mine" while
+/// it is still pending ([`inbox_item_pending`] — present and not archived)
+/// and finished once it is gone (assigned or deleted) or archived, exactly
+/// the triage agent's three outcomes. The verdict's three alerts are the
+/// todo-watcher's — each is filed against a task, which a triage session has
+/// none of — so for an inbox entry they are noted on stderr and otherwise
+/// read as the plain verdict under them: live work after triage waits out
+/// the grace and is then stopped, a session that is gone is forgotten, and a
+/// stalled one is kept.
 ///
 /// Cheap when idle: an empty map returns before any lock and before any
 /// subprocess, so a server whose watcher has dispatched nothing spawns no
@@ -1350,7 +1431,7 @@ fn todo_reaper_tick(state: &AppState) {
             return;
         }
     };
-    // `(task still exists, its status as the reaper reads it)` per entry.
+    // `(target still exists, its status as the reaper reads it)` per entry.
     let statuses: Vec<(bool, Option<Status>)> = {
         let store = match state.store.lock() {
             Ok(s) => s,
@@ -1361,20 +1442,64 @@ fn todo_reaper_tick(state: &AppState) {
             // A superseded session is finished with its task whatever that
             // task now reads, and a task that no longer exists counts as
             // closed: either way, this is not that task's worker any more.
-            .map(|(_, d)| {
-                let status = store.get_task(d.task_id).ok().map(|t| t.status);
-                (status.is_some(), status.filter(|_| !d.superseded))
+            // An inbox item still pending is the one reading that means
+            // "still mine"; anything else is a triage that ended.
+            .map(|(_, d)| match d.target {
+                DispatchTarget::Task(task_id) => {
+                    let status = store.get_task(task_id).ok().map(|t| t.status);
+                    (status.is_some(), status.filter(|_| !d.superseded))
+                }
+                DispatchTarget::InboxItem(item_id) => {
+                    let item = store.get_inbox_item(item_id).ok();
+                    let pending = item.as_ref().is_some_and(inbox_item_pending);
+                    (item.is_some(), pending.then_some(Status::InProgress))
+                }
             })
             .collect()
     };
     let now = Instant::now();
     for ((job_id, dispatch), (task_exists, status)) in dispatched.into_iter().zip(statuses) {
-        let task_id = dispatch.task_id;
+        let target = dispatch.target;
+        let watcher = target.watcher();
         let listed = sessions
             .iter()
             .find(|s| s.id.as_deref() == Some(job_id.as_str()));
         let mut memory = dispatch;
-        match reap_verdict(status, listed, &mut memory, now) {
+        let verdict = reap_verdict(status, listed, &mut memory, now);
+        // The alerts are filed against a task; a triage session has none, so
+        // an inbox entry takes the plain verdict, said once on stderr — the
+        // three alert arms below are then unreachable for it, and the task
+        // id they would file against is never read.
+        let (task_id, verdict) = match target {
+            DispatchTarget::Task(task_id) => (task_id, verdict),
+            DispatchTarget::InboxItem(_) => {
+                let verdict = match verdict {
+                    ReapVerdict::AlertLiveWork => {
+                        eprintln!(
+                            "{watcher}: {target} was triaged while its session {job_id} still \
+                             had work running; stopping it once the work ends"
+                        );
+                        memory.work_alerted = true;
+                        ReapVerdict::Keep
+                    }
+                    ReapVerdict::AlertAbandoned => {
+                        eprintln!("{watcher}: session {job_id} ended without triaging {target}");
+                        ReapVerdict::Forget
+                    }
+                    ReapVerdict::AlertStalled => {
+                        eprintln!(
+                            "{watcher}: session {job_id} on {target} looks stalled (claude \
+                             attach {job_id})"
+                        );
+                        memory.stalled_alerted = true;
+                        ReapVerdict::Keep
+                    }
+                    other => other,
+                };
+                (0, verdict)
+            }
+        };
+        match verdict {
             ReapVerdict::Keep => {}
             ReapVerdict::Forget => forget_dispatch(state, &job_id),
             ReapVerdict::Stop => match agents::stop(&job_id) {
@@ -1383,18 +1508,19 @@ fn todo_reaper_tick(state: &AppState) {
                         "was re-dispatched"
                     } else if memory.work_alerted {
                         "is closed and its live work outran the grace"
+                    } else if matches!(target, DispatchTarget::InboxItem(_)) {
+                        "is triaged"
                     } else {
                         "is closed"
                     };
                     eprintln!(
-                        "todo-watcher: task {task_id} {why}, stopped its session \
-                         (claude stop {job_id})"
+                        "{watcher}: {target} {why}, stopped its session (claude stop {job_id})"
                     );
                     forget_dispatch(state, &job_id);
                 }
                 // Kept, so the next pass tries again — the session is still
                 // running and still holding whatever it holds.
-                Err(e) => eprintln!("todo-watcher: stopping session {job_id} failed: {e}"),
+                Err(e) => eprintln!("{watcher}: stopping session {job_id} failed: {e}"),
             },
             ReapVerdict::AlertLiveWork => {
                 // The verdict only names this for a listed, live session.
@@ -1475,7 +1601,7 @@ fn supersede_dispatch(state: &AppState, task_id: i64) -> Vec<String> {
     };
     let stale: Vec<String> = map
         .iter()
-        .filter(|(_, d)| d.task_id == task_id && !d.superseded)
+        .filter(|(_, d)| d.target == DispatchTarget::Task(task_id) && !d.superseded)
         .map(|(job_id, _)| job_id.clone())
         .collect();
     for job_id in &stale {
@@ -1557,10 +1683,12 @@ pub fn serve(
                     let _ = tokio::task::spawn_blocking(move || todo_watcher_tick(&state)).await;
                 }
             });
-            // The reaper is the dispatch loop's other end (mesa task 1057),
-            // so it lives and dies with the same flag — but on its own
+        }
+        if watch_todo || watch_inbox {
+            // The reaper is the dispatch loops' other end (mesa tasks 1057,
+            // 1192), so it lives and dies with their flags — but on its own
             // shorter cadence, since a session that is finished with its task
-            // should not wait a whole dispatch tick to be stopped.
+            // or item should not wait a whole dispatch tick to be stopped.
             let reap_state = state.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(watch_todo_reap_tick());
@@ -11132,7 +11260,22 @@ exit 2
             .lock()
             .unwrap()
             .get(job_id)
-            .map(|d| d.task_id)
+            .and_then(|d| match d.target {
+                DispatchTarget::Task(id) => Some(id),
+                DispatchTarget::InboxItem(_) => None,
+            })
+    }
+
+    fn dispatched_item(state: &AppState, job_id: &str) -> Option<i64> {
+        state
+            .todo_dispatched
+            .lock()
+            .unwrap()
+            .get(job_id)
+            .and_then(|d| match d.target {
+                DispatchTarget::InboxItem(id) => Some(id),
+                DispatchTarget::Task(_) => None,
+            })
     }
 
     fn superseded(state: &AppState, job_id: &str) -> Option<bool> {
@@ -11148,13 +11291,13 @@ exit 2
     fn seed_dispatch(state: &AppState, job_id: &str, task_id: i64) {
         state.todo_dispatched.lock().unwrap().insert(
             job_id.to_string(),
-            DispatchedSession::new(task_id, Instant::now()),
+            DispatchedSession::new(DispatchTarget::Task(task_id), Instant::now()),
         );
     }
 
     /// A fresh dispatch's memory, as the map would hold it at `now`.
     fn fresh_memory(now: Instant) -> DispatchedSession {
-        DispatchedSession::new(7, now)
+        DispatchedSession::new(DispatchTarget::Task(7), now)
     }
 
     /// `session_row` with live work on it.
@@ -12615,6 +12758,219 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 log.contains(&format!("Triage mesa inbox item {}.", item.id)),
                 "the item must dispatch once the spawn succeeds: {log:?}"
             );
+
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
+    }
+
+    /// The one definition of "needs triage" (mesa task 1192): a change
+    /// request that is not archived. Read by the dispatch to pick items and
+    /// by the reaper to know a triage session is finished.
+    #[test]
+    fn inbox_item_pending_is_a_live_change_request() {
+        let (_dir, state) = test_state();
+        let origin = inbox_origin(&state);
+        let mut store = state.store.lock().unwrap();
+        let request = store
+            .create_inbox_item(None, "mesa: a request", InboxKind::ChangeRequest, origin)
+            .unwrap();
+        let summary = store
+            .create_inbox_item(None, "mesa: a report", InboxKind::TaskSummary, origin)
+            .unwrap();
+        assert!(inbox_item_pending(&request));
+        assert!(!inbox_item_pending(&summary), "a summary is never triaged");
+        let archived = store
+            .set_inbox_item_archived(request.id, true, Some("duplicate of task 3"))
+            .unwrap();
+        assert!(
+            !inbox_item_pending(&archived),
+            "an archived request has been triaged already"
+        );
+        let restored = store
+            .set_inbox_item_archived(request.id, false, None)
+            .unwrap();
+        assert!(inbox_item_pending(&restored), "un-archiving puts it back");
+    }
+
+    /// Mesa task 1192: an archived change request has been triaged — that is
+    /// the triage agent's own verdict — so it is never a dispatch candidate.
+    /// Before, only the in-memory dedup set held it back, and a server
+    /// restart empties that set, so every restart re-triaged every archived
+    /// request. Simulated here by clearing the set between ticks.
+    #[test]
+    fn inbox_watcher_tick_skips_archived_items_even_after_a_restart() {
+        // SAFETY: see `inbox_watcher_tick_dispatches_each_item_once_...`.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+            let (_dir, state) = test_state();
+            let origin = inbox_origin(&state);
+            let item = state
+                .store
+                .lock()
+                .unwrap()
+                .create_inbox_item(None, "mesa: a request", InboxKind::ChangeRequest, origin)
+                .unwrap();
+            inbox_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 1, "{log:?}");
+
+            // Triaged: archived with a reason. A restart forgets the dedup
+            // set, and the next tick must still not dispatch it.
+            state
+                .store
+                .lock()
+                .unwrap()
+                .set_inbox_item_archived(item.id, true, Some("shipped in abc123"))
+                .unwrap();
+            state.inbox_dispatched.lock().unwrap().clear();
+            inbox_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                1,
+                "an archived request must not be re-triaged after a restart: {log:?}"
+            );
+            assert!(
+                !state.inbox_dispatched.lock().unwrap().contains(&item.id),
+                "an archived item is not even claimed"
+            );
+
+            // Un-archived, it is pending again and is picked up.
+            state
+                .store
+                .lock()
+                .unwrap()
+                .set_inbox_item_archived(item.id, false, None)
+                .unwrap();
+            inbox_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                2,
+                "an un-archived request is pending again: {log:?}"
+            );
+
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
+    }
+
+    /// Mesa task 1192: the inbox-watcher's dispatch records its receipt in
+    /// the same map the todo-watcher's does, and the reaper stops the triage
+    /// session once its item is triaged — archived, assigned or deleted — and
+    /// the session is not busy. Exactly once, then forgotten.
+    #[test]
+    fn todo_reaper_tick_stops_a_triage_session_once_its_item_is_triaged() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN / MESA_CONFIG_FILE for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A dispatch seeds the `inbox-triage` agent definition under `$HOME`
+        // (mesa task 1168). Taken *after* ENV_LOCK, the usual order.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let agents_file = stub_dir.path().join("agents.json");
+            let stop_log = stub_dir.path().join("stops.log");
+            let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+            let (_dir, state) = test_state();
+            let origin = inbox_origin(&state);
+            let item = state
+                .store
+                .lock()
+                .unwrap()
+                .create_inbox_item(None, "mesa: a request", InboxKind::ChangeRequest, origin)
+                .unwrap();
+
+            // The dispatch records the receipt's job id against the item.
+            inbox_watcher_tick(&state);
+            assert_eq!(
+                dispatched_item(&state, "job0001"),
+                Some(item.id),
+                "a successful dispatch must record its job id against its item"
+            );
+
+            // Still pending: the session is left alone however idle it is.
+            std::fs::write(
+                &agents_file,
+                agents_listing("job0001", Some(4242), Some("idle")),
+            )
+            .unwrap();
+            todo_reaper_tick(&state);
+            assert!(
+                stops(&stop_log).is_empty(),
+                "a pending item's triage session must never be stopped"
+            );
+            assert_eq!(dispatched_item(&state, "job0001"), Some(item.id));
+
+            // Archived with a reason — triaged — but the session is still
+            // busy (writing its verdict): this pass stops nothing.
+            state
+                .store
+                .lock()
+                .unwrap()
+                .set_inbox_item_archived(item.id, true, Some("not actionable"))
+                .unwrap();
+            std::fs::write(
+                &agents_file,
+                agents_listing("job0001", Some(4242), Some("busy")),
+            )
+            .unwrap();
+            todo_reaper_tick(&state);
+            assert!(
+                stops(&stop_log).is_empty(),
+                "a busy session must be left for the next pass"
+            );
+            assert_eq!(dispatched_item(&state, "job0001"), Some(item.id));
+
+            // Idle now: stopped exactly once, and forgotten.
+            std::fs::write(
+                &agents_file,
+                agents_listing("job0001", Some(4242), Some("idle")),
+            )
+            .unwrap();
+            todo_reaper_tick(&state);
+            assert_eq!(stops(&stop_log), vec!["job0001".to_string()]);
+            assert_eq!(dispatched_item(&state, "job0001"), None);
+            todo_reaper_tick(&state);
+            assert_eq!(
+                stops(&stop_log),
+                vec!["job0001".to_string()],
+                "a stopped session must not be stopped again"
+            );
+
+            // The other terminal outcome: the item is gone (assigned or
+            // deleted). The stub hands out `job0001` again; the first entry
+            // is already forgotten, so the key is free.
+            let second = state
+                .store
+                .lock()
+                .unwrap()
+                .create_inbox_item(None, "mesa: another", InboxKind::ChangeRequest, origin)
+                .unwrap();
+            inbox_watcher_tick(&state);
+            assert_eq!(dispatched_item(&state, "job0001"), Some(second.id));
+            state
+                .store
+                .lock()
+                .unwrap()
+                .delete_inbox_item(second.id)
+                .unwrap();
+            todo_reaper_tick(&state);
+            assert_eq!(
+                stops(&stop_log),
+                vec!["job0001".to_string(), "job0001".to_string()],
+                "a deleted item's idle session is stopped"
+            );
+            assert_eq!(dispatched_item(&state, "job0001"), None);
 
             unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
         });

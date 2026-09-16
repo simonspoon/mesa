@@ -41,12 +41,24 @@ run() {
 }
 jqs() { jq -r "$1" <<<"$STDOUT"; }
 
-# ---- stub claude: logs every --bg invocation's (cwd, name, prompt) to BG_LOG ----
+# ---- stub claude: logs every --bg invocation's (cwd, name, prompt, job id) to
+# BG_LOG. Each dispatch gets its own receipt id, its `agents` branch lists every
+# id it handed out with one shared status/pid (the todo-watcher gate's reaper
+# stub), and `stop` records its argument — the whole of what the reaper
+# touches (mesa task 1192). ----
 
 STUB_DIR="$TMP/stub"
 mkdir -p "$STUB_DIR"
 BG_LOG="$TMP/bg.log"
-touch "$BG_LOG"
+JOB_IDS="$TMP/job-ids"
+STOPS="$TMP/stops.log"
+JOB_STATUS="$TMP/job-status"
+JOB_PID="$TMP/job-pid"
+JOB_COUNTER="$TMP/job-counter"
+touch "$BG_LOG" "$JOB_IDS" "$STOPS"
+echo idle > "$JOB_STATUS"
+echo 424242 > "$JOB_PID"
+echo 0 > "$JOB_COUNTER"
 cat > "$STUB_DIR/claude" <<EOF
 #!/usr/bin/env bash
 if [ "\$1" = "--bg" ]; then
@@ -59,11 +71,29 @@ if [ "\$1" = "--bg" ]; then
   if [ "\$1" = "--name" ]; then shift; NAME="\$1"; shift; fi
   PROMPT=""
   if [ "\$1" = "--" ]; then shift; PROMPT="\$1"; fi
-  echo "\$(pwd)|\$NAME|\$PROMPT" >> "$BG_LOG"
-  echo "backgrounded · deadbeef (idle — send a prompt to start)"
+  N=\$(( \$(cat "$JOB_COUNTER") + 1 ))
+  echo "\$N" > "$JOB_COUNTER"
+  ID=\$(printf 'job%04d' "\$N")
+  echo "\$ID" >> "$JOB_IDS"
+  echo "\$(pwd)|\$NAME|\$PROMPT|\$ID" >> "$BG_LOG"
+  echo "backgrounded · \$ID (idle — send a prompt to start)"
   exit 0
 fi
-if [ "\$1" = "agents" ]; then echo '[]'; exit 0; fi
+if [ "\$1" = "agents" ]; then
+  STATUS=\$(cat "$JOB_STATUS")
+  PID=\$(cat "$JOB_PID")
+  FIRST=1
+  printf '['
+  while read -r id; do
+    [ -z "\$id" ] && continue
+    [ "\$FIRST" = 1 ] || printf ','
+    FIRST=0
+    printf '{"pid":%s,"id":"%s","cwd":"/tmp","kind":"background","startedAt":1783000000000,"sessionId":"%s-0000-0000-0000-000000000000","name":"triage","status":"%s","state":"done"}' "\$PID" "\$id" "\$id" "\$STATUS"
+  done < "$JOB_IDS"
+  printf ']\n'
+  exit 0
+fi
+if [ "\$1" = "stop" ]; then echo "\$2" >> "$STOPS"; exit 0; fi
 exit 2
 EOF
 chmod +x "$STUB_DIR/claude"
@@ -144,7 +174,7 @@ rm -f "$STUB_DIR/fail"
 # ---- flag ON: dispatches the pending item in the workspace with "Triage mesa inbox item <id>." ----
 
 wait_bg_lines 1
-LINE=$(head -1 "$BG_LOG")
+LINE=$(head -1 "$BG_LOG" | cut -d'|' -f1-3)
 EXPECT="$WORKSPACE|inbox $ITEM_1: khora: eval errors on undefined|Triage mesa inbox item $ITEM_1."
 [ "$LINE" = "$EXPECT" ] || fail "expected '$EXPECT', got '$LINE'"
 [ -d "$WORKSPACE" ] || fail "the dispatch folder ~/.mesa/workspace must be created on demand"
@@ -179,7 +209,7 @@ ok "item still pending after dispatch is not re-dispatched on later ticks"
 run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "loki: find exits 0 on no match"
 ITEM_2=$(jqs .id)
 wait_bg_lines 2
-LINE=$(sed -n 2p "$BG_LOG")
+LINE=$(sed -n 2p "$BG_LOG" | cut -d'|' -f1-3)
 EXPECT="$WORKSPACE|inbox $ITEM_2: loki: find exits 0 on no match|Triage mesa inbox item $ITEM_2."
 [ "$LINE" = "$EXPECT" ] || fail "expected '$EXPECT', got '$LINE'"
 ok "a new inbox item is dispatched on the next tick, with its own id"
@@ -189,6 +219,7 @@ ok "a new inbox item is dispatched on the next tick, with its own id"
 # The inbox is one global queue with no per-project cap to pace it, unlike
 # the todo-watcher's one-agent-per-project. Three at once must all dispatch.
 run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "mesa: item three"
+ITEM_3=$(jqs .id)
 run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "mesa: item four"
 run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "mesa: item five"
 wait_bg_lines 5
@@ -222,21 +253,89 @@ ok "a task-summary item is never dispatched, on this tick or any later one"
   fail "--watch-inbox alone must not dispatch the todo watcher"
 ok "watch_inbox is independent of watch_todo: no task claimed, no /execute-mesa-task dispatch"
 
-# ---- an item leaving the inbox (triage's own terminal states) is quiet ----
+# ---- the reaper (mesa task 1192): a triage session is stopped once its item
+# is triaged — archived, assigned or deleted — and the session is not busy,
+# exactly once. Same map and same 20s loop as the todo-watcher's reaper, which
+# `--watch-inbox` alone must start. ----
 
-# Both of the triage skill's acting outcomes remove the item: a viable
+job_for() { # job_for <item id> -> the receipt id of that item's dispatch
+  grep "|Triage mesa inbox item $1\\.|" "$BG_LOG" | cut -d'|' -f4
+}
+wait_stop_lines() { # wait_stop_lines <n>
+  local n=$1
+  for _ in $(seq 1 60); do
+    [ "$(wc -l < "$STOPS")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n stop(s); log:\n$(cat "$STOPS")"
+}
+
+# Every item is still pending, so however idle the sessions are, none stops.
+sleep 1
+[ "$(wc -l < "$STOPS")" -eq 0 ] ||
+  fail "a pending item's triage session must never be stopped: $(cat "$STOPS")"
+ok "the reaper leaves a triage session alone while its item is pending"
+
+# Archived with a reason — the agent's own verdict — while the session is still
+# `busy` writing it: left for a later pass. Flipped a few ticks before the
+# archive, as the todo-watcher gate does, so no pass pairs an old `idle`
+# listing with the archived row.
+echo busy > "$JOB_STATUS"
+sleep 0.8
+run 0 "$MESA" inbox archive "$ITEM_3" --reason "not actionable"
+[ "$(jqs .archived_at)" != "null" ] || fail "archive must stamp archived_at"
+sleep 1
+[ "$(wc -l < "$STOPS")" -eq 0 ] ||
+  fail "a busy session must not be stopped: $(cat "$STOPS")"
+ok "a session still busy after its item was archived is left for a later pass"
+
+echo idle > "$JOB_STATUS"
+wait_stop_lines 1
+sleep 1
+[ "$(wc -l < "$STOPS")" -eq 1 ] ||
+  fail "a stopped session must be stopped exactly once: $(cat "$STOPS")"
+[ "$(head -1 "$STOPS")" = "$(job_for "$ITEM_3")" ] ||
+  fail "expected 'claude stop $(job_for "$ITEM_3")', got '$(head -1 "$STOPS")'"
+ok "archiving a dispatched item stops exactly its own session, exactly once"
+
+# ---- an item leaving the inbox (triage's other terminal states) is quiet,
+# and its session is stopped too ----
+
+# Both of the triage agent's acting outcomes remove the item: a viable
 # request becomes a task and the item is deleted, a non-viable one is
 # converted by `inbox assign`. Neither may provoke a re-dispatch.
 run 0 "$MESA" inbox delete "$ITEM_1"
 run 0 "$MESA" inbox assign "$ITEM_2" "$A"
 [ "$(jqs .status)" = "backlog" ] || fail "inbox assign must create a backlog task"
+wait_stop_lines 3
 sleep 1
 [ "$(wc -l < "$BG_LOG")" -eq 5 ] ||
   fail "items that left the inbox must not re-dispatch: $(cat "$BG_LOG")"
+[ "$(wc -l < "$STOPS")" -eq 3 ] ||
+  fail "expected exactly 3 stops (archived, deleted, assigned): $(cat "$STOPS")"
+grep -qx "$(job_for "$ITEM_1")" "$STOPS" || fail "the deleted item's session must be stopped: $(cat "$STOPS")"
+grep -qx "$(job_for "$ITEM_2")" "$STOPS" || fail "the assigned item's session must be stopped: $(cat "$STOPS")"
 curl -sf "http://127.0.0.1:$PORT/api/inbox" >/dev/null ||
   fail "server must still be healthy after the watcher pruned its dedup set"
 stop_server
-ok "an item removed by triage (delete or assign) is pruned, never re-dispatched"
+ok "an item removed by triage (delete or assign) is pruned, never re-dispatched, and its session stopped"
+
+# ---- a restart re-triages what is still pending, never what is archived ----
+
+# The dedup set is in memory, so a restart re-dispatches every item still
+# sitting untriaged (the recoverable direction). An archived request has
+# been triaged already — the archive is the verdict — and before mesa task
+# 1192 only that emptied set stood between it and a fresh agent, so every
+# restart re-triaged every archived request.
+start_server --watch-inbox
+wait_bg_lines 7
+sleep 1
+[ "$(wc -l < "$BG_LOG")" -eq 7 ] ||
+  fail "a restart re-dispatches exactly the two pending items: $(cat "$BG_LOG")"
+[ "$(grep -c "|Triage mesa inbox item $ITEM_3\\.|" "$BG_LOG")" -eq 1 ] ||
+  fail "an archived item must not be re-triaged after a restart: $(cat "$BG_LOG")"
+stop_server
+ok "after a restart the pending items are re-dispatched and the archived one is not"
 
 echo
 echo "inbox-watcher check passed ($CHECKS checks)"

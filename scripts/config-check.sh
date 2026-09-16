@@ -1376,9 +1376,9 @@ api POST "/api/projects/$A/agents" '{"prompt":"/execute-mesa-task 1"}'
 [ "$CODE" = "201" ] || fail "default fallback: expected 201, got $CODE: $STDOUT"
 [ "$(jq -r .id <<<"$STDOUT")" = "deadbeef" ] ||
   fail "default fallback: expected the claude stub's id, got $STDOUT"
-grep -qx "$DIR_A|--agent|swe|--|/execute-mesa-task 1" "$CLAUDE_LOG" ||
+grep -qx "$DIR_A|--model|opus|--agent|supervisor|--|/execute-mesa-task 1" "$CLAUDE_LOG" ||
   fail "the built-in default argv changed: $(cat "$CLAUDE_LOG")"
-ok "an action absent from the config uses the built-in \`claude --bg --agent swe -- <prompt>\` argv (MESA_CLAUDE_BIN stands in for a default template's \`claude\` only)"
+ok "an action absent from the config uses the built-in \`claude --bg --model opus --agent supervisor -- <prompt>\` argv (MESA_CLAUDE_BIN stands in for a default template's \`claude\` only)"
 
 # The other two actions fall back the same way — proven on a fresh project, so
 # the todo-watcher's one-agent-per-project cap doesn't hide it.
@@ -1404,7 +1404,7 @@ ok "the unconfigured inbox-watcher keeps its built-in \`--agent inbox-triage --n
 # ---- a saved template still holding the retired {bin}/{agent} (mesa task 1141) ----
 
 # A config written before 1141 may carry `{bin}`/`{agent}`. They are migrated
-# on every read — `{bin}` → `claude`, `{agent}` → `swe`, in memory — so the
+# on every read — `{bin}` → `claude`, `{agent}` → `supervisor` (mesa task 1188), in memory — so the
 # spawn still works and Settings shows the literal form; the file itself is
 # never rewritten. Saving either token anew is refused, since the vocabulary
 # no longer offers them. And a *configured* template is run exactly as
@@ -1424,7 +1424,7 @@ write_config <<'EOF'
 EOF
 api GET /api/config
 [ "$CODE" = "200" ] || fail "GET /api/config with a retired placeholder: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.[2].value' <<<"$STDOUT")" = "claude --bg --agent swe -- {prompt}" ] ||
+[ "$(jq -r '.[2].value' <<<"$STDOUT")" = "claude --bg --agent supervisor -- {prompt}" ] ||
   fail "a saved {bin}/{agent} must read back migrated to the literal form: $STDOUT"
 grep -Fq '{bin} --bg --agent {agent} -- {prompt}' "$CONFIG" ||
   fail "the migration must never rewrite the user's file: $(cat "$CONFIG")"
@@ -1438,7 +1438,7 @@ api POST "/api/projects/$A/agents" '{"prompt":"still spawns"}'
 [ "$CODE" = "201" ] || fail "spawn through a migrated template: expected 201, got $CODE: $STDOUT"
 [ "$(jq -r .id <<<"$STDOUT")" = "5c81eeee" ] ||
   fail "a configured template must run the \`claude\` it names, not MESA_CLAUDE_BIN: $STDOUT"
-grep -Fqx -- "--bg --agent swe -- still spawns" "$TMP/onpath.log" ||
+grep -Fqx -- "--bg --agent supervisor -- still spawns" "$TMP/onpath.log" ||
   fail "the migrated template's argv is wrong: $(cat "$TMP/onpath.log")"
 [ ! -s "$CLAUDE_LOG" ] ||
   fail "MESA_CLAUDE_BIN must not be substituted into a configured template: $(cat "$CLAUDE_LOG")"
@@ -1449,7 +1449,7 @@ api PUT /api/config '{"commands": {"agent-spawn": "claude --bg --agent {agent} -
 [ "$CODE" = "422" ] || fail "saving {agent} anew: expected 422, got $CODE: $STDOUT"
 grep -Fq '{bin} --bg --agent {agent} -- {prompt}' "$CONFIG" ||
   fail "a refused save must leave the file untouched: $(cat "$CONFIG")"
-ok "a pre-1141 template holding {bin}/{agent} is migrated on read (claude/swe), never rewritten on disk, runs the \`claude\` it names rather than MESA_CLAUDE_BIN, and neither token can be saved anew"
+ok "a pre-1141 template holding {bin}/{agent} is migrated on read (claude/supervisor), never rewritten on disk, runs the \`claude\` it names rather than MESA_CLAUDE_BIN, and neither token can be saved anew"
 
 echo
 echo "config-check: $CHECKS checks passed"

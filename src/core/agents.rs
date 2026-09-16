@@ -1074,13 +1074,14 @@ echo "backgrounded · 5we00000 · n""#,
     #[test]
     fn spawn_bg_passes_dash_prompt_after_separator() {
         // A prompt beginning with `-` must reach claude as a positional, not a
-        // flag: the stub asserts `--bg --agent swe -- <prompt>` and echoes the
-        // prompt back.
+        // flag: the stub asserts `--bg --model opus --agent supervisor --
+        // <prompt>` and echoes the prompt back.
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_claude(
             dir.path(),
-            r#"[ "$1" = "--bg" ] && [ "$2" = "--agent" ] && [ "$3" = "swe" ] && [ "$4" = "--" ] &&
-              [ "$5" = "--resume" ] || { echo "bad argv: $*" >&2; exit 1; }
+            r#"[ "$1" = "--bg" ] && [ "$2" = "--model" ] && [ "$3" = "opus" ] &&
+              [ "$4" = "--agent" ] && [ "$5" = "supervisor" ] && [ "$6" = "--" ] &&
+              [ "$7" = "--resume" ] && [ "$#" = 7 ] || { echo "bad argv: $*" >&2; exit 1; }
 echo "backgrounded · abc00000""#,
         );
         let script = default_script(config::AGENT_SPAWN, &bin, None, None, Some("--resume"));

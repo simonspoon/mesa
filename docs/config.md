@@ -8,7 +8,7 @@ persona and the slash command can all change without rebuilding mesa:
 | --- | --- | --- |
 | `todo-watcher` | `serve --watch-todo` dispatch (`docs/todo-watcher.md`) | `claude --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}"` |
 | `inbox-watcher` | `serve --watch-inbox` triage (`docs/inbox-watcher.md`) | `claude --bg --agent inbox-triage --name {name} -- "Triage mesa inbox item {id}."` |
-| `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `claude --bg --agent swe -- {prompt}` |
+| `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `claude --bg --model opus --agent supervisor -- {prompt}` |
 | `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `claude --bg --agent mesa-live --name {name} -- {prompt}` |
 | `live-summary` | `live stop`'s CLI handler and the API's stop route — the short-lived agent that writes a live conversation's memory once it ends (mesa task 921, `docs/live.md`) | `claude --bg --name {name} -- {prompt}` |
 | `live-dream` | The pass that tidies the live notebook — `mesa live memory dream` explicitly, and on its own at a handoff or when a conversation ends once `live::dream_wanted` says the notebook needs it (mesa task 1155): merges duplicate entries, deletes superseded ones, one guarded command at a time (mesa task 1152, `docs/live.md`) | `claude --bg --name {name} -- {prompt}` |
@@ -24,7 +24,7 @@ from the vocabulary (see *Retired placeholders* below).
 ```json
 {
   "commands": {
-    "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
+    "todo-watcher":   "claude --bg --agent supervisor --name {name} -- \"/execute-mesa-task {id}\"",
     "inbox-watcher":  "codex exec --cd . \"triage mesa inbox item {id}\"",
     "agent-spawn":    "claude --bg -- {prompt}",
     "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
@@ -114,7 +114,7 @@ redirection or a conditional binary all simply work, on one line or several:
 ```json
 {
   "commands": {
-    "todo-watcher": "set -euo pipefail\ncd \"$HOME/src/checkouts/{id}\" 2>/dev/null || cd \"$HOME/src\"\nexport CLAUDE_PROJECT=mesa\nexec claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\""
+    "todo-watcher": "set -euo pipefail\ncd \"$HOME/src/checkouts/{id}\" 2>/dev/null || cd \"$HOME/src\"\nexport CLAUDE_PROJECT=mesa\nexec claude --bg --agent supervisor --name {name} -- \"/execute-mesa-task {id}\""
   }
 }
 ```
@@ -125,7 +125,7 @@ More legibly, that value is:
 set -euo pipefail
 cd "$HOME/src/checkouts/{id}" 2>/dev/null || cd "$HOME/src"
 export CLAUDE_PROJECT=mesa
-exec claude --bg --agent swe --name {name} -- "/execute-mesa-task {id}"
+exec claude --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}"
 ```
 
 This *is* a shell, unlike the argv mode it replaces, and the untrusted-input
@@ -226,7 +226,7 @@ are what make the remaining lexer mistakes cheap.)
   string** — `''` in a word position, nothing inside quotes. Free-form shell
   text has no token to drop, so the old argv rule (drop the token and its
   flag) is gone with the argv mode: a promptless
-  `POST /api/projects/{id}/agents` runs `claude --bg --agent swe -- ''`, an
+  `POST /api/projects/{id}/agents` runs `claude --bg --model opus --agent supervisor -- ''`, an
   empty prompt. There is no `MESA_*` variable to tell "absent" from "blank"
   any more; a hook that must tell them apart tests `[ -n {name} ]`.
 

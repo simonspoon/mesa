@@ -117,8 +117,9 @@ esac
 EOF
 chmod +x "$STUB_DIR/claude"
 
+mkdir -p "$TMP/home"
 PORT=17771
-MESA_CLAUDE_BIN="$STUB_DIR/claude" "$MESA" serve --port "$PORT" >/dev/null 2>&1 &
+HOME="$TMP/home" MESA_CLAUDE_BIN="$STUB_DIR/claude" "$MESA" serve --port "$PORT" >/dev/null 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 50); do
   curl -sf "http://127.0.0.1:$PORT/api/projects" >/dev/null 2>&1 && break
@@ -174,15 +175,18 @@ api 201 POST "/api/projects/$P/agents" '{"prompt":"do the thing"}'
 [ "$(jqb .id)" = "deadbeef" ] || fail "POST agents with prompt: parsed job id"
 ok "POST /api/projects/{id}/agents starts a --bg session (with/without prompt)"
 
-# Every session mesa starts runs under an agent persona (`swe`, literal in the
-# default template since mesa task 1141) — the flag must sit between
+# Every session mesa starts runs under an agent persona (`supervisor` on opus,
+# literal in the default template since mesa task 1188) — the flag must sit between
 # `--bg` and the `--` separator or a prompt-leading `-` swallows it.
 ARGV=$(cat "$STUB_DIR/last-bg-argv")
 case "$ARGV" in
-  "--bg --agent swe -- do the thing") ;;
-  *) fail "spawn argv: expected '--bg --agent swe -- do the thing', got '$ARGV'" ;;
+  "--bg --model opus --agent supervisor -- do the thing") ;;
+  *) fail "spawn argv: expected '--bg --model opus --agent supervisor -- do the thing', got '$ARGV'" ;;
 esac
 ok "spawns pass --agent before the prompt separator"
+[ -f "$TMP/home/.claude/agents/supervisor.md" ] ||
+  fail "the spawn route must seed the supervisor agent definition under HOME"
+ok "the spawn route seeds the supervisor agent definition before spawning"
 
 api 422 POST "/api/projects/$D/agents" '{}'
 [ "$(jqb .error.code)" = "validation" ] || fail "POST agents (no path): validation"
@@ -281,7 +285,7 @@ ok "WS attach handshake: local/absent Origin upgrade, foreign Origin 403, bad/da
 # localhost:* page — cannot be forged here; it is pinned by the Rust unit tests
 # in src/api.rs (`cross_origin_attach_from_remote_peer_is_refused`).
 LAN_PORT=17772
-MESA_CLAUDE_BIN="$STUB_DIR/claude" "$MESA" serve --lan --port "$LAN_PORT" >/dev/null 2>&1 &
+HOME="$TMP/home" MESA_CLAUDE_BIN="$STUB_DIR/claude" "$MESA" serve --lan --port "$LAN_PORT" >/dev/null 2>&1 &
 LAN_PID=$!
 for _ in $(seq 1 50); do
   curl -sf -H "Host: 127.0.0.1:$LAN_PORT" "http://127.0.0.1:$LAN_PORT/api/projects" >/dev/null 2>&1 && break

@@ -12,7 +12,8 @@ touches the mesa store only to read `local_path`. There is deliberately no
 `agents::spawn_bg` is the single spawn chokepoint (the two watchers, this POST
 route and `mesa live start` all go through it) and runs the template
 `~/.mesa/config.json` gives for that action; this route's key is
-**`agent-spawn`**, defaulting to `claude --bg --agent swe -- {prompt}`. The
+**`agent-spawn`**, defaulting to `claude --bg --model opus --agent supervisor -- {prompt}`
+(mesa task 1188; the `supervisor` definition is seeded to disk first). The
 sections below describe that default. A replacement command owes mesa only its
 exit code; see the `POST` route below on the `id: null` case.
 

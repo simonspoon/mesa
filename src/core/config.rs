@@ -13,9 +13,9 @@
 //! ```json
 //! {
 //!   "commands": {
-//!     "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
+//!     "todo-watcher":   "claude --bg --agent supervisor --name {name} -- \"/execute-mesa-task {id}\"",
 //!     "inbox-watcher":  "claude --bg --agent inbox-triage --name {name} -- \"Triage mesa inbox item {id}.\"",
-//!     "agent-spawn":    "claude --bg --agent swe -- {prompt}",
+//!     "agent-spawn":    "claude --bg --model opus --agent supervisor -- {prompt}",
 //!     "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
 //!     "live-summary":   "claude --bg --name {name} -- {prompt}",
 //!     "live-dream":     "claude --bg --name {name} -- {prompt}"
@@ -258,8 +258,9 @@ pub const DEFAULT_INBOX_WATCHER: &str =
 /// Built-in default for [`AGENT_SPAWN`]. No `{id}`/`{name}`: this spawn is
 /// driven by a request body, not a mesa record, and the prompt is optional —
 /// absent, the `-- {prompt}` pair drops out and the session starts idle. The
-/// agent is the literal `swe`.
-pub const DEFAULT_AGENT_SPAWN: &str = "claude --bg --agent swe -- {prompt}";
+/// agent is the literal `supervisor` on opus (mesa task 1188: no `swe` agent
+/// exists), seeded by `spawn_project_agent` before the spawn.
+pub const DEFAULT_AGENT_SPAWN: &str = "claude --bg --model opus --agent supervisor -- {prompt}";
 /// Built-in default for [`LIVE_AGENT`]. The union of the two shapes above: a
 /// live session is a mesa record (so it has an `{id}` and a `{name}`) *and*
 /// carries a prompt mesa supplies — `core::live::agent_prompt`, the session
@@ -391,8 +392,9 @@ fn command_in(path: &Path, action: &str) -> Result<Option<String>, String> {
 }
 
 /// Rewrites the two placeholders mesa task 1141 retired — `{bin}` and
-/// `{agent}` — into the literal values they always resolved to by default,
-/// `claude` and `swe`.
+/// `{agent}` — into literal values: `claude`, which `{bin}` always resolved
+/// to, and `supervisor` for `{agent}`, whose old default `swe` names no agent
+/// that exists (mesa task 1188).
 ///
 /// Applied to a template **as it is read** from the config file, every read,
 /// in memory: the user's file is never rewritten behind their back. An
@@ -412,7 +414,7 @@ fn command_in(path: &Path, action: &str) -> Result<Option<String>, String> {
 pub fn migrate_retired_placeholders(template: &str) -> String {
     template
         .replace("{bin}", "claude")
-        .replace("{agent}", "swe")
+        .replace("{agent}", "supervisor")
 }
 
 /// Every action's current setting, for the Settings page
@@ -1413,7 +1415,7 @@ fn bash_syntax_check(action: &str, script: &str) -> Result<(), String> {
 /// The values a template's placeholders may resolve to. A `None` field is
 /// "not available for this call" and substitutes as the empty string. The
 /// program and the agent are not here: since mesa task 1141 a template names
-/// both literally (`claude --bg --agent swe …`), so there is nothing to fill.
+/// both literally (`claude --bg --agent supervisor …`), so there is nothing to fill.
 #[derive(Debug, Default, Clone)]
 pub struct Vars<'a> {
     pub id: Option<i64>,
@@ -3527,7 +3529,8 @@ mod tests {
             r#"}}"#
         );
         let path = write_config(dir.path(), before);
-        let literal = r#"claude --bg --agent swe --name {name} -- "/execute-mesa-task {id}""#;
+        let literal =
+            r#"claude --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}""#;
         assert_eq!(
             command_in(&path, TODO_WATCHER).unwrap().as_deref(),
             Some(literal)
@@ -3552,13 +3555,13 @@ mod tests {
         // retired names, so a script that used them still runs as written.
         assert_eq!(
             command_in(&path, AGENT_SPAWN).unwrap().as_deref(),
-            Some("cd /repo\nexec \"claude\" --agent swe -- {prompt}")
+            Some("cd /repo\nexec \"claude\" --agent supervisor -- {prompt}")
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         // Only the exact braced tokens are rewritten.
         assert_eq!(
             migrate_retired_placeholders("{bin: 1} {prompt:bin} {agent}"),
-            "{bin: 1} {prompt:bin} swe"
+            "{bin: 1} {prompt:bin} supervisor"
         );
     }
 
@@ -3827,7 +3830,7 @@ mod tests {
         };
         assert_eq!(
             resolve(AGENT_SPAWN, DEFAULT_AGENT_SPAWN, &spawn).unwrap(),
-            "claude --bg --agent swe -- 'look at the tests'"
+            "claude --bg --model opus --agent supervisor -- 'look at the tests'"
         );
         // The live agent takes both halves: a named session id *and* the
         // prompt mesa supplies. The prompt is one argument however long or
@@ -3902,11 +3905,20 @@ mod tests {
         let vars = Vars::default();
         assert_eq!(
             resolve(AGENT_SPAWN, DEFAULT_AGENT_SPAWN, &vars).unwrap(),
-            "claude --bg --agent swe -- ''"
+            "claude --bg --model opus --agent supervisor -- ''"
         );
         assert_eq!(
             argv_of(&resolve(AGENT_SPAWN, DEFAULT_AGENT_SPAWN, &vars).unwrap()),
-            ["claude", "--bg", "--agent", "swe", "--", ""]
+            [
+                "claude",
+                "--bg",
+                "--model",
+                "opus",
+                "--agent",
+                "supervisor",
+                "--",
+                ""
+            ]
         );
         let named = Vars {
             id: Some(7),

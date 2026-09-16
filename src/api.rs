@@ -7925,6 +7925,11 @@ async fn spawn_project_agent(
         });
     }
     let dir = path.clone();
+    // The default template spawns `--agent supervisor` (mesa task 1188), so the
+    // definition is seeded to disk first — `claude --agent` errors on an agent
+    // it has never seen. A failure is treated exactly like a failed spawn.
+    supervisor::ensure_agent_definition(&state.store.lock().unwrap())
+        .map_err(agents_unavailable)?;
     let prompts = library::prompts(&state.store.lock().unwrap())?;
     // `~/.mesa/config.json`'s `agent-spawn` entry, defaulting to
     // `claude --bg … -- <prompt>`. `job` is None when that command printed no

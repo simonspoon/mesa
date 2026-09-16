@@ -12,6 +12,7 @@ function item(fields: Partial<InboxItem>): InboxItem {
     updated_at: '2026-01-01 00:00:00',
     read_at: null,
     archived_at: null,
+    archive_reason: null,
     kind: 'task-summary',
     task_id: 42,
     task_name: 'Improve Inbox: require "from-task-id"',

@@ -47,6 +47,6 @@ pub use types::{
     LiveTranscript, LiveTurn, LiveWindow, MesaVersion, ModelRates, Priority, Project,
     ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
     ProjectVersion, RetroFinding, RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind,
-    ScriptRun, Status, SystemInfo, Task, TaskReceipt, TaskSummary, Waypoint,
-    is_valid_artifact_content_type, task_name,
+    ScriptRun, ScriptRunEvent, ScriptStream, Status, SystemInfo, Task, TaskReceipt, TaskSummary,
+    Waypoint, is_valid_artifact_content_type, task_name,
 };

@@ -9,7 +9,8 @@ project must un-bind the user's scripts rather than destroy work they authored
 by hand and cannot get back. `args` is stored as a JSON array and decoded inside
 `Store` — the column is an implementation detail, the `Script` struct exposes a
 typed `Vec<ScriptArg>`. Runs are **not** persisted: a `ScriptRun` is a
-request/response record, the `HookRun` twin.
+request/response record, the `HookRun` twin, and a streamed run's
+`ScriptRunEvent`s exist only on the wire.
 
 - **Arguments are declared, never parsed out of the body.** Nothing reads the
   shell source looking for `$1` or `${FOO}` — that is a guessing game, and a
@@ -44,7 +45,11 @@ request/response record, the `HookRun` twin.
 - **Execution lives in `src/core/scripts.rs`, not in `Store`** — running a
   process is not storage. Two functions: `validate_values` (pure; the CLI and
   the API both call it, so they cannot diverge on what a valid call is) and
-  `run` (the `hooks.rs` executor shape).
+  the executor, in two shapes over **one** private `command()` builder — the
+  body, the positional and `MESA_ARG_*` values, the env sweep and the cwd are
+  built in exactly one place: `run` (capture-and-return, the `hooks.rs`
+  executor shape, used by the CLI and `POST …/run`) and `start` +
+  `Streaming::stream` (line by line, used by `POST …/run/stream`, below).
 - **No value is ever interpolated into a string a shell parses.** This is the
   repo-wide rule (CLAUDE.md, "Untrusted input") and the reason the module
   exists. The body goes to `bash -c` as **one verbatim argument**; the values
@@ -70,6 +75,28 @@ request/response record, the `HookRun` twin.
   There is deliberately **no timeout** (matching hooks and agents): a run that
   should outlive the request must background itself. The only `Err` is "bash
   could not be spawned".
+- **The streamed run** (mesa task 1196) is what the web page uses. `start`
+  validates and spawns before any byte is sent — so a bad value or an
+  unusable cwd is still 422 and a bash that will not start still 502 — in a
+  **process group of its own**. `Streaming::stream` then reads each pipe on its
+  own thread into one channel, so the events come out in **arrival order**:
+  `{"type":"line","stream":"stdout"|"stderr","t":<ms since start>,"text":…}`
+  per line (newline, and a `\r` before it, stripped; lossy UTF-8), then
+  exactly one `{"type":"exit","code","duration_ms","truncated"}` — or one
+  `{"type":"error","message"}` if the exit status cannot be collected after
+  the response has started. The order is what the two pipes delivered, which
+  is only as fine as the script's own buffering (a program that block-buffers
+  a pipe arrives in blocks). The **same 64 KiB cap** applies per stream,
+  counted in bytes read: past it, that stream's further output is read and
+  **dropped** (never blocking the script on a full pipe), a line the cap cuts
+  is emitted up to the cap, and the exit event says `truncated: true`; there is
+  no `[truncated]` marker line. Nothing is stored — the full log is not kept
+  anywhere, deliberately, so a stream has exactly the captured run's bounds.
+  **Stop is the client going away**: the loop kills the process group
+  (`kill -KILL -- -<pgid>`, then reaps bash) as soon as the channel to the
+  response body is closed, which it asks on every line *and* at least every
+  100ms while the script is silent. A descendant that left the group
+  (`setsid`) is out of reach, as it would be for a terminal's Ctrl-C.
 - **The working directory is resolved from the script's own project binding,
   never from the caller.** A bound script runs in that project's `local_path`,
   via the standard ladder the terminal and agents use: no `local_path`, or a
@@ -101,7 +128,7 @@ request/response record, the `HookRun` twin.
   rejected as an unknown argument on `list` and `run`, exit 2. On `update` it
   sits **outside** the field `ArgGroup`, so `--quiet` alone is still the "no
   field given" usage error rather than a legal call that does nothing.
-- API — all six routes under the global `guard` middleware (Host allowlist +
+- API — all seven routes under the global `guard` middleware (Host allowlist +
   Content-Type), no carve-outs:
 
   | Route | Success | Gate |
@@ -112,8 +139,9 @@ request/response record, the `HookRun` twin.
   | `PATCH /api/scripts/{id}` | 200 | `require_agent_access` |
   | `DELETE /api/scripts/{id}` | 200, destroyed record | `require_agent_access` |
   | `POST /api/scripts/{id}/run` (`{"values": {…}}`) | 200 | `require_agent_access` |
+  | `POST /api/scripts/{id}/run/stream` (same body) | 200, chunked `application/x-ndjson` | `require_agent_access` |
 
-  **All six routes share one gate** (mesa task 1022, the reversal tasks 1004
+  **All seven routes share one gate** (mesa task 1022, the reversal tasks 1004
   and 1021 already made for the library and Settings). Authoring a script is
   *choosing a program mesa will execute* and running one is *triggering*
   execution of something already stored — both are the agents' capability
@@ -134,9 +162,13 @@ request/response record, the `HookRun` twin.
   (`lan_page_may_author_a_script_but_not_from_a_rebound_page`).
   A malformed body is 422 (every handler takes `Result<Json<T>, JsonRejection>`,
   never bare `Json`); values that fail `validate_values` are 422 `validation`;
-  a bash that will not start is 502 `unavailable`. The run's blocking
-  subprocess goes through `tokio::task::spawn_blocking` — it has no timeout and
-  must never occupy an async worker.
+  a bash that will not start is 502 `unavailable` — on the stream route too,
+  since all of that is decided before its first byte. The run's blocking
+  subprocess (and the stream's read loop) goes through
+  `tokio::task::spawn_blocking` — it has no timeout and must never occupy an
+  async worker. The captured route's payload and the CLI's `script run` output
+  are unchanged by the stream route; the stream is an addition, not a
+  replacement.
 - Web UI: **Scripts** is a flat left-nav entry at `#/scripts`, immediately after
   Terminal (not part of the project subtree, so `navCollapse.ts` is untouched),
   plus one Command Palette destination. `pages/ScriptsView.tsx` is the list and
@@ -158,20 +190,41 @@ request/response record, the `HookRun` twin.
   all. Escape is otherwise unbound here, so arming it costs this page nothing.
   There is still no status bar, no find bar and no `onSave` (Cmd/Ctrl+S stays
   the browser's).
-  `components/ScriptRunModal.tsx` wraps `components/ScriptRunPanel.tsx`,
-  reusing the `.create-task-backdrop`/`.create-task-modal` classes so
-  `keyboardScope.ts::shouldIgnoreShortcut` keeps working unchanged. The panel
-  generates one control per declared arg (`text`→text input, `number`→number
-  input, `bool`→checkbox, `choice`→`<select>`) and renders the returned run as
-  an exit-code badge plus separate stdout/stderr blocks — a failing run is
-  displayed as **data**, not as an app error. All form logic is pure and
-  unit-tested in `scriptDraft.ts`, mirroring the Rust validation rules so the
-  two cannot drift; every field is held as a **string** so a half-typed value
-  survives a keystroke.
+  **Running** a script (mesa task 1196) replaces the list with
+  `components/ScriptRunPane.tsx` — in the page, no modal, no dimming, `←
+  scripts` to go back. Top: the name and description, the generated form (one
+  control per declared arg: `text`→text input, `number`→number input,
+  `bool`→checkbox, `choice`→`<select>`), RUN, and the last run's summary (its
+  start time, exit code — or `stopped`/the failure — duration, and the cwd,
+  shown from the project binding but never sent). Under it a horizontal drag
+  handle resizes the split (`clampFormHeight`: the form keeps 96px, the log
+  120px) and a toggle on it folds the form away entirely. Below, one log reads
+  `POST …/run/stream` through `fetch` + a body reader (`EventSource` cannot
+  POST): every line timestamped with the run's start plus its `t`, stderr
+  tagged and coloured, and a header with the state (running / finished /
+  stopped / failed), the equivalent `--set` command line and the elapsed
+  clock, plus **follow** (pins the log to its end; scrolling up turns it off,
+  scrolling back to the bottom turns it on), **wrap**, **copy** (the log as
+  timestamped text) and **stop** (aborts the fetch, which is what kills the
+  script server-side). A run that exited nonzero is displayed as **data**, not
+  as an app error; only a request refused before it started shows `.error`.
+  **Leaving the pane does not stop a run** — closing the old modal never did,
+  and a navigation must not kill a release halfway — the run finishes
+  server-side with nobody reading it. The stream's pure logic (NDJSON line
+  cutting across chunks, the follow predicate, the split clamp, time and
+  command formatting, the copy text) is `scriptRun.ts`, unit-tested; the form
+  logic is `scriptDraft.ts`, mirroring the Rust validation rules so the two
+  cannot drift; every field is held as a **string** so a half-typed value
+  survives a keystroke. The pane has no key handling of its own: typing in its
+  fields is already outside every global shortcut
+  (`keyboardScope.ts::shouldIgnoreShortcut`'s text-control rule).
 - Gate: `scripts/scripts-check.sh` — the CLI and API contracts, the error
   shapes and exit codes, the `--quiet` key set, run semantics (nonzero exit as
-  data, streams separated, truncation), the cwd ladder, and the two assertions
+  data, streams separated, truncation), the streamed run (arrival-order
+  interleaving with sleeps, timestamps, one exit event, the same 422s/404 and
+  cwd/injection behaviour, and a client hanging up killing both bash and a
+  child it started), the cwd ladder, and the two assertions
   this feature exists to keep true: a hostile value is echoed **literally**, and
   an unsupplied argument is **unset rather than empty**. It asserts the
-  read/write gate pairing in **both** default and `--lan` mode, the same pairing
+  gate on every route, the stream included, in **both** default and `--lan` mode, the same pairing
   `api-check.sh` holds for tasks.

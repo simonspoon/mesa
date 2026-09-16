@@ -1656,6 +1656,46 @@ pub struct ScriptRun {
     pub truncated: bool,
 }
 
+/// Which of a script's two output pipes a streamed line came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum ScriptStream {
+    Stdout,
+    Stderr,
+}
+
+/// One line of `POST /api/scripts/{id}/run/stream`'s NDJSON body (mesa task
+/// 1196): every output line as it arrives, stdout and stderr interleaved in
+/// arrival order, then exactly one `exit` — or one `error` if the run could
+/// not be collected after the response had started. Like [`ScriptRun`], never
+/// persisted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum ScriptRunEvent {
+    Line {
+        stream: ScriptStream,
+        /// Milliseconds since the run started, taken when the line was read.
+        #[ts(type = "number")]
+        t: u64,
+        /// The line without its trailing newline (lossy UTF-8).
+        text: String,
+    },
+    Exit {
+        /// Process exit code; -1 when the script was killed by a signal.
+        code: i32,
+        #[ts(type = "number")]
+        duration_ms: u64,
+        /// True when either stream passed the 64 KiB cap; that stream's later
+        /// lines were dropped.
+        truncated: bool,
+    },
+    Error {
+        message: String,
+    },
+}
+
 // ---- artifacts (agent-written pages, mesa task 974) --------------------
 //
 // NOTE: unrelated to `Task::artifact` (a bounded pointer string — a commit

@@ -20,15 +20,23 @@
 //! on this call genuinely *unset*, so `set -u` fires instead of the body
 //! silently reading a stale or empty value.
 //!
-//! Runs are capture-and-return: all three stdio piped, no timeout (matching
-//! hooks and agents), output capped. A nonzero exit is **data** — the only
-//! `Err` is "bash could not be spawned".
+//! Runs come in two shapes over one [`command`]: capture-and-return ([`run`],
+//! the CLI's and `POST /api/scripts/{id}/run`'s) and line-by-line streaming
+//! ([`start`] + [`Streaming::stream`], the Scripts page's). Both pipe all three
+//! stdio, have no timeout (matching hooks and agents) and cap each stream at
+//! 64 KiB. A nonzero exit is **data** — the only `Err` is "bash could not be
+//! spawned".
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use crate::core::types::{Script, ScriptArg, ScriptArgKind, ScriptRun};
+use crate::core::types::{
+    Script, ScriptArg, ScriptArgKind, ScriptRun, ScriptRunEvent, ScriptStream,
+};
 
 /// Prefix of every environment variable this module sets on a run.
 pub const ALL_ENV_PREFIX: &str = "MESA_ARG_";
@@ -115,19 +123,10 @@ pub fn validate_values(
     Ok(resolved)
 }
 
-/// Validates `values`, then runs `script.body` under `bash -c` in `cwd`
-/// (inheriting the caller's directory when `None`) and captures the outcome.
-///
-/// `Err` only when bash itself cannot be spawned or its output cannot be
-/// collected; the script's own nonzero exit is reported in
-/// [`ScriptRun::exit_code`] with a success status, exactly like a `HookRun`.
-pub fn run(
-    script: &Script,
-    values: &BTreeMap<String, String>,
-    cwd: Option<&str>,
-) -> Result<ScriptRun, String> {
-    let resolved = validate_values(&script.args, values)?;
-
+/// The one `bash -c` invocation both run shapes use: body verbatim, values
+/// positionally and by environment, the unset sweep, the working directory.
+/// `values` must already be resolved by [`validate_values`].
+fn command(script: &Script, resolved: &BTreeMap<String, String>, cwd: Option<&str>) -> Command {
     let mut cmd = Command::new("bash");
     // The body is one argument, never a fragment of a command line. `$0` is
     // the script's name so `set -u` diagnostics and `basename $0` read right.
@@ -146,7 +145,7 @@ pub fn run(
     for var in env_var_names(&script.args) {
         cmd.env_remove(var);
     }
-    for (name, value) in &resolved {
+    for (name, value) in resolved {
         cmd.env(env_var_name(name), value);
     }
     if let Some(dir) = cwd {
@@ -155,18 +154,36 @@ pub fn run(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    cmd
+}
 
-    let mut child = cmd
+/// Close stdin from a thread while the caller drains stdout/stderr: writing
+/// inline could deadlock against a script that fills its output pipe first
+/// (hooks.rs:107-115). Scripts get no payload — an empty stdin that reaches
+/// EOF, so `read` in a body returns rather than hanging.
+fn close_stdin(child: &mut Child) -> std::thread::JoinHandle<()> {
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(b"");
+    })
+}
+
+/// Validates `values`, then runs `script.body` under `bash -c` in `cwd`
+/// (inheriting the caller's directory when `None`) and captures the outcome.
+///
+/// `Err` only when bash itself cannot be spawned or its output cannot be
+/// collected; the script's own nonzero exit is reported in
+/// [`ScriptRun::exit_code`] with a success status, exactly like a `HookRun`.
+pub fn run(
+    script: &Script,
+    values: &BTreeMap<String, String>,
+    cwd: Option<&str>,
+) -> Result<ScriptRun, String> {
+    let resolved = validate_values(&script.args, values)?;
+    let mut child = command(script, &resolved, cwd)
         .spawn()
         .map_err(|e| format!("failed to run bash for script {:?}: {e}", script.name))?;
-    // Close stdin from a thread while wait_with_output drains stdout/stderr:
-    // writing inline could deadlock against a script that fills its output
-    // pipe first (hooks.rs:107-115). Scripts get no payload — an empty stdin
-    // that reaches EOF, so `read` in a body returns rather than hanging.
-    let mut stdin = child.stdin.take().expect("stdin was piped");
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(b"");
-    });
+    let writer = close_stdin(&mut child);
     let out = child
         .wait_with_output()
         .map_err(|e| format!("failed to collect output of script {:?}: {e}", script.name))?;
@@ -183,6 +200,176 @@ pub fn run(
         stderr,
         truncated: out_cut || err_cut,
     })
+}
+
+/// A script started by [`start`], not yet read. Dropping it without calling
+/// [`Streaming::stream`] kills it.
+pub struct Streaming {
+    child: Child,
+    started: Instant,
+    name: String,
+}
+
+/// Validates `values` and starts the script exactly as [`run`] would — the
+/// same [`command`] — except in a process group of its own, so a stop can
+/// kill whatever the body started too. Split from [`Streaming::stream`] so a
+/// spawn failure is still a status code, before any byte is on the wire.
+pub fn start(
+    script: &Script,
+    values: &BTreeMap<String, String>,
+    cwd: Option<&str>,
+) -> Result<Streaming, String> {
+    let resolved = validate_values(&script.args, values)?;
+    let mut cmd = command(script, &resolved, cwd);
+    cmd.process_group(0);
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to run bash for script {:?}: {e}", script.name))?;
+    Ok(Streaming {
+        child,
+        started: Instant::now(),
+        name: script.name.clone(),
+    })
+}
+
+/// What a pipe reader hands the streaming loop.
+enum Pumped {
+    Line(ScriptStream, u64, String),
+    /// The pipe reached EOF; `true` when its cap cut something.
+    Done(bool),
+}
+
+/// How often the streaming loop asks `cancelled` while the script is silent.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+
+impl Streaming {
+    /// Emits every output line as it is read, stdout and stderr interleaved in
+    /// arrival order, then one `exit` (or one `error`) event. Each stream is
+    /// capped at [`OUTPUT_CAP`] bytes like the captured run: past it, that
+    /// stream's lines are read and dropped (so the script never blocks on a
+    /// full pipe) and the exit event says `truncated`.
+    ///
+    /// The run stops — the whole process group is killed and nothing more is
+    /// emitted — as soon as `emit` returns `false` or `cancelled` returns
+    /// `true`, which is how a client that walks away stops the script: the
+    /// caller's `cancelled` is asked at least every [`CANCEL_POLL`], so a
+    /// script that prints nothing is stopped too.
+    pub fn stream(
+        mut self,
+        mut emit: impl FnMut(ScriptRunEvent) -> bool,
+        cancelled: impl Fn() -> bool,
+    ) {
+        let writer = close_stdin(&mut self.child);
+        let (tx, rx) = mpsc::channel();
+        let stdout = self.child.stdout.take().expect("stdout was piped");
+        let stderr = self.child.stderr.take().expect("stderr was piped");
+        // Both readers feed one channel, so its order is arrival order.
+        pump(stdout, ScriptStream::Stdout, self.started, tx.clone());
+        pump(stderr, ScriptStream::Stderr, self.started, tx);
+
+        let mut open = 2;
+        let mut truncated = false;
+        while open > 0 {
+            if cancelled() {
+                return self.kill();
+            }
+            match rx.recv_timeout(CANCEL_POLL) {
+                Ok(Pumped::Line(stream, t, text)) => {
+                    if !emit(ScriptRunEvent::Line { stream, t, text }) {
+                        return self.kill();
+                    }
+                }
+                Ok(Pumped::Done(cut)) => {
+                    open -= 1;
+                    truncated |= cut;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = writer.join();
+        let event = match self.child.wait() {
+            Ok(status) => ScriptRunEvent::Exit {
+                code: status.code().unwrap_or(-1),
+                duration_ms: self.started.elapsed().as_millis() as u64,
+                truncated,
+            },
+            Err(e) => ScriptRunEvent::Error {
+                message: format!("failed to collect output of script {:?}: {e}", self.name),
+            },
+        };
+        emit(event);
+    }
+
+    /// SIGKILLs the script's process group (its own, from [`start`]), then
+    /// reaps the leader. The readers are left to finish on their own: a
+    /// descendant that escaped the group may still hold a pipe open.
+    fn kill(&mut self) {
+        let pgid = self.child.id();
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pgid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for Streaming {
+    fn drop(&mut self) {
+        // Reaped already on every path through `stream`; this is the unread
+        // case, which must not leave a script running with nobody reading it.
+        if let Ok(None) = self.child.try_wait() {
+            self.kill();
+        }
+    }
+}
+
+/// Reads one pipe line by line on its own thread, capping it at
+/// [`OUTPUT_CAP`] bytes.
+fn pump(
+    pipe: impl Read + Send + 'static,
+    stream: ScriptStream,
+    started: Instant,
+    tx: mpsc::Sender<Pumped>,
+) {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut used = 0usize;
+        let mut cut = false;
+        let mut buf = Vec::new();
+        loop {
+            let room = OUTPUT_CAP - used;
+            if room == 0 {
+                // Keep draining so the script never blocks on a full pipe.
+                cut |= std::io::copy(&mut reader, &mut std::io::sink()).unwrap_or(0) > 0;
+                break;
+            }
+            buf.clear();
+            let n = match (&mut reader).take(room as u64).read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            used += n;
+            let whole = buf.last() == Some(&b'\n');
+            if whole {
+                buf.pop();
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+            } else if used == OUTPUT_CAP {
+                // The cap landed mid-line; whatever follows is dropped.
+                cut = true;
+            }
+            let t = started.elapsed().as_millis() as u64;
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            if tx.send(Pumped::Line(stream, t, text)).is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(Pumped::Done(cut));
+    });
 }
 
 /// Lossy UTF-8, truncated to [`OUTPUT_CAP`] on a char boundary. The flag is
@@ -369,6 +556,165 @@ mod tests {
         assert!(out.truncated);
         assert!(out.stdout.ends_with("[truncated]"), "no marker");
         assert!(out.stdout.len() <= OUTPUT_CAP + "\n[truncated]".len());
+    }
+
+    fn stream_all(s: &Script, vals: &BTreeMap<String, String>) -> Vec<ScriptRunEvent> {
+        let mut events = Vec::new();
+        start(s, vals, None).unwrap().stream(
+            |e| {
+                events.push(e);
+                true
+            },
+            || false,
+        );
+        events
+    }
+
+    #[test]
+    fn stream_interleaves_both_pipes_in_arrival_order_then_exits() {
+        let s = script(
+            "echo one; sleep 0.2; echo two >&2; sleep 0.2; printf 'three'; exit 4",
+            vec![],
+        );
+        let events = stream_all(&s, &values(&[]));
+        let lines: Vec<(ScriptStream, &str)> = events
+            .iter()
+            .filter_map(|e| match e {
+                ScriptRunEvent::Line { stream, text, .. } => Some((*stream, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (ScriptStream::Stdout, "one"),
+                (ScriptStream::Stderr, "two"),
+                (ScriptStream::Stdout, "three"),
+            ]
+        );
+        let ts: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                ScriptRunEvent::Line { t, .. } => Some(*t),
+                _ => None,
+            })
+            .collect();
+        assert!(ts[1] >= 150 && ts[2] >= ts[1] + 150, "{ts:?}");
+        match events.last().unwrap() {
+            ScriptRunEvent::Exit {
+                code,
+                duration_ms,
+                truncated,
+            } => {
+                assert_eq!(*code, 4);
+                assert!(*duration_ms >= 400);
+                assert!(!truncated);
+            }
+            other => panic!("last event {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_shares_the_value_plumbing_of_run() {
+        let s = script(
+            "printf '%s|%s\\n' \"$1\" \"${MESA_ARG_NOTE-UNSET}\"",
+            vec![
+                arg("t", ScriptArgKind::Text, true),
+                arg("note", ScriptArgKind::Text, false),
+            ],
+        );
+        let events = stream_all(&s, &values(&[("t", "; echo pwned #")]));
+        assert!(matches!(
+            &events[0],
+            ScriptRunEvent::Line { text, .. } if text == "; echo pwned #|UNSET"
+        ));
+        assert!(start(&s, &values(&[]), None).is_err(), "validation first");
+    }
+
+    #[test]
+    fn stream_caps_each_stream_and_reports_truncation() {
+        let s = script(
+            &format!("yes line | head -c {} ; echo tail >&2", OUTPUT_CAP + 4096),
+            vec![],
+        );
+        let events = stream_all(&s, &values(&[]));
+        let out_bytes: usize = events
+            .iter()
+            .filter_map(|e| match e {
+                ScriptRunEvent::Line {
+                    stream: ScriptStream::Stdout,
+                    text,
+                    ..
+                } => Some(text.len() + 1),
+                _ => None,
+            })
+            .sum();
+        assert!(out_bytes <= OUTPUT_CAP + 1, "{out_bytes}");
+        // The other stream is capped on its own.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ScriptRunEvent::Line { stream: ScriptStream::Stderr, text, .. } if text == "tail"
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(ScriptRunEvent::Exit {
+                truncated: true,
+                code: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn stream_kills_the_process_group_when_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pid");
+        // A child of the body, in the body's group: the stop must reach it.
+        let s = script(
+            &format!(
+                "sleep 30 & echo $! > '{}'; echo started; wait",
+                marker.display()
+            ),
+            vec![],
+        );
+        let begun = Instant::now();
+        let mut seen = 0;
+        let mut events = Vec::new();
+        start(&s, &values(&[]), None).unwrap().stream(
+            |e| {
+                seen += 1;
+                events.push(e);
+                true
+            },
+            || begun.elapsed() > Duration::from_millis(300),
+        );
+        assert!(begun.elapsed() < Duration::from_secs(5));
+        assert_eq!(seen, 1, "only the line, no exit event: {events:?}");
+        let pid = std::fs::read_to_string(&marker).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the body's child survived the stop");
+    }
+
+    #[test]
+    fn stream_stops_when_emit_reports_the_reader_gone() {
+        let s = script("while :; do echo x; sleep 0.01; done", vec![]);
+        let begun = Instant::now();
+        let mut n = 0;
+        start(&s, &values(&[]), None).unwrap().stream(
+            |_| {
+                n += 1;
+                n < 3
+            },
+            || false,
+        );
+        assert_eq!(n, 3);
+        assert!(begun.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

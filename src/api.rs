@@ -1975,6 +1975,9 @@ fn router(state: AppState) -> Router {
             get(show_script).patch(update_script).delete(delete_script),
         )
         .route("/api/scripts/{id}/run", post(run_script))
+        // The Scripts page's run: the same run, streamed as NDJSON lines as
+        // they arrive (mesa task 1196). Same gate, same validation and cwd.
+        .route("/api/scripts/{id}/run/stream", post(run_script_stream))
         // Library: agent definitions, skills, hooks, prompts and CLAUDE.md
         // files, each (a prompt only when it exports) mirrored onto disk under
         // `.claude/`. A row becomes code mesa or Claude Code executes, so all
@@ -4736,6 +4739,61 @@ async fn run_script(
             .map_err(|e| agents_unavailable(format!("script run panicked: {e}")))?
             .map_err(agents_unavailable)?;
     Ok(Json(run).into_response())
+}
+
+/// Runs one script and streams its output as `application/x-ndjson`, one
+/// [`crate::core::ScriptRunEvent`] per line: each output line as it is read (stdout and
+/// stderr interleaved in arrival order), then one `exit` — the page's run pane
+/// (mesa task 1196). Everything before the first byte is [`run_script`]'s:
+/// the same gate, the same 422 for bad values or an unusable cwd, 502 when
+/// bash will not start, and the same `core::scripts` command.
+///
+/// **Stop is the client going away.** When the response body is dropped the
+/// channel closes, and the blocking loop — which asks `is_closed` at least
+/// every 100ms even while the script is silent — kills the script's process
+/// group. Nothing is persisted; the 64 KiB per-stream cap applies.
+async fn run_script_stream(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<ScriptRunBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    let script = {
+        let store = state.store.lock().unwrap();
+        store.get_script(id)?
+    };
+    let cwd = script_cwd(&state, &script)?;
+    scripts::validate_values(&script.args, &body.values).map_err(|message| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message,
+    })?;
+    let running =
+        scripts::start(&script, &body.values, cwd.as_deref()).map_err(agents_unavailable)?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
+    tokio::task::spawn_blocking(move || {
+        running.stream(
+            |event| {
+                let mut line = serde_json::to_vec(&event).unwrap_or_default();
+                line.push(b'\n');
+                tx.blocking_send(Ok(line)).is_ok()
+            },
+            || tx.is_closed(),
+        )
+    });
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        Body::from_stream(ReceiverStream::new(rx)),
+    )
+        .into_response())
 }
 
 /// The working directory a run happens in, resolved **server-side** from the

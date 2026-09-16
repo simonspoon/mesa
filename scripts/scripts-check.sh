@@ -14,7 +14,10 @@
 #   * cwd is resolved server-side: a project-bound script runs in that
 #     project's `local_path`, an unbound one in `~/.mesa/workspace`, and a
 #     bound project with no `local_path` is 422 validation;
-#   * ONE gate over all six routes — reads, run and authoring alike behind
+#   * the streamed run (/run/stream, mesa task 1196) interleaves stdout and
+#     stderr in arrival order, ends with one exit event, validates like the
+#     captured run, and a client hanging up kills the script and its child;
+#   * ONE gate over all seven routes — reads, run and authoring alike behind
 #     `require_agent_access` (mesa task 1022) — holds in BOTH `serve` and
 #     `serve --lan`.
 set -euo pipefail
@@ -621,6 +624,78 @@ api 422 POST "/api/scripts/$ANOPATH/run" '{"values":{}}'
 [ "$(jqb .error.code)" = "validation" ] || fail "API cwd: no local_path must be 422 validation, got $BODY"
 ok "POST /api/scripts/{id}/run for a bound project with no local_path: 422 validation"
 
+# ---- streamed run (mesa task 1196) ----
+# The Scripts page's run: the same run as NDJSON, one event per line, stdout
+# and stderr interleaved in arrival order, then one `exit`. Stop is the
+# client hanging up — the server must kill the script's whole process group.
+
+stream() { # stream <path> <json-body> [extra curl args...] -> STATUS, BODY, CTYPE
+  local path=$1 body=$2; shift 2
+  STATUS=$(curl -sN -o "$TMP/stream" -D "$TMP/stream-headers" -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' -d "$body" "$@" "http://127.0.0.1:$PORT$path")
+  BODY=$(cat "$TMP/stream")
+  CTYPE=$(tr -d '\r' <"$TMP/stream-headers" | awk -F': ' 'tolower($1)=="content-type"{print $2}')
+}
+
+api 201 POST /api/scripts "$(jq -nc '{name:"api-streamer", body:"echo one; sleep 0.3; echo two >&2; sleep 0.3; printf three; exit 3"}')"
+ASTREAM=$(jqb .id)
+stream "/api/scripts/$ASTREAM/run/stream" '{"values":{}}'
+[ "$STATUS" = "200" ] || fail "API stream: expected 200, got $STATUS: $BODY"
+[ "$CTYPE" = "application/x-ndjson" ] || fail "API stream: content-type, got '$CTYPE'"
+[ "$(jq -sc '[.[] | select(.type == "line") | [.stream, .text]]' <<<"$BODY")" = '[["stdout","one"],["stderr","two"],["stdout","three"]]' ] ||
+  fail "API stream: lines not interleaved in arrival order: $BODY"
+[ "$(jq -s '[.[] | select(.type == "line") | .t] | .[1] >= 250 and .[2] >= .[1] + 250' <<<"$BODY")" = "true" ] ||
+  fail "API stream: line timestamps must follow the sleeps: $BODY"
+[ "$(jq -sc '.[-1] | [.type, .code, .truncated, (.duration_ms >= 600)]' <<<"$BODY")" = '["exit",3,false,true]' ] ||
+  fail "API stream: last event must be the exit event: $BODY"
+[ "$(jq -s '[.[] | select(.type == "exit")] | length' <<<"$BODY")" = "1" ] ||
+  fail "API stream: exactly one exit event: $BODY"
+ok "POST /api/scripts/{id}/run/stream: NDJSON lines interleaved in arrival order, timestamped, then one exit event carrying the nonzero code"
+
+stream "/api/scripts/$AS/run/stream" '{"values":{}}'
+[ "$STATUS" = "422" ] || fail "API stream missing required: expected 422, got $STATUS"
+[ "$(jqb .error.code)" = "validation" ] || fail "API stream missing required: error.code"
+stream "/api/scripts/$AS/run/stream" '{"values":{"who":"x","nope":"y"}}'
+[ "$STATUS" = "422" ] || fail "API stream undeclared key: expected 422, got $STATUS"
+stream "/api/scripts/$ANOPATH/run/stream" '{"values":{}}'
+[ "$STATUS" = "422" ] && [ "$(jqb .error.code)" = "validation" ] ||
+  fail "API stream: no local_path must be 422 validation, got $STATUS $BODY"
+stream /api/scripts/999999/run/stream '{"values":{}}'
+[ "$STATUS" = "404" ] || fail "API stream unknown id: expected 404, got $STATUS"
+ok "POST /api/scripts/{id}/run/stream: bad values and an unusable cwd are 422 validation, an unknown id 404 — before any stream starts"
+
+stream "/api/scripts/$AWHERE/run/stream" '{"values":{}}'
+[ "$(jq -sr '.[0].text' <<<"$BODY")" = "$WORKDIR" ] ||
+  fail "API stream cwd: bound script must run in the project's local_path, got $BODY"
+API_PWNED2="$TMP/api-pwned-stream"
+stream "/api/scripts/$AECHO/run/stream" "$(jq -nc --arg v "; touch $API_PWNED2 #" '{values:{target:$v}}')"
+[ "$(jq -sr '.[0].text' <<<"$BODY")" = "; touch $API_PWNED2 #" ] || fail "API stream INJECTION: value not literal: $BODY"
+[ -e "$API_PWNED2" ] && fail "API stream INJECTION: the value was executed"
+ok "POST /api/scripts/{id}/run/stream: same cwd ladder and injection-proof values as the captured run"
+
+# Stop = the client aborts. The body starts a child in its own process group,
+# prints once and then falls silent, so the server can only notice the hangup
+# by polling — and must kill the child as well as bash.
+PIDS="$TMP/stream-pids"
+api 201 POST /api/scripts "$(jq -nc --arg f "$PIDS" '{name:"api-sleeper", body:("sleep 60 & echo $$ $! > \u0027" + $f + "\u0027; echo started; wait")}')"
+ASLEEP=$(jqb .id)
+set +e
+curl -sN --max-time 2 -o "$TMP/stream-abort" -X POST -H 'Content-Type: application/json' \
+  -d '{"values":{}}' "http://127.0.0.1:$PORT/api/scripts/$ASLEEP/run/stream"
+set -e
+grep -q '"started"' "$TMP/stream-abort" || fail "API stream abort: the first line never arrived: $(cat "$TMP/stream-abort")"
+read -r BASH_PID SLEEP_PID <"$PIDS"
+GONE=
+for _ in $(seq 1 30); do
+  if ! kill -0 "$BASH_PID" 2>/dev/null && ! kill -0 "$SLEEP_PID" 2>/dev/null; then GONE=1; break; fi
+  sleep 0.1
+done
+[ -n "$GONE" ] || {
+  kill "$SLEEP_PID" "$BASH_PID" 2>/dev/null
+  fail "API stream abort: the script (bash $BASH_PID, child $SLEEP_PID) outlived the client"
+}
+ok "POST /api/scripts/{id}/run/stream: a client that hangs up stops the run — bash and its child are both killed"
+
 # ---- delete ----
 
 api 200 DELETE "/api/scripts/$AFAIL"
@@ -637,7 +712,7 @@ api 404 DELETE /api/scripts/999999
 ok "DELETE /api/scripts/{id} unknown id: 404 not_found"
 
 # ================= gates: default mode =================
-# A script body is a program mesa will execute, so all six routes — reads, run
+# A script body is a program mesa will execute, so all seven routes — reads, run
 # and authoring alike — sit behind `require_agent_access` (mesa task 1022,
 # replacing the loopback-only check the three mutations used to carry). Every
 # curl below originates on this machine, so the server always sees a LOOPBACK
@@ -674,6 +749,14 @@ raw GET "/api/scripts/$AS" -H "Host: evil.example"
 raw POST "/api/scripts/$AS/run" -H "Host: evil.example" \
   -H 'Content-Type: application/json' -d '{"values":{"who":"x"}}'
 [ "$STATUS" = "403" ] || fail "default: run with a foreign Host must be 403, got $STATUS"
+raw POST "/api/scripts/$AS/run/stream" -H "Host: evil.example" \
+  -H 'Content-Type: application/json' -d '{"values":{"who":"x"}}'
+[ "$STATUS" = "403" ] || fail "default: stream with a foreign Host must be 403, got $STATUS"
+raw POST "/api/scripts/$AS/run/stream" -H "Host: 127.0.0.1:$PORT" -H 'Origin: https://evil.example' \
+  -H 'Content-Type: application/json' -d '{"values":{"who":"x"}}'
+[ "$STATUS" = "403" ] || fail "default: stream with a foreign Origin must be 403, got $STATUS"
+raw POST "/api/scripts/$AS/run/stream"
+[ "$STATUS" = "415" ] || fail "default: stream with no Content-Type must be 415, got $STATUS"
 ok "default mode: show and run carry the same gate as list"
 
 raw POST /api/scripts -H "Host: evil.example" -H 'Content-Type: application/json' \
@@ -762,7 +845,14 @@ ok "--lan: reads follow require_agent_access — IP-literal Host on our port all
   fail "--lan: run must reject a DNS-name Host"
 [ "$(lan_req POST "/api/scripts/$AS/run" "192.0.2.7:$LAN_PORT" 'https://evil.example' '{"values":{"who":"x"}}')" = "403" ] ||
   fail "--lan: run must reject a foreign Origin"
-ok "--lan: POST /api/scripts/{id}/run is reachable LAN-side (trigger allowed) but shut to rebinding and cross-site pages"
+[ "$(lan_req POST "/api/scripts/$AS/run/stream" "192.0.2.7:$LAN_PORT" '' '{"values":{"who":"lan"}}')" = "200" ] ||
+  fail "--lan: the streamed run must be reachable from a LAN-shaped request"
+[ "$(jq -sr '.[-1].type' <"$TMP/body")" = "exit" ] || fail "--lan: the streamed run must end with its exit event"
+[ "$(lan_req POST "/api/scripts/$AS/run/stream" 'evil.example' '' '{"values":{"who":"x"}}')" = "403" ] ||
+  fail "--lan: the streamed run must reject a DNS-name Host"
+[ "$(lan_req POST "/api/scripts/$AS/run/stream" "192.0.2.7:$LAN_PORT" 'https://evil.example' '{"values":{"who":"x"}}')" = "403" ] ||
+  fail "--lan: the streamed run must reject a foreign Origin"
+ok "--lan: POST /api/scripts/{id}/run and /run/stream are reachable LAN-side (trigger allowed) but shut to rebinding and cross-site pages"
 
 # Authoring carries that identical gate as of mesa task 1022: a rebinding page
 # and a cross-site page are refused, a page this server handed out is not.

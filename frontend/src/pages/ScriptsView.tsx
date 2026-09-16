@@ -9,7 +9,7 @@ import {
 import { useLiveContext } from '../liveContext'
 import { CodeEditor } from '../components/CodeEditor'
 import { ConfirmDelete } from '../components/ConfirmDelete'
-import { ScriptRunModal } from '../components/ScriptRunModal'
+import { ScriptRunPane } from '../components/ScriptRunPane'
 import {
   ARG_KINDS,
   argError,
@@ -260,8 +260,8 @@ export function ScriptsView() {
   const [running, setRunning] = useState<Script | null>(null)
 
   // What the person is looking at (mesa task 888). A run wins over an open
-  // edit form: it is the modal on top, and it is the one the conversation is
-  // about while it is up. The create form has no script to name yet, so it
+  // edit form: its pane replaces the list, and it is the one the conversation
+  // is about while it is up. The create form has no script to name yet, so it
   // reports the form itself.
   const focused =
     running ??
@@ -274,6 +274,29 @@ export function ScriptsView() {
     label: focused !== null ? focused.name : editing === 'new' ? 'new script' : null,
     detail: running !== null ? 'running' : null,
   })
+
+  if (running !== null) {
+    // The run pane is the page while it is open (mesa task 1196): no modal,
+    // no dimming. The cwd is shown, never sent — the server resolves it.
+    const project =
+      running.project_id === null
+        ? null
+        : projects?.find((p) => p.id === running.project_id)
+    const cwd =
+      running.project_id === null
+        ? '~/.mesa/workspace'
+        : (project?.local_path ?? `project ${running.project_id} (no folder)`)
+    return (
+      <div className="scripts-page">
+        <ScriptRunPane
+          key={running.id}
+          script={running}
+          cwd={cwd}
+          onClose={() => setRunning(null)}
+        />
+      </div>
+    )
+  }
 
   return (
     <div className="scripts-page">
@@ -356,10 +379,6 @@ export function ScriptsView() {
             </li>
           ))}
         </ul>
-      )}
-
-      {running !== null && (
-        <ScriptRunModal script={running} onClose={() => setRunning(null)} />
       )}
     </div>
   )

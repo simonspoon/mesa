@@ -2,10 +2,12 @@
 // generated from the Rust domain types by ts-rs (src/types/) — do not
 // hand-write payload shapes here (spec Requirement 12).
 
-// The one runtime import here: the unregister query is a decision (which
-// of the two fields narrow the call), tested in `libraryHooks.test.ts`,
-// so it is not rebuilt inline.
+// The runtime imports here are decisions tested elsewhere, so they are not
+// rebuilt inline: the unregister query (which of the two fields narrow the
+// call, `libraryHooks.test.ts`) and the script-run stream's NDJSON line
+// cutting (`scriptRun.test.ts`).
 import { unregisterHookQuery } from './libraryHooks'
+import { finishNdjson, parseEvent, splitNdjson } from './scriptRun'
 
 import type { AgentSession } from './types/AgentSession'
 import type { AgentSpawned } from './types/AgentSpawned'
@@ -74,7 +76,7 @@ import type { Priority } from './types/Priority'
 import type { Project } from './types/Project'
 import type { Script } from './types/Script'
 import type { ScriptArg } from './types/ScriptArg'
-import type { ScriptRun } from './types/ScriptRun'
+import type { ScriptRunEvent } from './types/ScriptRunEvent'
 import type { Status } from './types/Status'
 import type { SystemInfo } from './types/SystemInfo'
 import type { Task } from './types/Task'
@@ -1440,11 +1442,44 @@ export function deleteScript(id: number): Promise<Script> {
  * validation error, a missing script, or bash failing to spawn (502
  * `unavailable`). Runs are not persisted.
  */
-export function runScript(
+/**
+ * Runs a script and hands each `ScriptRunEvent` to `onEvent` as its NDJSON
+ * line arrives (mesa task 1196). Resolves when the body ends; a refusal
+ * before the stream starts (422, 403, 502…) rejects with the usual
+ * `ApiError`. Aborting `signal` is the Stop button: the server kills the
+ * script when the response is dropped. `fetch` + a body reader rather than
+ * `EventSource`, which cannot POST.
+ */
+export async function runScriptStream(
   id: number,
   values: Record<string, string>,
-): Promise<ScriptRun> {
-  return request(`/api/scripts/${id}/run`, jsonInit('POST', { values }))
+  onEvent: (event: ScriptRunEvent) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`/api/scripts/${id}/run/stream`, {
+    ...jsonInit('POST', { values }),
+    headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+    signal,
+  })
+  if (!res.ok) throw await apiErrorFrom(res)
+  if (res.body === null) return
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let rest = ''
+  const deliver = (lines: string[]) => {
+    for (const line of lines) {
+      const event = parseEvent(line)
+      if (event !== null) onEvent(event)
+    }
+  }
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    const cut = splitNdjson(rest, decoder.decode(value, { stream: true }))
+    rest = cut.rest
+    deliver(cut.lines)
+  }
+  deliver(finishNdjson(rest + decoder.decode()))
 }
 
 // ---- Artifacts (mesa task 974) ----

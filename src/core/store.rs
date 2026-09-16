@@ -12,9 +12,9 @@ use super::types::{
     EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit, InboxItem, InboxKind,
     LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveBoard, LiveBoardKind,
     LiveBoardSummary, LiveContext, LiveMemoryHit, LiveNotebookEntry, LiveNotice, LiveRole,
-    LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, Script,
-    ScriptArg, ScriptArgKind, Status, Task, TaskEvent, TaskReceipt, Waypoint,
-    is_valid_artifact_content_type, task_name,
+    LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, RetroFinding,
+    RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind, Status, Task, TaskEvent, TaskReceipt,
+    Waypoint, is_valid_artifact_content_type, task_name,
 };
 
 #[derive(Debug)]
@@ -910,6 +910,33 @@ const MIGRATIONS: &[&str] = &[
     // `archived_at` is — the triage agent's verdict ("duplicate of task 12",
     // "shipped in abc123") kept beside the item it decided.
     "ALTER TABLE inbox ADD COLUMN archive_reason TEXT;",
+    // Task 1158: the session retrospective. `retro_runs` is one row per pass
+    // (`trigger` = `watcher` | `manual`), written before the agent is spawned
+    // — the claim that stops a second dispatch inside the interval — and
+    // deleted again when the spawn fails. `retro_findings` is the finding
+    // log: one row per `fingerprint`, so a repeat bumps `count` and appends
+    // `evidence` instead of filing a second inbox item. It lives in the db,
+    // not in server memory like `inbox_dispatched`, because a retrospective's
+    // memory has to survive a restart and span runs days apart.
+    // `inbox_item_id` is `ON DELETE SET NULL`: triage deletes the item it
+    // assigns, and the finding must remember it was filed regardless.
+    "CREATE TABLE retro_runs (
+        id INTEGER PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        trigger TEXT NOT NULL
+    );
+    CREATE TABLE retro_findings (
+        id INTEGER PRIMARY KEY,
+        fingerprint TEXT NOT NULL UNIQUE,
+        subject TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 1,
+        evidence TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        inbox_item_id INTEGER REFERENCES inbox(id) ON DELETE SET NULL
+    );",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1303,6 +1330,67 @@ fn row_to_live_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSummary>
         updated_at: row.get(3)?,
     })
 }
+
+const RETRO_RUN_COLUMNS: &str = "id, started_at, trigger";
+
+fn row_to_retro_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetroRun> {
+    Ok(RetroRun {
+        id: row.get(0)?,
+        started_at: row.get(1)?,
+        trigger: row.get(2)?,
+    })
+}
+
+const RETRO_FINDING_COLUMNS: &str = "id, fingerprint, subject, kind, summary, count, evidence, \
+                                     first_seen_at, last_seen_at, inbox_item_id";
+
+fn row_to_retro_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetroFinding> {
+    Ok(RetroFinding {
+        id: row.get(0)?,
+        fingerprint: row.get(1)?,
+        subject: row.get(2)?,
+        kind: row.get(3)?,
+        summary: row.get(4)?,
+        count: row.get(5)?,
+        evidence: row.get(6)?,
+        first_seen_at: row.get(7)?,
+        last_seen_at: row.get(8)?,
+        inbox_item_id: row.get(9)?,
+    })
+}
+
+/// The evidence field after one more report: `line` appended after what is
+/// already there (newest last), then the **oldest** lines dropped until the
+/// whole field fits in [`RETRO_EVIDENCE_MAX`] characters. One line is at most
+/// [`RETRO_EVIDENCE_LINE_MAX`], so the newest line always survives. `None`
+/// in, `None` out when there is nothing to add.
+fn append_retro_evidence(existing: Option<&str>, line: Option<&str>) -> Option<String> {
+    let mut joined = match (existing, line) {
+        (Some(old), Some(new)) => format!("{old}\n{new}"),
+        (Some(old), None) => old.to_string(),
+        (None, Some(new)) => new.to_string(),
+        (None, None) => return None,
+    };
+    while joined.chars().count() > RETRO_EVIDENCE_MAX {
+        match joined.split_once('\n') {
+            Some((_, rest)) => joined = rest.to_string(),
+            None => break,
+        }
+    }
+    Some(joined)
+}
+
+/// The whole `evidence` field's ceiling, in characters — the oldest lines
+/// are trimmed past it (`append_retro_evidence`).
+pub const RETRO_EVIDENCE_MAX: usize = 4000;
+/// One report's evidence line, in characters.
+pub const RETRO_EVIDENCE_LINE_MAX: usize = 2000;
+/// `fingerprint`, `subject` and `kind` are keys, bounded like a name.
+pub const RETRO_KEY_MAX: usize = 200;
+/// `summary` is one paragraph, not a report — the report is the inbox item.
+pub const RETRO_SUMMARY_MAX: usize = 2000;
+/// The most `list_retro_findings` will return.
+pub const RETRO_FINDINGS_LIST_MAX: i64 = 500;
 
 /// The one route rule, shared by `set_live_route` and a `navigate` turn's
 /// `target` so the page can never be sent somewhere the session couldn't
@@ -5229,6 +5317,213 @@ impl Store {
             "SELECT {LIVE_SUMMARY_COLUMNS} FROM live_summaries ORDER BY session_id DESC LIMIT ?1"
         ))?;
         let rows = stmt.query_map([limit], row_to_live_summary)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ---- the session retrospective (mesa task 1158) ----
+
+    /// Records that a retrospective started — `trigger` is `watcher` or
+    /// `manual` — and answers the row. Written **before** the spawn on both
+    /// sites, so it is the claim a concurrent `mesa retro run` sees as
+    /// `conflict`; [`Store::delete_retro_run`] takes it back when the spawn
+    /// fails, so the next tick (or the person) retries.
+    pub fn record_retro_run(&mut self, trigger: &str) -> Result<RetroRun> {
+        if trigger != "watcher" && trigger != "manual" {
+            return Err(Error::Validation(format!(
+                "a retro run's trigger is `watcher` or `manual`, got {trigger:?}"
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO retro_runs (started_at, trigger) VALUES (datetime('now'), ?1)",
+            [trigger],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        Ok(self.conn.query_row(
+            &format!("SELECT {RETRO_RUN_COLUMNS} FROM retro_runs WHERE id = ?1"),
+            [id],
+            row_to_retro_run,
+        )?)
+    }
+
+    /// The newest run, or `None` on an install that has never run one.
+    pub fn last_retro_run(&self) -> Result<Option<RetroRun>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {RETRO_RUN_COLUMNS} FROM retro_runs ORDER BY id DESC LIMIT 1"),
+                [],
+                row_to_retro_run,
+            )
+            .optional()?)
+    }
+
+    /// Removes a run row — the rollback for a spawn that failed after the row
+    /// was claimed. `not_found` for an unknown id.
+    pub fn delete_retro_run(&mut self, id: i64) -> Result<()> {
+        let n = self
+            .conn
+            .execute("DELETE FROM retro_runs WHERE id = ?1", [id])?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("retro run {id} not found")));
+        }
+        Ok(())
+    }
+
+    /// Whether a retrospective is due, judged on the store's own clock: due
+    /// when nothing has ever run, or when the last run started at least
+    /// `interval_hours` ago. `next_due_at` is that deadline, for the CLI to
+    /// print; the counts are the finding log's size and how many of its rows
+    /// still point at an inbox item.
+    pub fn retro_status(&self, interval_hours: u32) -> Result<RetroStatus> {
+        let last_run = self.last_retro_run()?;
+        let (next_due_at, due) = match &last_run {
+            None => (None, true),
+            Some(run) => {
+                let (next, due): (String, bool) = self.conn.query_row(
+                    "SELECT datetime(?1, ?2), datetime(?1, ?2) <= datetime('now')",
+                    (&run.started_at, format!("+{interval_hours} hours")),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                (Some(next), due)
+            }
+        };
+        let (findings, linked): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COUNT(inbox_item_id) FROM retro_findings",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(RetroStatus {
+            last_run,
+            interval_hours,
+            next_due_at,
+            due,
+            findings,
+            linked,
+        })
+    }
+
+    /// Upserts one finding on its `fingerprint` and answers `(row, is_new)`.
+    /// A new fingerprint is a row with `count` 1 and `evidence` = the line
+    /// given; a known one bumps `count`, moves `last_seen_at`, and appends
+    /// the line to `evidence` (newest last, the oldest trimmed past
+    /// [`RETRO_EVIDENCE_MAX`]) while `subject`, `kind`, `summary` and the
+    /// inbox link stay as first recorded — `is_new == false` is the agent's
+    /// signal that this friction is already filed and nothing more goes to
+    /// the inbox.
+    pub fn record_retro_finding(
+        &mut self,
+        fingerprint: &str,
+        subject: &str,
+        kind: &str,
+        summary: &str,
+        evidence: Option<&str>,
+    ) -> Result<(RetroFinding, bool)> {
+        let fingerprint = Self::validate_retro_key("fingerprint", fingerprint)?;
+        let subject = Self::validate_retro_key("subject", subject)?;
+        let kind = Self::validate_retro_key("kind", kind)?;
+        let summary = summary.trim();
+        if summary.is_empty() {
+            return Err(Error::Validation(
+                "a finding's summary may not be empty".into(),
+            ));
+        }
+        if summary.chars().count() > RETRO_SUMMARY_MAX {
+            return Err(Error::Validation(format!(
+                "a finding's summary must be at most {RETRO_SUMMARY_MAX} characters"
+            )));
+        }
+        let evidence = evidence.map(str::trim).filter(|e| !e.is_empty());
+        if evidence.is_some_and(|e| e.chars().count() > RETRO_EVIDENCE_LINE_MAX) {
+            return Err(Error::Validation(format!(
+                "a finding's evidence must be at most {RETRO_EVIDENCE_LINE_MAX} characters"
+            )));
+        }
+        let existing: Option<(i64, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT id, evidence FROM retro_findings WHERE fingerprint = ?1",
+                [fingerprint],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let id = match &existing {
+            None => {
+                self.conn.execute(
+                    "INSERT INTO retro_findings \
+                     (fingerprint, subject, kind, summary, count, evidence, first_seen_at, last_seen_at) \
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, datetime('now'), datetime('now'))",
+                    (fingerprint, subject, kind, summary, evidence),
+                )?;
+                self.conn.last_insert_rowid()
+            }
+            Some((id, old)) => {
+                let merged = append_retro_evidence(old.as_deref(), evidence);
+                self.conn.execute(
+                    "UPDATE retro_findings SET count = count + 1, evidence = ?2, \
+                     last_seen_at = datetime('now') WHERE id = ?1",
+                    (id, merged),
+                )?;
+                *id
+            }
+        };
+        Ok((self.get_retro_finding(id)?, existing.is_none()))
+    }
+
+    fn validate_retro_key<'a>(label: &str, value: &'a str) -> Result<&'a str> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(Error::Validation(format!(
+                "a finding's {label} may not be empty"
+            )));
+        }
+        if value.chars().count() > RETRO_KEY_MAX {
+            return Err(Error::Validation(format!(
+                "a finding's {label} must be at most {RETRO_KEY_MAX} characters"
+            )));
+        }
+        Ok(value)
+    }
+
+    /// Points a finding at the inbox item it was filed as. Bumps nothing;
+    /// `not_found` for an unknown finding, `validation` for an unknown item.
+    pub fn link_retro_finding(&mut self, id: i64, inbox_item_id: i64) -> Result<RetroFinding> {
+        self.get_retro_finding(id)?;
+        if self.get_inbox_item(inbox_item_id).is_err() {
+            return Err(Error::Validation(format!(
+                "inbox item {inbox_item_id} not found"
+            )));
+        }
+        self.conn.execute(
+            "UPDATE retro_findings SET inbox_item_id = ?2 WHERE id = ?1",
+            (id, inbox_item_id),
+        )?;
+        self.get_retro_finding(id)
+    }
+
+    pub fn get_retro_finding(&self, id: i64) -> Result<RetroFinding> {
+        self.conn
+            .query_row(
+                &format!("SELECT {RETRO_FINDING_COLUMNS} FROM retro_findings WHERE id = ?1"),
+                [id],
+                row_to_retro_finding,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("retro finding {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// The finding log, most recently seen first. `limit` is clamped into
+    /// `1..=`[`RETRO_FINDINGS_LIST_MAX`], the `list_live_summaries` rule.
+    pub fn list_retro_findings(&self, limit: i64) -> Result<Vec<RetroFinding>> {
+        let limit = limit.clamp(1, RETRO_FINDINGS_LIST_MAX);
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {RETRO_FINDING_COLUMNS} FROM retro_findings \
+             ORDER BY last_seen_at DESC, id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map([limit], row_to_retro_finding)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -12158,15 +12453,246 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            61,
-            "a fresh db should report user_version 61"
+            62,
+            "a fresh db should report user_version 62"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 61);
+        assert_eq!(version, 62);
+    }
+
+    // ---- the session retrospective (mesa task 1158) ----
+
+    /// Pins the retrospective's two tables at index 61 (`user_version` 62),
+    /// for the reason [`the_live_summaries_table_arrives_at_migration_49`]
+    /// gives.
+    #[test]
+    fn the_retro_tables_arrive_at_migration_61() {
+        const RETRO: usize = 61;
+        assert!(
+            MIGRATIONS[RETRO].contains("CREATE TABLE retro_runs")
+                && MIGRATIONS[RETRO].contains("CREATE TABLE retro_findings"),
+            "migration {RETRO} is no longer the retrospective migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+    }
+
+    #[test]
+    fn retro_runs_are_claimed_then_rolled_back_and_judge_due_on_the_store_clock() {
+        let (mut store, _dir) = temp_store();
+        assert!(store.last_retro_run().unwrap().is_none());
+        let status = store.retro_status(72).unwrap();
+        assert!(status.due, "nothing has run: due");
+        assert_eq!(status.next_due_at, None);
+        assert_eq!((status.findings, status.linked), (0, 0));
+
+        let err = store.record_retro_run("cron").unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{err}");
+
+        let run = store.record_retro_run("watcher").unwrap();
+        assert_eq!(run.trigger, "watcher");
+        assert_eq!(store.last_retro_run().unwrap(), Some(run.clone()));
+        let status = store.retro_status(72).unwrap();
+        assert!(!status.due, "a run just started: not due for 72h");
+        assert!(
+            status.next_due_at.as_deref().unwrap() > run.started_at.as_str(),
+            "next_due_at must be after the run: {status:?}"
+        );
+        // An interval of zero hours is due at once — the arithmetic is the
+        // store's, so this is the one clock the CLI and watcher share.
+        assert!(store.retro_status(0).unwrap().due);
+
+        // The rollback: a failed spawn deletes the row, and the next status
+        // is due again. Deleting it twice is not_found.
+        store.delete_retro_run(run.id).unwrap();
+        assert!(store.retro_status(72).unwrap().due);
+        assert!(matches!(
+            store.delete_retro_run(run.id).unwrap_err(),
+            Error::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn retro_findings_dedup_on_fingerprint_bumping_count_and_appending_evidence() {
+        let (mut store, _dir) = temp_store();
+        let (first, is_new) = store
+            .record_retro_finding(
+                "swe/denial",
+                "swe",
+                "denial",
+                "swe keeps asking to run git push",
+                Some("session abc: 3 denials"),
+            )
+            .unwrap();
+        assert!(is_new);
+        assert_eq!(first.count, 1);
+        assert_eq!(first.evidence.as_deref(), Some("session abc: 3 denials"));
+        assert_eq!(first.inbox_item_id, None);
+
+        // The repeat: same fingerprint, a different summary — the count and
+        // evidence move, the summary stays as first recorded, and `is_new`
+        // is false, which is what tells the agent not to file again.
+        let (again, is_new) = store
+            .record_retro_finding(
+                "  swe/denial ",
+                "swe",
+                "denial",
+                "a different summary",
+                Some("session def: 2 denials"),
+            )
+            .unwrap();
+        assert!(!is_new);
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.count, 2);
+        assert_eq!(again.summary, first.summary);
+        assert_eq!(
+            again.evidence.as_deref(),
+            Some("session abc: 3 denials\nsession def: 2 denials")
+        );
+        assert!(again.last_seen_at >= first.last_seen_at);
+
+        // A report with no evidence bumps the count and leaves the field.
+        let (third, _) = store
+            .record_retro_finding("swe/denial", "swe", "denial", "x", None)
+            .unwrap();
+        assert_eq!(third.count, 3);
+        assert_eq!(third.evidence, again.evidence);
+
+        // A different fingerprint is a new row; the list is newest-seen first.
+        let (other, is_new) = store
+            .record_retro_finding("khora/timeout", "khora", "timeout", "khora hangs", None)
+            .unwrap();
+        assert!(is_new);
+        assert_eq!(other.evidence, None);
+        let ids: Vec<i64> = store
+            .list_retro_findings(50)
+            .unwrap()
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(ids, vec![other.id, first.id]);
+        assert_eq!(
+            store.list_retro_findings(0).unwrap().len(),
+            1,
+            "limit clamps to 1"
+        );
+        assert_eq!(store.retro_status(72).unwrap().findings, 2);
+    }
+
+    #[test]
+    fn retro_evidence_trims_the_oldest_lines_past_the_cap() {
+        assert_eq!(append_retro_evidence(None, None), None);
+        assert_eq!(append_retro_evidence(None, Some("a")).as_deref(), Some("a"));
+        assert_eq!(append_retro_evidence(Some("a"), None).as_deref(), Some("a"));
+        // 1500-char lines: two fit (3001 chars), a third does not (4502), so
+        // five reports leave the newest two.
+        let line = "x".repeat(1500);
+        let mut field = None;
+        for _ in 0..5 {
+            field = append_retro_evidence(field.as_deref(), Some(&line));
+        }
+        let field = field.unwrap();
+        assert!(
+            field.chars().count() <= RETRO_EVIDENCE_MAX,
+            "the whole field stays inside the cap: {}",
+            field.len()
+        );
+        assert_eq!(field.lines().count(), 2, "the oldest lines are trimmed");
+        // The newest line always survives, even at the per-line maximum:
+        // two 2000-char lines are 4001 with the newline, so one is trimmed
+        // and the one kept is the newer.
+        let max = "y".repeat(RETRO_EVIDENCE_LINE_MAX);
+        let field =
+            append_retro_evidence(Some(&"z".repeat(RETRO_EVIDENCE_LINE_MAX)), Some(&max)).unwrap();
+        assert_eq!(field, max);
+    }
+
+    #[test]
+    fn retro_finding_validation_and_linking() {
+        let (mut store, _dir) = temp_store();
+        let long_key = "k".repeat(RETRO_KEY_MAX + 1);
+        for (label, args) in [
+            ("empty fingerprint", ("", "s", "k", "sum", None)),
+            ("empty subject", ("f", " ", "k", "sum", None)),
+            ("empty kind", ("f", "s", "", "sum", None)),
+            ("empty summary", ("f", "s", "k", "", None)),
+            (
+                "long fingerprint",
+                (long_key.as_str(), "s", "k", "sum", None),
+            ),
+            ("long subject", ("f", long_key.as_str(), "k", "sum", None)),
+            ("long kind", ("f", "s", long_key.as_str(), "sum", None)),
+        ] {
+            let err = store
+                .record_retro_finding(args.0, args.1, args.2, args.3, args.4)
+                .unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "{label}: {err}");
+        }
+        let long_summary = "s".repeat(RETRO_SUMMARY_MAX + 1);
+        assert!(matches!(
+            store
+                .record_retro_finding("f", "s", "k", &long_summary, None)
+                .unwrap_err(),
+            Error::Validation(_)
+        ));
+        let long_evidence = "e".repeat(RETRO_EVIDENCE_LINE_MAX + 1);
+        assert!(matches!(
+            store
+                .record_retro_finding("f", "s", "k", "sum", Some(&long_evidence))
+                .unwrap_err(),
+            Error::Validation(_)
+        ));
+        assert!(
+            store.list_retro_findings(10).unwrap().is_empty(),
+            "nothing written"
+        );
+
+        let (finding, _) = store
+            .record_retro_finding("f", "s", "k", "sum", None)
+            .unwrap();
+        assert!(matches!(
+            store.link_retro_finding(finding.id + 1, 1).unwrap_err(),
+            Error::NotFound(_)
+        ));
+        assert!(matches!(
+            store.link_retro_finding(finding.id, 999).unwrap_err(),
+            Error::Validation(_)
+        ));
+        let project = store.create_project("p", None, None, None, None).unwrap();
+        let task = store
+            .create_task(
+                project.id,
+                "t",
+                Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let item = store
+            .create_inbox_item(Some("retro"), "friction", InboxKind::ChangeRequest, task.id)
+            .unwrap();
+        let linked = store.link_retro_finding(finding.id, item.id).unwrap();
+        assert_eq!(linked.inbox_item_id, Some(item.id));
+        assert_eq!(linked.count, 1, "linking bumps nothing");
+        assert_eq!(store.retro_status(72).unwrap().linked, 1);
+        // Triage deletes the item it assigns; the finding keeps its memory
+        // and only drops the pointer (ON DELETE SET NULL).
+        store.delete_inbox_item(item.id).unwrap();
+        assert_eq!(
+            store.get_retro_finding(finding.id).unwrap().inbox_item_id,
+            None
+        );
+        assert!(matches!(
+            store.get_retro_finding(finding.id + 1).unwrap_err(),
+            Error::NotFound(_)
+        ));
     }
 
     /// Pins the dream-pass migration (mesa task 1152) at index 57: the

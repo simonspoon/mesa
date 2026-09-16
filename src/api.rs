@@ -48,7 +48,7 @@ use crate::core::{
     ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch,
     Script, ScriptArg, ScriptPatch, Status, Store, SystemInfo, Task, TaskPatch, TaskSummary,
     Waypoint, agents, attachments, board, config, files, git, guard, hooks, inbox_triage, library,
-    listen, live, receipt, scripts, speech, supervisor, system, version,
+    listen, live, receipt, retro, scripts, speech, supervisor, system, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -282,6 +282,103 @@ fn watch_cost_tick() -> Duration {
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(WATCH_COST_TICK)
+}
+
+/// How often the retro-watcher (`watch_retro`) asks whether a retrospective
+/// is due. An hour, not a minute: the cadence it enforces is measured in days
+/// (`watchers.retro-interval-hours`, default 72), so a finer tick would only
+/// re-read the config for nothing. `MESA_WATCH_RETRO_TICK_MS` is the
+/// matching test seam.
+const WATCH_RETRO_TICK: Duration = Duration::from_secs(60 * 60);
+
+fn watch_retro_tick() -> Duration {
+    std::env::var("MESA_WATCH_RETRO_TICK_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(WATCH_RETRO_TICK)
+}
+
+/// One retro-watcher pass (mesa task 1158, `docs/retro.md`): if no
+/// retrospective has run in the last `watchers.retro-interval-hours`, claim a
+/// `watcher` run row and spawn the `mesa-retro` agent on it.
+///
+/// The run row is the claim, written **before** the spawn — the
+/// inbox-watcher's dedup set, but in the db rather than memory, because the
+/// interval spans days and has to survive a restart; it is also what a
+/// concurrent `mesa retro run` sees as `conflict`. A failed spawn deletes the
+/// row again, so the next tick retries instead of waiting out the interval.
+/// The interval is read from `~/.mesa/config.json` fresh every tick, the
+/// `todo_concurrency` rule, and "due" is judged on the store's clock
+/// (`Store::retro_status`), the same arithmetic `mesa retro status` prints.
+///
+/// cwd is `~/.mesa/workspace`: a retrospective spans every project, so there
+/// is no `local_path` to run in — the inbox-watcher's reasoning. Two-phase
+/// like [`inbox_watcher_tick`]: the store lock is dropped before the blocking
+/// `claude --bg` shell-out.
+fn retro_watcher_tick(state: &AppState) {
+    let interval = match config::retro_interval_hours() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("retro-watcher: {e}");
+            return;
+        }
+    };
+    // Phase one: judge, claim and seed under the lock.
+    let claimed = {
+        let mut store = match state.store.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        match store.retro_status(interval) {
+            Ok(status) if !status.due => return,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("retro-watcher: retro_status failed: {e}");
+                return;
+            }
+        }
+        let run = match store.record_retro_run("watcher") {
+            Ok(run) => run,
+            Err(e) => {
+                eprintln!("retro-watcher: record_retro_run failed: {e}");
+                return;
+            }
+        };
+        // The default template spawns `--agent mesa-retro`, so the definition
+        // has to be on disk before the spawn — `claude --agent` errors on an
+        // agent it has never seen. A failure is a failed spawn, rolled back
+        // below with the rest.
+        let seeded = retro::ensure_agent_definition(&store)
+            .and_then(|_| library::prompts(&store).map_err(|e| e.to_string()));
+        (run, seeded)
+    };
+    let (run, seeded) = claimed;
+    // Phase two: the shell-out, off the lock.
+    let dispatch_dir = config::workspace_dir().to_string_lossy().into_owned();
+    let session_name = retro::session_name(run.id);
+    if let Err(e) = seeded.and_then(|prompts| {
+        agents::spawn_bg(
+            config::RETRO,
+            &dispatch_dir,
+            Some(run.id),
+            Some(&session_name),
+            None,
+            &prompts,
+        )
+    }) {
+        eprintln!("retro-watcher: spawn failed for retro run {}: {e}", run.id);
+        let mut store = match state.store.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        if let Err(e) = store.delete_retro_run(run.id) {
+            eprintln!(
+                "retro-watcher: could not roll back retro run {}: {e}",
+                run.id
+            );
+        }
+    }
 }
 
 /// How much of an inbox body goes into an auto-dispatched session's name,
@@ -1148,7 +1245,8 @@ fn forget_dispatch(state: &AppState, job_id: &str) {
 /// killed. Binds 127.0.0.1 by default; with `lan`, binds 0.0.0.0 so other
 /// devices on the local network can reach it (no auth — see `serve --help`).
 /// `watch_todo` starts the periodic todo-watcher (see [`todo_watcher_tick`]),
-/// and `watch_inbox` the periodic inbox-watcher (see [`inbox_watcher_tick`]);
+/// `watch_inbox` the periodic inbox-watcher (see [`inbox_watcher_tick`]) and
+/// `watch_retro` the scheduled retrospective (see [`retro_watcher_tick`]);
 /// all off by default, all propagated across the web UI's Restart Server
 /// action. They are independent flags over independent queues — none implies
 /// another.
@@ -1158,6 +1256,7 @@ pub fn serve(
     watch_todo: bool,
     watch_inbox: bool,
     watch_cost: bool,
+    watch_retro: bool,
 ) -> crate::core::Result<()> {
     let store = Store::open_default()?;
     let restart_requested = Arc::new(AtomicBool::new(false));
@@ -1239,7 +1338,19 @@ pub fn serve(
                 }
             });
         }
+        if watch_retro {
+            let watch_state = state.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(watch_retro_tick());
+                loop {
+                    ticker.tick().await;
+                    let state = watch_state.clone();
+                    let _ = tokio::task::spawn_blocking(move || retro_watcher_tick(&state)).await;
+                }
+            });
+        }
         let listener = tokio::net::TcpListener::bind((host, port)).await?;
+
         println!("{}", json!({"listening": format!("http://{host}:{port}")}));
         // ConnectInfo carries the peer address so the agent endpoints can be
         // gated on loopback in default mode (see `require_agent_access`).
@@ -1273,7 +1384,11 @@ pub fn serve(
         if watch_cost {
             args.push("--watch-cost".to_string());
         }
+        if watch_retro {
+            args.push("--watch-retro".to_string());
+        }
         std::process::Command::new(exe).args(args).spawn()?;
+
         std::process::exit(0);
     }
     Ok(())
@@ -6779,6 +6894,9 @@ struct WatchersUpdate {
     /// layer's named 422 rather than a deserializer rejection.
     #[serde(default, deserialize_with = "deserialize_some")]
     todo_concurrency: Option<Option<serde_json::Value>>,
+    /// The retrospective's cadence (mesa task 1158), same three-way rule.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    retro_interval_hours: Option<Option<serde_json::Value>>,
 }
 
 /// Distinguishes an absent key from an explicit `null` — the difference
@@ -6807,6 +6925,10 @@ async fn update_config_watchers(
     if let Some(value) = body.todo_concurrency {
         updates.insert(config::TODO_CONCURRENCY.to_string(), value);
     }
+    if let Some(value) = body.retro_interval_hours {
+        updates.insert(config::RETRO_INTERVAL_HOURS.to_string(), value);
+    }
+
     config::save_watchers(&updates).map_err(|e| match e {
         config::SaveError::Validation(message) => ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -9773,6 +9895,7 @@ mod tests {
                         $headers.clone(),
                         Json(WatchersUpdate {
                             todo_concurrency: None,
+                            retro_interval_hours: None,
                         }),
                     )
                     .await
@@ -11763,7 +11886,112 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         });
     }
 
+    /// The retro-watcher (mesa task 1158) dispatches exactly once per
+    /// interval: the first tick over a fresh db spawns the `mesa-retro`
+    /// agent under `~/.mesa/workspace` with the run id in its prompt, and a
+    /// second tick inside the interval spawns nothing, because the run row
+    /// it wrote is the claim.
+    #[test]
+    fn retro_watcher_tick_dispatches_once_per_interval() {
+        // SAFETY: see `inbox_watcher_tick_dispatches_each_item_once_...`.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::core::library::test_home::with_home_dir(|home| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+            let (_dir, state) = test_state();
+            retro_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 1, "a fresh db is due: {log:?}");
+            let run = state
+                .store
+                .lock()
+                .unwrap()
+                .last_retro_run()
+                .unwrap()
+                .expect("the run row is the claim");
+            assert_eq!(run.trigger, "watcher");
+            assert!(
+                log.contains(&format!(
+                    "|mesa retro {}|Run mesa session retrospective {}.",
+                    run.id, run.id
+                )),
+                "the session name and prompt carry the run id: {log:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(stub_dir.path().join("last-agent"))
+                    .unwrap()
+                    .trim(),
+                "mesa-retro"
+            );
+            assert!(
+                home.join(".claude/agents/mesa-retro.md").is_file(),
+                "the definition is seeded before the spawn"
+            );
+
+            retro_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                1,
+                "inside the interval nothing dispatches: {log:?}"
+            );
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
+    }
+
+    /// A spawn failure rolls the run row back, so the next tick retries
+    /// rather than waiting out a 72-hour interval on a run that never
+    /// happened — the inbox-watcher's claim release, in the db.
+    #[test]
+    fn retro_watcher_tick_rolls_back_the_run_when_spawn_fails() {
+        // SAFETY: see `inbox_watcher_tick_dispatches_each_item_once_...`.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            std::fs::write(stub_dir.path().join("fail"), "").unwrap();
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+            let (_dir, state) = test_state();
+            retro_watcher_tick(&state);
+            assert!(
+                state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .last_retro_run()
+                    .unwrap()
+                    .is_none(),
+                "a failed spawn must leave no run row"
+            );
+
+            std::fs::remove_file(stub_dir.path().join("fail")).unwrap();
+            retro_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 1, "the retry dispatches: {log:?}");
+            assert!(
+                state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .last_retro_run()
+                    .unwrap()
+                    .is_some()
+            );
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
+    }
+
     // --- scripts: /api/scripts (mesa task 785) ------------------------------
+
     //
     // CRUD and run semantics over HTTP are `scripts/scripts-check.sh`'s job.
     // What only lives here is the peer-address-sensitive half: the gate

@@ -1,6 +1,6 @@
 # Config (`~/.mesa/config.json`)
 
-mesa starts a coding agent from exactly six places. Each one's command line
+mesa starts a coding agent from exactly seven places. Each one's command line
 is a **template** in `~/.mesa/config.json`, so the program, its flags, the
 persona and the slash command can all change without rebuilding mesa:
 
@@ -12,6 +12,7 @@ persona and the slash command can all change without rebuilding mesa:
 | `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `claude --bg --agent mesa-live --name {name} -- {prompt}` |
 | `live-summary` | `live stop`'s CLI handler and the API's stop route — the short-lived agent that writes a live conversation's memory once it ends (mesa task 921, `docs/live.md`) | `claude --bg --agent swe --name {name} -- {prompt}` |
 | `live-dream` | The pass that tidies the live notebook — `mesa live memory dream` explicitly, and on its own at a handoff or when a conversation ends once `live::dream_wanted` says the notebook needs it (mesa task 1155): merges duplicate entries, deletes superseded ones, one guarded command at a time (mesa task 1152, `docs/live.md`) | `claude --bg --agent swe --name {name} -- {prompt}` |
+| `retro` | `serve --watch-retro` every `watchers.retro-interval-hours`, and `mesa retro run` — the session retrospective that reviews finished task sessions for friction and files suggestions into the inbox, proposing only (mesa task 1158, `docs/retro.md`) | `claude --bg --agent mesa-retro --name {name} -- "Run mesa session retrospective {id}."` |
 
 The defaults are **plain, editable command lines** (mesa task 1141): the
 program and the agent are both spelled out, so a user who wants a different
@@ -28,7 +29,8 @@ from the vocabulary (see *Retired placeholders* below).
     "agent-spawn":    "claude --bg -- {prompt}",
     "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
     "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}",
-    "live-dream":     "claude --bg --agent swe --name {name} -- {prompt}"
+    "live-dream":     "claude --bg --agent swe --name {name} -- {prompt}",
+    "retro":          "claude --bg --agent mesa-retro --name {name} -- \"Run mesa session retrospective {id}.\""
   }
 }
 ```
@@ -72,6 +74,15 @@ one guarded command at a time (`docs/live.md`, "Dreaming"). `{prompt}` is
 task should land in, then the active notebook), `{id}` is the newest
 conversation's id and `{name}` is the literal `live memory dream`. It runs in
 that newest conversation's project folder exactly as the summariser would.
+
+`retro` (mesa task 1158) is `inbox-watcher`'s shape: the run is a mesa record
+(`retro_runs`, so `{id}` is the run id and `{name}` the session name `mesa
+retro <id>`) and the prompt is one sentence, because the `mesa-retro` agent
+definition holds the whole procedure — which is why the default names
+`--agent mesa-retro`, seeded to `~/.claude/agents/mesa-retro.md` before the
+spawn exactly as `inbox-triage` is (`docs/retro.md`). No `{prompt}`: mesa
+supplies none. It runs in `~/.mesa/workspace`, since a retrospective spans
+every project.
 
 Everything lives in `src/core/config.rs`; `MESA_CONFIG_FILE` overrides the path
 for tests (mirroring `MESA_DB`/`MESA_HOOKS_FILE`). `~/.mesa` may be the JSON
@@ -131,8 +142,8 @@ knows about:
 
 | Placeholder | Where | Value |
 | --- | --- | --- |
-| `{id}` | watchers, `live-agent`, `live-summary`, `live-dream` | the task id / inbox item id / live session id (for `live-dream`, the newest session's; empty on an install that has never held one) |
-| `{name}` | watchers, `live-agent`, `live-summary`, `live-dream` | the session name mesa derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), the live session's own name, or the literal `live memory dream` |
+| `{id}` | watchers, `retro`, `live-agent`, `live-summary`, `live-dream` | the task id / inbox item id / retro run id / live session id (for `live-dream`, the newest session's; empty on an install that has never held one) |
+| `{name}` | watchers, `retro`, `live-agent`, `live-summary`, `live-dream` | the session name mesa derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), `mesa retro <id>`, the live session's own name, or the literal `live memory dream` |
 | `{prompt}` | `agent-spawn`, `live-agent`, `live-summary`, `live-dream` | the POST body's `prompt` (`agent-spawn`; absent when omitted) / the live agent's, summariser's or dream pass's instruction block, always present |
 
 ### Quoted for where it sits
@@ -530,14 +541,16 @@ See `docs/cc-dashboard.md` for the permanent-loss property.
 
 ## Watchers
 
-A third, independent section holds per-watcher tuning knobs — currently one:
-the todo-watcher's per-project concurrency limit (mesa task 777,
-`docs/todo-watcher.md`).
+A third, independent section holds per-watcher tuning knobs — two: the
+todo-watcher's per-project concurrency limit (mesa task 777,
+`docs/todo-watcher.md`) and the retrospective's cadence (mesa task 1158,
+`docs/retro.md`).
 
 ```json
 {
   "watchers": {
-    "todo-concurrency": 3
+    "todo-concurrency": 3,
+    "retro-interval-hours": 72
   }
 }
 ```
@@ -560,17 +573,30 @@ the todo-watcher's per-project concurrency limit (mesa task 777,
 - Lowering the limit never touches work already dispatched: an
   already-`in_progress` leaf stays `in_progress` regardless of what the limit
   now says. It only narrows what the *next* tick is willing to start.
+- `retro-interval-hours` is how many hours `serve --watch-retro` waits
+  between two retrospectives, and what `mesa retro run` judges its `conflict`
+  against. **Absent or `null` ⇒ the built-in default, 72** (three days). The
+  editor requires an integer in `1..=8760` — a year, a sanity cap like the
+  one above — and is `422 validation` otherwise, writing nothing; a
+  hand-edited out-of-range value is clamped on read, exactly as
+  `todo-concurrency` is. Read on every tick and on every `retro run`/`status`,
+  so an edit lands on the next tick with no restart.
 
 ### Routes
 
 - `GET /api/config/watchers` → `ConfigWatchers`:
-  `{todo_concurrency, todo_concurrency_default}`, where `todo_concurrency` is
-  the override (`null` when unset) and `todo_concurrency_default` is the
-  built-in, 1. Gated like `GET /api/config`/`GET /api/config/pricing`
-  (`require_agent_access`); a malformed config is **502 `unavailable`**.
-- `PUT /api/config/watchers`, body `{"todo_concurrency": <1..=20> | null}` →
-  echoes the getter. `null` removes the key, restoring the default. An
-  out-of-range or non-integer value is **422 `validation`**, writing nothing.
+  `{todo_concurrency, todo_concurrency_default, retro_interval_hours,
+  retro_interval_hours_default}`, where each `*` is the override (`null` when
+  unset) and each `*_default` is the built-in (1 and 72). The two retro keys
+  are `ts(skip)`ped off the generated TypeScript type — the retrospective has
+  no page, so the Settings editor neither shows nor writes them. Gated like
+  `GET /api/config`/`GET /api/config/pricing` (`require_agent_access`); a
+  malformed config is **502 `unavailable`**.
+- `PUT /api/config/watchers`, body `{"todo_concurrency": <1..=20> | null,
+  "retro_interval_hours": <1..=8760> | null}` (either key may be absent,
+  which leaves it alone) → echoes the getter. `null` removes the key,
+  restoring the default. An out-of-range or non-integer value is **422
+  `validation`**, writing nothing.
   Gated with `require_agent_access` — the same posture as the other two config
   writes (mesa task 1021): it is the same file, and which section a write lands
   in is not the distinction that matters.

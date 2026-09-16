@@ -95,10 +95,14 @@
 //! { "watchers": { "todo-concurrency": 3 } }
 //! ```
 //!
-//! Today that is one key — how many agents `serve --watch-todo` may have
-//! running **per project** ([`todo_concurrency`]), default
-//! [`DEFAULT_TODO_CONCURRENCY`]. Read per tick rather than at startup, so an
-//! edit lands on the next tick with no restart. See `docs/todo-watcher.md`.
+//! Two keys: how many agents `serve --watch-todo` may have running **per
+//! project** ([`todo_concurrency`]), default [`DEFAULT_TODO_CONCURRENCY`],
+//! and how many hours `serve --watch-retro` waits between two
+//! retrospectives ([`retro_interval_hours`], mesa task 1158), default
+//! [`DEFAULT_RETRO_INTERVAL_HOURS`]. Both read per tick rather than at
+//! startup, so an edit lands on the next tick with no restart. See
+//! `docs/todo-watcher.md` and `docs/retro.md`.
+
 //!
 //! ## Speech
 //!
@@ -199,17 +203,23 @@ pub const LIVE_SUMMARY: &str = "live-summary";
 /// to merge duplicate entries and drop superseded ones one guarded command
 /// at a time.
 pub const LIVE_DREAM: &str = "live-dream";
+/// The session retrospective (mesa task 1158, `docs/retro.md`): spawned by
+/// `serve --watch-retro` every `retro-interval-hours`, and by `mesa retro
+/// run` on demand, to review finished task sessions for friction and file
+/// suggestions into the inbox. Proposes, never edits.
+pub const RETRO: &str = "retro";
 
 /// Every configurable command, in the order the docs and the Settings page
 /// list them. The single source of truth for "which keys mesa configures" —
 /// [`default_command`] answers the same question one key at a time.
-pub const ACTIONS: [&str; 6] = [
+pub const ACTIONS: [&str; 7] = [
     TODO_WATCHER,
     INBOX_WATCHER,
     AGENT_SPAWN,
     LIVE_AGENT,
     LIVE_SUMMARY,
     LIVE_DREAM,
+    RETRO,
 ];
 
 /// Built-in default for [`TODO_WATCHER`] — the argv mesa shipped before the
@@ -271,6 +281,15 @@ pub const DEFAULT_LIVE_SUMMARY: &str = "claude --bg --agent swe --name {name} --
 /// `live memory dream`, and `{prompt}` is `core::live::dream_prompt`, the
 /// instructions plus the active notebook. Runs as the literal `swe`.
 pub const DEFAULT_LIVE_DREAM: &str = "claude --bg --agent swe --name {name} -- {prompt}";
+/// Built-in default for [`RETRO`] — [`DEFAULT_INBOX_WATCHER`]'s shape: the
+/// run is a mesa record (`retro_runs`, so `{id}` is the run id and `{name}`
+/// the `mesa retro <id>` session name) and the prompt is one sentence, since
+/// the `mesa-retro` agent definition (mesa task 1158,
+/// `core::retro::RETRO_DEFINITION`, seeded to `.claude/agents/mesa-retro.md`
+/// before the spawn) holds the whole procedure. No `{prompt}`: mesa supplies
+/// none.
+pub const DEFAULT_RETRO: &str =
+    r#"claude --bg --agent mesa-retro --name {name} -- "Run mesa session retrospective {id}.""#;
 
 /// The built-in template for `action`, or `None` if `action` isn't one of
 /// [`ACTIONS`]. Public so the docs check and the API can report the shipped
@@ -283,6 +302,7 @@ pub fn default_command(action: &str) -> Option<&'static str> {
         LIVE_AGENT => Some(DEFAULT_LIVE_AGENT),
         LIVE_SUMMARY => Some(DEFAULT_LIVE_SUMMARY),
         LIVE_DREAM => Some(DEFAULT_LIVE_DREAM),
+        RETRO => Some(DEFAULT_RETRO),
         _ => None,
     }
 }
@@ -1717,8 +1737,21 @@ fn validate_rates(prefix: &str, rates: &ModelRates) -> Result<(), String> {
 /// The config key holding the todo-watcher's per-project agent ceiling.
 pub const TODO_CONCURRENCY: &str = "todo-concurrency";
 
+/// The config key holding the retrospective's cadence, in hours (mesa task
+/// 1158, `docs/retro.md`).
+pub const RETRO_INTERVAL_HOURS: &str = "retro-interval-hours";
+
 /// Every key the `watchers` section understands, for the unknown-key error.
-const WATCHER_KEYS: &[&str] = &[TODO_CONCURRENCY];
+const WATCHER_KEYS: &[&str] = &[TODO_CONCURRENCY, RETRO_INTERVAL_HOURS];
+
+/// How long `serve --watch-retro` waits between two retrospectives with no
+/// config: three days, the cadence the feature was asked for.
+pub const DEFAULT_RETRO_INTERVAL_HOURS: u32 = 72;
+
+/// The longest cadence the editor will write — a year. A sanity bound like
+/// [`MAX_TODO_CONCURRENCY`]: a retrospective that never runs is spelled by
+/// not passing `--watch-retro`, not by a huge number.
+pub const MAX_RETRO_INTERVAL_HOURS: u32 = 8760;
 
 /// How many watcher agents one project may run at once with no config — the
 /// value that keeps an unconfigured install byte-identical to mesa before
@@ -1745,6 +1778,8 @@ struct WatchersConfig {
 struct WatchersSection {
     #[serde(default, rename = "todo-concurrency")]
     todo_concurrency: Option<u32>,
+    #[serde(default, rename = "retro-interval-hours")]
+    retro_interval_hours: Option<u32>,
 }
 
 fn read_watchers(path: &Path) -> Result<WatchersSection, String> {
@@ -1783,6 +1818,23 @@ fn todo_concurrency_in(path: &Path) -> Result<u32, String> {
         .unwrap_or(DEFAULT_TODO_CONCURRENCY))
 }
 
+/// How many hours `serve --watch-retro` waits between two retrospectives
+/// (mesa task 1158). [`todo_concurrency`]'s rules exactly: read on every
+/// tick (and by `mesa retro run`/`status`), an absent file or key is
+/// [`DEFAULT_RETRO_INTERVAL_HOURS`], a hand-edited value outside
+/// `1..=MAX_RETRO_INTERVAL_HOURS` is clamped rather than rejected, and a file
+/// that can't be read or parsed is `Err`.
+pub fn retro_interval_hours() -> Result<u32, String> {
+    retro_interval_hours_in(&config_file())
+}
+
+fn retro_interval_hours_in(path: &Path) -> Result<u32, String> {
+    Ok(read_watchers(path)?
+        .retro_interval_hours
+        .map(|n| n.clamp(1, MAX_RETRO_INTERVAL_HOURS))
+        .unwrap_or(DEFAULT_RETRO_INTERVAL_HOURS))
+}
+
 /// The watcher settings for the Settings page (`GET /api/config/watchers`):
 /// the configured value (verbatim, or `null` when the file says nothing) plus
 /// the built-in default behind it — the `{value, default}` idiom
@@ -1792,9 +1844,12 @@ pub fn watchers() -> Result<ConfigWatchers, String> {
 }
 
 fn watchers_in(path: &Path) -> Result<ConfigWatchers, String> {
+    let section = read_watchers(path)?;
     Ok(ConfigWatchers {
-        todo_concurrency: read_watchers(path)?.todo_concurrency,
+        todo_concurrency: section.todo_concurrency,
         todo_concurrency_default: DEFAULT_TODO_CONCURRENCY,
+        retro_interval_hours: section.retro_interval_hours,
+        retro_interval_hours_default: DEFAULT_RETRO_INTERVAL_HOURS,
     })
 }
 
@@ -1835,7 +1890,12 @@ fn save_watchers_in(
             )));
         }
         if let Some(value) = &updates[*key] {
-            validate_limit(key, value).map_err(SaveError::Validation)?;
+            let max = if key.as_str() == RETRO_INTERVAL_HOURS {
+                MAX_RETRO_INTERVAL_HOURS
+            } else {
+                MAX_TODO_CONCURRENCY
+            };
+            validate_limit(key, value, max).map_err(SaveError::Validation)?;
         }
     }
 
@@ -1872,20 +1932,19 @@ fn save_watchers_in(
     write_atomically(path, &body)
 }
 
-/// A watcher limit has to be a whole number of agents inside the sanity
-/// bound: `0` (which would stop the watcher rather than configure it), a
-/// negative, a fraction and anything over [`MAX_TODO_CONCURRENCY`] are all
-/// named rather than silently coerced.
-fn validate_limit(key: &str, value: &serde_json::Value) -> Result<(), String> {
+/// A watcher limit has to be a whole number inside its sanity bound
+/// (`max` — [`MAX_TODO_CONCURRENCY`] agents, or [`MAX_RETRO_INTERVAL_HOURS`]
+/// hours): `0` (which would stop the watcher rather than configure it), a
+/// negative, a fraction and anything over the bound are all named rather
+/// than silently coerced.
+fn validate_limit(key: &str, value: &serde_json::Value, max: u32) -> Result<(), String> {
     let Some(n) = value.as_u64() else {
         return Err(format!(
-            "{key} must be a whole number between 1 and {MAX_TODO_CONCURRENCY}, got {value}"
+            "{key} must be a whole number between 1 and {max}, got {value}"
         ));
     };
-    if n < 1 || n > u64::from(MAX_TODO_CONCURRENCY) {
-        return Err(format!(
-            "{key} must be between 1 and {MAX_TODO_CONCURRENCY}, got {n}"
-        ));
+    if n < 1 || n > u64::from(max) {
+        return Err(format!("{key} must be between 1 and {max}, got {n}"));
     }
     Ok(())
 }
@@ -3579,6 +3638,26 @@ mod tests {
         assert_eq!(settings[5].action, LIVE_DREAM);
         assert_eq!(settings[5].default, DEFAULT_LIVE_DREAM);
         assert_eq!(settings[5].placeholders, ["{id}", "{name}", "{prompt}"]);
+        // The retrospective (mesa task 1158) is the seventh: a mesa record
+        // with no prompt of mesa's, the inbox-watcher's shape.
+        assert_eq!(settings[6].action, RETRO);
+        assert_eq!(settings[6].default, DEFAULT_RETRO);
+        assert_eq!(settings[6].placeholders, ["{id}", "{name}"]);
+    }
+
+    /// The retro default resolves like the inbox-watcher's: the run id lands
+    /// inside the quoted prompt and the session name in its own argument.
+    #[test]
+    fn retro_default_resolves_with_the_run_id_and_name() {
+        let vars = Vars {
+            id: Some(7),
+            name: Some("mesa retro 7"),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve(RETRO, DEFAULT_RETRO, &vars).unwrap(),
+            r#"claude --bg --agent mesa-retro --name 'mesa retro 7' -- "Run mesa session retrospective 7.""#
+        );
     }
 
     #[test]
@@ -4785,6 +4864,71 @@ mod tests {
         let view = watchers_in(&path).unwrap();
         assert_eq!(view.todo_concurrency, Some(3));
         assert_eq!(view.todo_concurrency_default, DEFAULT_TODO_CONCURRENCY);
+    }
+
+    /// The second watcher key (mesa task 1158): 72 with no config, the
+    /// configured value round-trips, a hand-edited out-of-range value clamps
+    /// on read, and the editor refuses to write one.
+    #[test]
+    fn retro_interval_hours_defaults_to_72_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            retro_interval_hours_in(&dir.path().join("nope.json")).unwrap(),
+            DEFAULT_RETRO_INTERVAL_HOURS
+        );
+        let path = write_config(dir.path(), r#"{"watchers": {"todo-concurrency": 2}}"#);
+        assert_eq!(retro_interval_hours_in(&path).unwrap(), 72);
+        let view = watchers_in(&path).unwrap();
+        assert_eq!(view.retro_interval_hours, None);
+        assert_eq!(view.retro_interval_hours_default, 72);
+
+        save_watchers_in(&path, &watcher(&[(RETRO_INTERVAL_HOURS, Some(24))])).unwrap();
+        assert_eq!(retro_interval_hours_in(&path).unwrap(), 24);
+        let view = watchers_in(&path).unwrap();
+        assert_eq!(view.retro_interval_hours, Some(24));
+        // The other key survived the save.
+        assert_eq!(view.todo_concurrency, Some(2));
+        assert_eq!(todo_concurrency_in(&path).unwrap(), 2);
+
+        // `null` removes it; the default is expressed by absence.
+        save_watchers_in(&path, &watcher(&[(RETRO_INTERVAL_HOURS, None)])).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(written["watchers"].get(RETRO_INTERVAL_HOURS).is_none());
+        assert_eq!(retro_interval_hours_in(&path).unwrap(), 72);
+
+        // Hand-edited nonsense clamps on read (the `todo-concurrency` posture)…
+        let path = write_config(dir.path(), r#"{"watchers": {"retro-interval-hours": 0}}"#);
+        assert_eq!(retro_interval_hours_in(&path).unwrap(), 1);
+        let path = write_config(
+            dir.path(),
+            r#"{"watchers": {"retro-interval-hours": 999999}}"#,
+        );
+        assert_eq!(
+            retro_interval_hours_in(&path).unwrap(),
+            MAX_RETRO_INTERVAL_HOURS
+        );
+        // …while the editor refuses to write it, byte-identically.
+        let before = r#"{"watchers": {"retro-interval-hours": 48}}"#;
+        let path = write_config(dir.path(), before);
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(8761),
+            serde_json::json!(1.5),
+            serde_json::json!("72"),
+        ] {
+            let err = save_watchers_in(&path, &{
+                let mut m = HashMap::new();
+                m.insert(RETRO_INTERVAL_HOURS.to_string(), Some(value.clone()));
+                m
+            })
+            .unwrap_err();
+            assert!(
+                matches!(&err, SaveError::Validation(m) if m.contains(RETRO_INTERVAL_HOURS)),
+                "{value}: {err:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
     }
 
     #[test]

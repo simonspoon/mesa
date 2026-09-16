@@ -13,6 +13,8 @@ pub mod listen;
 pub mod live;
 pub mod look;
 pub mod receipt;
+pub mod retro;
+
 pub mod scripts;
 pub mod speech;
 mod store;
@@ -43,6 +45,7 @@ pub use types::{
     LiveNotebookEntry, LiveNotice, LiveRole, LiveSession, LiveState, LiveStatus, LiveSummary,
     LiveTranscript, LiveTurn, LiveWindow, MesaVersion, ModelRates, Priority, Project,
     ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
-    ProjectVersion, Script, ScriptArg, ScriptArgKind, ScriptRun, Status, SystemInfo, Task,
-    TaskReceipt, TaskSummary, Waypoint, is_valid_artifact_content_type, task_name,
+    ProjectVersion, RetroFinding, RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind,
+    ScriptRun, Status, SystemInfo, Task, TaskReceipt, TaskSummary, Waypoint,
+    is_valid_artifact_content_type, task_name,
 };

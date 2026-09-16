@@ -196,6 +196,7 @@ mesa serve --port 7770     # HTTP API + web UI on http://127.0.0.1:7770
 mesa serve --lan           # opt-in: bind 0.0.0.0 and serve other LAN devices
 mesa serve --watch-todo    # opt-in: auto-dispatch agents onto actionable todos
 mesa serve --watch-inbox   # opt-in: auto-triage the global inbox
+mesa serve --watch-retro   # opt-in: a session retrospective every three days, filed into the inbox
 ```
 
 The server exposes a REST API under `/api` (`/api/projects`, `/api/tasks`, plus
@@ -364,6 +365,15 @@ start locations in the global Agents sidebar.
   a project counts as busy by its `in_progress` *leaves* and its sessions doing
   live work, so an umbrella task parks nothing — it narrows the tick to its own
   descendants. See `docs/todo-watcher.md`.
+- **Retrospective** (`mesa serve --watch-retro`, off by default; `mesa retro
+  run` on demand): every `watchers.retro-interval-hours` (default 72) starts
+  the `mesa-retro` agent, which reviews the task sessions finished since the
+  last run for friction — denials, retry loops, a missing skill, a tool that
+  keeps failing — and files each *new* finding into the inbox as a change
+  request for the inbox-watcher to triage. It proposes and never edits; a
+  finding log in the db (`mesa retro finding …`) keyed by fingerprint means a
+  repeat bumps a count and adds evidence instead of filing twice. See
+  `docs/retro.md`.
 - **Mesa live** (`mesa live`, the **Live** page in the web UI): a spoken
   conversation with an agent. The microphone opens on its own once you join,
   a dedicated Claude Code session does the work with the ordinary mesa CLI,
@@ -398,7 +408,8 @@ start locations in the global Agents sidebar.
   way, no mesa data is ever spliced into a string a shell parses. The same file
   holds two other independent sections: `pricing` (per-model-family rates for
   the CC Dashboard's cost estimates, longest prefix wins) and `watchers`
-  (the todo watcher's per-project concurrency). All three are editable from the
+  (the todo watcher's per-project concurrency and the retrospective's
+  cadence). All three are editable from the
   web UI's **Settings** page (pinned to the bottom of the left nav) or by hand,
   and each section's save preserves the other two. See `docs/config.md`.
 - **Hooks**: bind shell commands to named hook points in a `hooks.json` beside
@@ -432,6 +443,7 @@ scripts/agents-check.sh     # agents-surface contract against a stub `claude`
 scripts/hooks-check.sh      # task-execute hook contract over CLI + API
 scripts/todo-watcher-check.sh   # `serve --watch-todo` dispatch loop against a stub `claude`
 scripts/inbox-watcher-check.sh  # `serve --watch-inbox` triage loop against a stub `claude`
+scripts/retro-check.sh      # `mesa retro` + `serve --watch-retro` retrospective against a stub `claude`
 scripts/config-check.sh     # the configurable spawn commands in ~/.mesa/config.json
 scripts/live-check.sh       # `mesa live` conversation loop over CLI + API
 scripts/cc-check.sh         # `mesa cc` ingest + dashboard contract against synthetic transcripts

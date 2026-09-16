@@ -254,6 +254,17 @@ pub struct ConfigWatchers {
     /// The built-in limit mesa ships (1), so the editor can show what blank
     /// means without hardcoding it.
     pub todo_concurrency_default: u32,
+    /// How many hours `serve --watch-retro` waits between two retrospectives
+    /// (mesa task 1158, `docs/retro.md`), or `null` when the config says
+    /// nothing — then `retro_interval_hours_default` applies. `ts(skip)`: the
+    /// retrospective has no page, so the Settings editor neither shows nor
+    /// writes this key, and an absent key on `PUT` is left alone.
+    #[ts(skip)]
+    pub retro_interval_hours: Option<u32>,
+    /// The built-in cadence mesa ships (72), for the same reason as
+    /// `todo_concurrency_default`.
+    #[ts(skip)]
+    pub retro_interval_hours_default: u32,
 }
 
 /// The speech settings as the Settings page sees them (`core::config`,
@@ -3776,6 +3787,74 @@ pub struct LiveMemoryHit {
     /// Who said it, for a turn; null for a summary or a note.
     pub role: Option<LiveRole>,
     pub snippet: String,
+}
+
+/// One run of the session retrospective (mesa task 1158, `docs/retro.md`):
+/// when it started and what started it — `watcher` for `serve --watch-retro`'s
+/// scheduled pass, `manual` for `mesa retro run`. The row is written **before**
+/// the agent is spawned (it is the claim that stops a second dispatch inside
+/// the interval) and deleted again when that spawn fails, so a row that exists
+/// is a run that started.
+///
+/// **Not ts-exported**, like [`LiveMemoryHit`]: the retrospective is CLI +
+/// watcher only, with no HTTP route and no page, so there is no TypeScript
+/// consumer.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RetroRun {
+    pub id: i64,
+    pub started_at: String,
+    /// `watcher` | `manual`.
+    pub trigger: String,
+}
+
+/// One entry in the retrospective's **finding log** (mesa task 1158): a piece
+/// of friction the agent saw, keyed by a `fingerprint` so the same finding on
+/// a later run bumps `count` and appends to `evidence` instead of filing a
+/// second inbox item. `inbox_item_id` is the item the finding was filed as,
+/// `ON DELETE SET NULL` — a triaged (assigned, hence deleted) item leaves the
+/// finding's memory intact.
+///
+/// **Not ts-exported**, for [`RetroRun`]'s reason. `summary` and `evidence`
+/// are the unbounded free text `--quiet` drops.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RetroFinding {
+    pub id: i64,
+    /// The dedup key — the agent's rule is lowercase `<subject>/<kind>`.
+    pub fingerprint: String,
+    /// The agent, skill or tool the friction belongs to.
+    pub subject: String,
+    /// What sort of friction (`denial`, `retry-loop`, `missing-skill`, …) —
+    /// the agent's vocabulary, not an enum mesa enforces.
+    pub kind: String,
+    pub summary: String,
+    /// How many runs have reported this fingerprint.
+    pub count: i64,
+    /// One line per report, newest last, the oldest lines trimmed past
+    /// `Store::RETRO_EVIDENCE_MAX` characters. Untrusted: it quotes transcripts.
+    pub evidence: Option<String>,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub inbox_item_id: Option<i64>,
+}
+
+/// What `mesa retro status` prints (mesa task 1158): the last run, the
+/// configured cadence, and whether a run is due — the arithmetic done on the
+/// store's own clock, the `stale_claims` precedent, so the CLI and the
+/// watcher can never disagree about "due".
+///
+/// **Not ts-exported**, for [`RetroRun`]'s reason.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RetroStatus {
+    pub last_run: Option<RetroRun>,
+    pub interval_hours: u32,
+    /// `last_run.started_at + interval_hours`; null when nothing has run.
+    pub next_due_at: Option<String>,
+    /// True when nothing has run yet, or `next_due_at` has passed.
+    pub due: bool,
+    /// Rows in the finding log.
+    pub findings: i64,
+    /// Findings that still point at an inbox item.
+    pub linked: i64,
 }
 
 /// What one live **board** holds — the four things a picture can be in a

@@ -32,7 +32,7 @@ use crate::core::{
     LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority,
     Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch,
     Status, Store, Task, TaskPatch, TaskReceipt, agents, board, cc, config, files, library, live,
-    look, receipt, system,
+    look, receipt, retro, system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -122,6 +122,11 @@ enum Command {
     /// Claude Code telemetry: sessions, tokens, models, skills, agents, cost
     #[command(subcommand)]
     Cc(CcCmd),
+    /// The session retrospective: run it, see when it is due, and its
+    /// finding log (mesa task 1158)
+    #[command(subcommand)]
+    Retro(RetroCmd),
+
     /// Start the HTTP server and web UI
     ///
     /// By default binds 127.0.0.1 only (loopback): reachable solely from this
@@ -179,8 +184,21 @@ enum Command {
         /// web UI's Restart Server action.
         #[arg(long, default_value_t = false)]
         watch_cost: bool,
+        /// Every `watchers.retro-interval-hours` (default 72), auto-start a
+        /// background `claude` agent that reviews the task sessions finished
+        /// since the last retrospective for friction and files each NEW
+        /// finding into the inbox as a change request (default: the
+        /// `mesa-retro` agent definition, configurable in ~/.mesa/config.json;
+        /// cwd `~/.mesa/workspace`). It proposes only — it never edits an
+        /// agent, a skill or project code. Off by default: this spawns real
+        /// agents (API cost) with no user request behind it. Independent of
+        /// the other three watchers. Preserved across the web UI's Restart
+        /// Server action.
+        #[arg(long, default_value_t = false)]
+        watch_retro: bool,
     },
     /// Snapshot the database to a file (safe while the server runs)
+
     ///
     /// Uses SQLite `VACUUM INTO`, which is safe under WAL mode — unlike
     /// copying the database file. The destination must not already exist.
@@ -1566,6 +1584,130 @@ EXAMPLES
 /// every command except `status` is `not_found` naming `mesa live start`;
 /// `status` prints `null` and exits 0, because "nobody is talking to mesa" is
 /// an answer, not a failure.
+/// The session retrospective (mesa task 1158, `docs/retro.md`): a scheduled
+/// review of the task sessions that finished since the last run, looking for
+/// friction — denials, retry loops, a missing skill, a tool that keeps
+/// failing — and filing each NEW finding into the inbox as a change request.
+/// It proposes; it never edits an agent, a skill, a config file or project
+/// code. `serve --watch-retro` runs it every `watchers.retro-interval-hours`;
+/// these verbs run it by hand and hold its finding log.
+#[derive(Subcommand)]
+enum RetroCmd {
+    /// Start a retrospective now: records a `manual` run and spawns the agent
+    ///
+    /// Prints the run row. Inside the interval since the last run this is
+    /// `conflict` naming when the next is due — `--force` runs it anyway. The
+    /// agent is spawned through `agents::spawn_bg` with the `retro` template
+    /// from ~/.mesa/config.json (default: `claude --bg --agent mesa-retro …`),
+    /// in ~/.mesa/workspace. If the spawn fails the run row is deleted again
+    /// and the command exits 1 with code "unavailable", so the next attempt
+    /// is not a `conflict` against a run that never happened.
+    #[command(after_help = "\
+EXAMPLES
+  mesa retro run             # conflict if one ran inside the interval
+  mesa retro run --force     # run it regardless")]
+    Run {
+        /// Run even if the last retrospective is newer than the interval
+        #[arg(long)]
+        force: bool,
+        /// Print the run in its compact shape instead of in full
+        ///
+        /// A run carries no unbounded free text, so this output is identical
+        /// to the default; the flag is accepted for uniformity.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// When the last retrospective ran, when the next is due, and the log's size
+    ///
+    /// `{last_run, interval_hours, next_due_at, due, findings, linked}` —
+    /// `due` and `next_due_at` are computed on the store's clock, the same
+    /// arithmetic `serve --watch-retro` dispatches on.
+    #[command(visible_aliases = ["show", "get"])]
+    Status {
+        /// Print the status in its compact shape instead of in full
+        ///
+        /// The status carries no unbounded free text, so this output is
+        /// identical to the default; the flag is accepted for uniformity.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// The finding log — record/link/list/show
+    #[command(subcommand)]
+    Finding(RetroFindingCmd),
+}
+
+/// The retrospective's **finding log**: one row per fingerprint, so the same
+/// friction seen on a later run bumps a count and adds evidence instead of
+/// filing a second inbox item. In the db rather than the server's memory,
+/// unlike the inbox-watcher's dedup set, because a retrospective's memory has
+/// to survive a restart and span runs days apart.
+#[derive(Subcommand)]
+enum RetroFindingCmd {
+    /// Record a finding; prints `{"new": bool, "finding": {...}}`
+    ///
+    /// Upserts on `--fingerprint` (the agent's rule: lowercase
+    /// `<subject>/<kind>`). A new fingerprint is a row with count 1; a known
+    /// one bumps its count, moves `last_seen_at` and appends `--evidence` as
+    /// one more line (newest last, the oldest trimmed past 4000 characters)
+    /// while the summary stays as first recorded. `"new": false` is the
+    /// agent's signal that the finding is already filed and nothing more goes
+    /// to the inbox.
+    #[command(after_help = "\
+EXAMPLES
+  mesa retro finding record --fingerprint swe/denial --subject swe --kind denial \\
+    --summary \"swe keeps asking to run git push\" --evidence \"session abc: 3 denials\"")]
+    Record {
+        /// The dedup key (≤ 200 characters)
+        #[arg(long, value_name = "KEY")]
+        fingerprint: String,
+        /// The agent, skill or tool the friction belongs to (≤ 200 characters)
+        #[arg(long, value_name = "NAME")]
+        subject: String,
+        /// What sort of friction (≤ 200 characters)
+        #[arg(long, value_name = "KIND")]
+        kind: String,
+        /// One paragraph on what was seen (≤ 2000 characters)
+        #[arg(long, value_name = "TEXT")]
+        summary: String,
+        /// One line of evidence for this report (≤ 2000 characters)
+        #[arg(long, value_name = "TEXT")]
+        evidence: Option<String>,
+        /// Print the finding minus its summary and evidence
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Point a finding at the inbox item it was filed as; prints the finding
+    ///
+    /// Bumps nothing. `not_found` for an unknown finding, `validation` for an
+    /// unknown inbox item.
+    Link {
+        /// The finding id
+        #[arg(long)]
+        id: i64,
+        /// The inbox item id
+        #[arg(long, value_name = "ID")]
+        inbox_item: i64,
+        /// Print the finding minus its summary and evidence
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// List findings, most recently seen first (no --quiet: already compact)
+    List {
+        /// At most this many (clamped into 1..=500)
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Print one finding in full
+    #[command(visible_alias = "get")]
+    Show {
+        /// The finding id
+        id: i64,
+        /// Print the finding minus its summary and evidence
+        #[arg(long)]
+        quiet: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum LiveCmd {
     /// Start the live session and spawn the agent that drives it
@@ -3347,6 +3489,12 @@ fn print_record<T: serde::Serialize>(record: &T, is_quiet: bool, drop: &[&str]) 
     }
 }
 
+/// Keys dropped from a `RetroFinding` under `--quiet` (mesa task 1158): the
+/// paragraph and the evidence lines it quotes from transcripts — the two
+/// unbounded free-text fields. A `RetroRun` and a `RetroStatus` have nothing
+/// to drop, so both pass through in declaration order.
+const QUIET_DROP_RETRO_FINDING: &[&str] = &["summary", "evidence"];
+
 /// Print one project: the full record, or the record minus `description`.
 fn print_project(project: &Project, is_quiet: bool) {
     print_record(project, is_quiet, QUIET_DROP_PROJECT);
@@ -3536,13 +3684,16 @@ fn execute(command: Command) -> Result<()> {
         Command::Live(cmd) => run_live(cmd),
         Command::Attachment(cmd) => run_attachment(cmd),
         Command::Cc(cmd) => run_cc(cmd),
+        Command::Retro(cmd) => run_retro(cmd),
         Command::Serve {
             port,
             lan,
             watch_todo,
             watch_inbox,
             watch_cost,
-        } => crate::api::serve(port, lan, watch_todo, watch_inbox, watch_cost),
+            watch_retro,
+        } => crate::api::serve(port, lan, watch_todo, watch_inbox, watch_cost, watch_retro),
+
         Command::System => {
             print_json(&system::snapshot());
             Ok(())
@@ -5022,6 +5173,104 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
     Ok(())
 }
 
+/// The retrospective's verbs (mesa task 1158). `run` is the CLI's spawn site,
+/// the twin of `api::retro_watcher_tick`: the same claim-then-spawn order
+/// (the run row is written first, so a concurrent watcher tick sees it), the
+/// same seeded definition, the same template and the same rollback.
+fn run_retro(cmd: RetroCmd) -> Result<()> {
+    let mut store = Store::open_default()?;
+    match cmd {
+        RetroCmd::Run { force, quiet } => {
+            let interval = config::retro_interval_hours().map_err(Error::Unavailable)?;
+            let status = store.retro_status(interval)?;
+            if !force && !status.due {
+                return Err(Error::Conflict(format!(
+                    "the last retrospective started at {}; the next is due at {} (pass --force to run it now)",
+                    status.last_run.map(|r| r.started_at).unwrap_or_default(),
+                    status.next_due_at.unwrap_or_default()
+                )));
+            }
+            let run = store.record_retro_run("manual")?;
+            // The `mesa-retro` definition is seeded first: the default
+            // template spawns `--agent mesa-retro`, which errors on an agent
+            // Claude Code has never seen. cwd is ~/.mesa/workspace — a
+            // retrospective spans every project, so there is no local_path.
+            let dir = config::workspace_dir().to_string_lossy().into_owned();
+            let name = retro::session_name(run.id);
+            let spawned = retro::ensure_agent_definition(&store).and_then(|_| {
+                let prompts = library::prompts(&store).map_err(|e| e.to_string())?;
+                agents::spawn_bg(
+                    config::RETRO,
+                    &dir,
+                    Some(run.id),
+                    Some(&name),
+                    None,
+                    &prompts,
+                )
+            });
+            if let Err(e) = spawned {
+                let id = run.id;
+                store.delete_retro_run(id)?;
+                return Err(Error::Unavailable(format!(
+                    "retro run {id} could not spawn its agent, so it was deleted again: {e}"
+                )));
+            }
+            print_record(&run, quiet, &[]);
+        }
+        RetroCmd::Status { quiet } => {
+            let interval = config::retro_interval_hours().map_err(Error::Unavailable)?;
+            print_record(&store.retro_status(interval)?, quiet, &[]);
+        }
+        RetroCmd::Finding(cmd) => run_retro_finding(&mut store, cmd)?,
+    }
+    Ok(())
+}
+
+fn run_retro_finding(store: &mut Store, cmd: RetroFindingCmd) -> Result<()> {
+    match cmd {
+        RetroFindingCmd::Record {
+            fingerprint,
+            subject,
+            kind,
+            summary,
+            evidence,
+            quiet,
+        } => {
+            let (finding, is_new) = store.record_retro_finding(
+                &fingerprint,
+                &subject,
+                &kind,
+                &summary,
+                evidence.as_deref(),
+            )?;
+            // A composite: the key structure stays, the member is compacted.
+            let finding = if quiet {
+                self::quiet(&finding, QUIET_DROP_RETRO_FINDING)
+            } else {
+                serde_json::to_value(&finding).expect("json serialize")
+            };
+            print_json(&json!({"new": is_new, "finding": finding}));
+        }
+        RetroFindingCmd::Link {
+            id,
+            inbox_item,
+            quiet,
+        } => {
+            let finding = store.link_retro_finding(id, inbox_item)?;
+            print_record(&finding, quiet, QUIET_DROP_RETRO_FINDING);
+        }
+        RetroFindingCmd::List { limit } => print_json(&store.list_retro_findings(limit)?),
+        RetroFindingCmd::Show { id, quiet } => {
+            print_record(
+                &store.get_retro_finding(id)?,
+                quiet,
+                QUIET_DROP_RETRO_FINDING,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_live_summary(store: &mut Store, cmd: LiveSummaryCmd) -> Result<()> {
     match cmd {
         LiveSummaryCmd::Set { id, text, quiet } => {
@@ -5981,6 +6230,7 @@ mod tests {
         FrameShape, InboxItem, Project, TaskSummary, Waypoint,
     };
     use crate::core::{DiffStat, GitCommit, LiveContext, LiveContextKind, LiveWindow};
+    use crate::core::{RetroFinding, RetroRun, RetroStatus};
 
     /// Serialized top-level key set of any record, sorted.
     fn keys(value: &impl serde::Serialize) -> Vec<String> {
@@ -6805,6 +7055,91 @@ mod tests {
                 QUIET_DROP_LIVE_SUMMARY
             ))),
             minus(&full, QUIET_DROP_LIVE_SUMMARY),
+        );
+    }
+
+    fn sample_retro_finding() -> RetroFinding {
+        RetroFinding {
+            id: 4,
+            fingerprint: "swe/denial".into(),
+            subject: "swe".into(),
+            kind: "denial".into(),
+            summary: "swe keeps asking to run git push".into(),
+            count: 2,
+            evidence: Some("session abc: 3 denials\nsession def: 2 denials".into()),
+            first_seen_at: "2026-09-01 00:00:00".into(),
+            last_seen_at: "2026-09-04 00:00:00".into(),
+            inbox_item_id: Some(9),
+        }
+    }
+
+    /// Key parity for the finding (mesa task 1158): the quiet shape is the
+    /// row minus its two free-text fields, and a new field on the record
+    /// forces a decision here.
+    #[test]
+    fn retro_finding_quiet_drops_summary_and_evidence() {
+        let full = keys(&sample_retro_finding());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "fingerprint",
+                "subject",
+                "kind",
+                // The paragraph. Dropped.
+                "summary",
+                "count",
+                // The transcript quotes, one line per report. Dropped.
+                "evidence",
+                "first_seen_at",
+                "last_seen_at",
+                "inbox_item_id",
+            ]),
+            "RetroFinding gained/lost a field: decide whether it belongs in \
+             the --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(
+                &sample_retro_finding(),
+                QUIET_DROP_RETRO_FINDING
+            ))),
+            minus(&full, QUIET_DROP_RETRO_FINDING),
+        );
+    }
+
+    /// A run and the status have nothing unbounded, so their `--quiet` is the
+    /// record itself — pinned so a free-text field added later is noticed.
+    #[test]
+    fn retro_run_and_status_have_nothing_to_drop() {
+        let run = RetroRun {
+            id: 1,
+            started_at: "2026-09-01 00:00:00".into(),
+            trigger: "manual".into(),
+        };
+        assert_eq!(
+            sorted_owned(keys(&run)),
+            sorted(&["id", "started_at", "trigger"]),
+            "RetroRun gained/lost a field: decide whether --quiet should drop it"
+        );
+        let status = RetroStatus {
+            last_run: Some(run),
+            interval_hours: 72,
+            next_due_at: Some("2026-09-04 00:00:00".into()),
+            due: false,
+            findings: 3,
+            linked: 1,
+        };
+        assert_eq!(
+            sorted_owned(keys(&status)),
+            sorted(&[
+                "last_run",
+                "interval_hours",
+                "next_due_at",
+                "due",
+                "findings",
+                "linked",
+            ]),
+            "RetroStatus gained/lost a field: decide whether --quiet should drop it"
         );
     }
 

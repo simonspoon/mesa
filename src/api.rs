@@ -46,9 +46,10 @@ use crate::core::{
     LiveContext, LiveNotebookEntry, LiveNotice, LiveRole, LiveState, LiveStatus, LiveTranscript,
     LiveWindow, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree,
     ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch,
-    Script, ScriptArg, ScriptPatch, Status, Store, SystemInfo, Task, TaskPatch, TaskSummary,
-    Waypoint, agents, attachments, board, config, files, git, guard, hooks, inbox_triage, library,
-    listen, live, receipt, retro, scripts, speech, supervisor, system, version,
+    STALE_CLAIM_MINUTES, Script, ScriptArg, ScriptPatch, Status, Store, SystemInfo, Task,
+    TaskPatch, TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard, hooks,
+    inbox_triage, library, listen, live, receipt, retro, scripts, speech, supervisor, system,
+    version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -773,8 +774,11 @@ fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
 /// spawn failure reverts the task back to `todo` so the project isn't
 /// wedged; a dispatched agent that later crashes without finishing is not
 /// detected here (task-status, not live-session, is the "in process" signal)
-/// and leaves that project quiet until someone intervenes — an accepted v1
-/// tradeoff over polling `claude agents` for every project every tick.
+/// — the reaper is what notices it (mesa task 1191): [`todo_reaper_tick`]
+/// files an inbox alert for a dispatched session that ended, or sat idle an
+/// hour, without closing its `in_progress` task, and leaves the task itself
+/// for a person to move. A restart forgets the dispatches spawned before it,
+/// and a session it never dispatched is not watched at all.
 ///
 /// "Busy" is a **count**, not a flag (mesa task 777), and is the **max** of
 /// two independent signals (mesa task 802):
@@ -1042,13 +1046,7 @@ fn todo_watcher_tick(state: &AppState) {
                         Ok(d) => d,
                         Err(e) => e.into_inner(),
                     };
-                    dispatched.insert(
-                        job_id,
-                        DispatchedSession {
-                            task_id,
-                            superseded: false,
-                        },
-                    );
+                    dispatched.insert(job_id, DispatchedSession::new(task_id, Instant::now()));
                 }
             }
             Err(e) => {
@@ -1075,11 +1073,67 @@ fn todo_watcher_tick(state: &AppState) {
 /// started a second agent on it — so the reaper reads it as a closed task
 /// whatever the task's own status says, which is what keeps a re-claimed
 /// `in_progress` from sparing the session it replaced.
+///
+/// The rest is the reaper's per-session **memory** for the three alerts it
+/// files (mesa task 1191): when it first saw the closed task's session still
+/// holding live work, when it first saw the `in_progress` task's session
+/// idle, and which alerts it has already filed. All in memory with the map
+/// itself, and a flag is set only once the filing succeeded, so a failed
+/// filing is retried on the next pass rather than lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DispatchedSession {
     task_id: i64,
     superseded: bool,
+    /// When the dispatch was recorded. A job the listing does not name yet is
+    /// not judged abandoned until [`REAP_ABANDON_GRACE`] after this, since a
+    /// session `claude --bg` has only just backgrounded may not be listed on
+    /// the very next pass.
+    dispatched_at: Instant,
+    /// First pass that found the session still holding live work after its
+    /// task closed; cleared when the work ends. [`REAP_LIVE_WORK_GRACE`] is
+    /// measured from here.
+    work_since: Option<Instant>,
+    /// The closed-with-live-work alert has been filed for this session.
+    work_alerted: bool,
+    /// First pass that found the session idle — not `busy`, no live work —
+    /// while its task was still `in_progress`; cleared the moment it is seen
+    /// working again, so the stall clock measures *continuous* idleness.
+    idle_since: Option<Instant>,
+    /// The stalled alert has been filed for this session.
+    stalled_alerted: bool,
 }
+
+impl DispatchedSession {
+    fn new(task_id: i64, now: Instant) -> Self {
+        DispatchedSession {
+            task_id,
+            superseded: false,
+            dispatched_at: now,
+            work_since: None,
+            work_alerted: false,
+            idle_since: None,
+            stalled_alerted: false,
+        }
+    }
+}
+
+/// How long a closed task's session may keep its live work running after the
+/// reaper has said so in the inbox, before it is stopped anyway (mesa task
+/// 1191). A shell the closing agent left running — a dev server, a check
+/// script — is worth a look, not a worktree held forever.
+const REAP_LIVE_WORK_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// How long after a dispatch a job missing from the `claude agents` listing
+/// is still read as "not listed *yet*" rather than gone (mesa task 1191).
+const REAP_ABANDON_GRACE: Duration = Duration::from_secs(60);
+
+/// How long an `in_progress` task's session must sit continuously idle before
+/// the reaper reports it stalled (mesa task 1191): the same hour
+/// `task next`'s stale-claim diagnostic uses, since both name one wedge.
+const REAP_STALL_AFTER: Duration = Duration::from_secs(STALE_CLAIM_MINUTES as u64 * 60);
+
+/// Author every reaper alert is filed under, `COST_GUARD_AUTHOR`'s twin.
+const TODO_REAPER_AUTHOR: &str = "todo-reaper";
 
 /// What the reaper should do with one dispatched session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1090,34 +1144,173 @@ enum ReapVerdict {
     Forget,
     /// Finished with its task and still running: `claude stop <job id>`.
     Stop,
+    /// Finished with its task but still holding a live shell or subagent:
+    /// tell the inbox, then wait for the work to end (or the grace to run
+    /// out) before stopping.
+    AlertLiveWork,
+    /// The task is still `in_progress` but the session is gone: tell the
+    /// inbox the project's loop is stalled on it, then forget the dispatch.
+    AlertAbandoned,
+    /// The task is still `in_progress` and the session has sat idle for
+    /// [`REAP_STALL_AFTER`]: tell the inbox once, and keep the entry.
+    AlertStalled,
 }
 
 /// The reaper's whole decision, kept pure so it is testable without a
 /// `claude` binary: the task's status (`None` = the task was deleted, which
-/// counts as closed) and the session's row in the current `claude agents`
-/// listing (`None` = not listed).
+/// counts as closed), the session's row in the current `claude agents`
+/// listing (`None` = not listed), the dispatch's own memory and the clock.
+/// The memory's two timers are advanced here — this is the one place that
+/// reads them, so it is the one place that should move them — while its
+/// `*_alerted` flags belong to the caller, since only it knows whether the
+/// filing succeeded.
 ///
 /// `in_progress` is the one status that means "still mine": every other one —
 /// `done`, `cancelled`, and a task pushed back to `todo`/`backlog` by hand —
 /// says the agent is finished with the work it was started for, whether or
-/// not it finished it well.
+/// not it finished it well. Even so, an `in_progress` task is not left alone
+/// blindly (mesa task 1191): a session that is gone — listed with no `pid`,
+/// or unlisted past [`REAP_ABANDON_GRACE`] — ended without closing its task,
+/// which parks that project's whole loop, and one sitting idle with nothing
+/// running for [`REAP_STALL_AFTER`] is probably waiting on something nobody
+/// will answer. Both are reported, neither is touched: the reaper stops only
+/// what has finished, and the task's status stays the person's to move.
 ///
 /// A **busy** session is left for the next pass rather than stopped: an agent
 /// that has just closed its task is usually still writing its report or its
 /// inbox summary, and cutting that off would lose the very thing the run was
-/// for. Every other live state (`idle`, `waiting`, or a row with no status at
-/// all) is a session sitting on a worktree with nothing to do.
-fn reap_verdict(status: Option<Status>, listed: Option<&AgentSession>) -> ReapVerdict {
+/// for. So is one whose task closed while it still holds a **live shell or
+/// subagent** — a dev server, a check script, a delegate mid-report — but
+/// that one is reported, and stopped anyway once [`REAP_LIVE_WORK_GRACE`]
+/// has passed since it was first seen. Every other live state (`idle`,
+/// `waiting`, or a row with no status at all) is a session sitting on a
+/// worktree with nothing to do.
+fn reap_verdict(
+    status: Option<Status>,
+    listed: Option<&AgentSession>,
+    memory: &mut DispatchedSession,
+    now: Instant,
+) -> ReapVerdict {
+    let live = listed.filter(|s| s.pid.is_some());
+    let live_work = live.is_some_and(|s| s.live_shells + s.live_subagents > 0);
+    let busy = live.is_some_and(|s| s.status.as_deref() == Some("busy"));
     if status == Some(Status::InProgress) {
+        memory.work_since = None;
+        let Some(_) = live else {
+            // Never listed yet, and dispatched only moments ago: the daemon
+            // may still be registering it.
+            if listed.is_none() && now.duration_since(memory.dispatched_at) < REAP_ABANDON_GRACE {
+                return ReapVerdict::Keep;
+            }
+            return ReapVerdict::AlertAbandoned;
+        };
+        if busy || live_work {
+            memory.idle_since = None;
+            return ReapVerdict::Keep;
+        }
+        let since = *memory.idle_since.get_or_insert(now);
+        if !memory.stalled_alerted && now.duration_since(since) >= REAP_STALL_AFTER {
+            return ReapVerdict::AlertStalled;
+        }
         return ReapVerdict::Keep;
     }
-    match listed {
-        // Not listed, or listed with no pid: the process is already gone.
-        None => ReapVerdict::Forget,
-        Some(session) if session.pid.is_none() => ReapVerdict::Forget,
-        Some(session) if session.status.as_deref() == Some("busy") => ReapVerdict::Keep,
-        Some(_) => ReapVerdict::Stop,
+    memory.idle_since = None;
+    // Not listed, or listed with no pid: the process is already gone.
+    if live.is_none() {
+        return ReapVerdict::Forget;
     }
+    if live_work {
+        let since = *memory.work_since.get_or_insert(now);
+        if !memory.work_alerted {
+            return ReapVerdict::AlertLiveWork;
+        }
+        if now.duration_since(since) >= REAP_LIVE_WORK_GRACE {
+            return ReapVerdict::Stop;
+        }
+        return ReapVerdict::Keep;
+    }
+    memory.work_since = None;
+    if busy {
+        return ReapVerdict::Keep;
+    }
+    ReapVerdict::Stop
+}
+
+/// The alert for a task that closed — or was re-dispatched, when the
+/// session is `superseded` — while its session still had work running.
+fn reaper_live_work_body(
+    job_id: &str,
+    task_id: i64,
+    session: &AgentSession,
+    superseded: bool,
+) -> String {
+    let why = if superseded {
+        "was re-dispatched while its previous"
+    } else {
+        "closed while its"
+    };
+    format!(
+        "Task {task_id} {why} agent session {job_id} still had work running: \
+         {} live shell(s) and {} live subagent(s). The session is being left alone \
+         for {} minutes so that work can finish, then stopped. Look in with \
+         `claude attach {job_id}`, or end it now with `claude stop {job_id}`.",
+        session.live_shells,
+        session.live_subagents,
+        REAP_LIVE_WORK_GRACE.as_secs() / 60
+    )
+}
+
+/// The alert for a session that ended without closing its `in_progress` task.
+fn reaper_abandoned_body(job_id: &str, task_id: i64) -> String {
+    format!(
+        "Agent session {job_id} ended without closing task {task_id}, which is still \
+         in_progress. The project's todo loop is stalled until the task is moved — \
+         for example `mesa task update {task_id} --status todo` to have it dispatched \
+         again, or `--status done` if the work landed."
+    )
+}
+
+/// The alert for an `in_progress` task whose session has sat idle for an hour.
+fn reaper_stalled_body(job_id: &str, task_id: i64) -> String {
+    format!(
+        "Agent session {job_id} on task {task_id} looks stalled: the task is still \
+         in_progress, but the session has been idle with nothing running for \
+         {} minutes. See what it is waiting on with `claude attach {job_id}`.",
+        REAP_STALL_AFTER.as_secs() / 60
+    )
+}
+
+/// Files one reaper alert against `task_id`, `Ok(())` meaning the alert is
+/// dealt with — filed, or nothing to file because the task is gone (said
+/// once on stderr, since an inbox item must name a real task). `Err` is a
+/// filing that should be retried next pass.
+fn file_reaper_alert(
+    state: &AppState,
+    task_exists: bool,
+    task_id: i64,
+    job_id: &str,
+    body: &str,
+) -> Result<(), String> {
+    if !task_exists {
+        eprintln!(
+            "todo-watcher: task {task_id} was deleted while its session {job_id} still had \
+             work running; nothing to file the alert against"
+        );
+        return Ok(());
+    }
+    let mut store = match state.store.lock() {
+        Ok(s) => s,
+        Err(e) => e.into_inner(),
+    };
+    store
+        .create_inbox_item(
+            Some(TODO_REAPER_AUTHOR),
+            body,
+            InboxKind::TaskSummary,
+            task_id,
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// One reaper pass: stop the sessions the todo-watcher dispatched whose task
@@ -1157,7 +1350,8 @@ fn todo_reaper_tick(state: &AppState) {
             return;
         }
     };
-    let statuses: Vec<Option<Status>> = {
+    // `(task still exists, its status as the reaper reads it)` per entry.
+    let statuses: Vec<(bool, Option<Status>)> = {
         let store = match state.store.lock() {
             Ok(s) => s,
             Err(e) => e.into_inner(),
@@ -1168,24 +1362,27 @@ fn todo_reaper_tick(state: &AppState) {
             // task now reads, and a task that no longer exists counts as
             // closed: either way, this is not that task's worker any more.
             .map(|(_, d)| {
-                (!d.superseded)
-                    .then(|| store.get_task(d.task_id).ok().map(|t| t.status))
-                    .flatten()
+                let status = store.get_task(d.task_id).ok().map(|t| t.status);
+                (status.is_some(), status.filter(|_| !d.superseded))
             })
             .collect()
     };
-    for ((job_id, dispatch), status) in dispatched.into_iter().zip(statuses) {
+    let now = Instant::now();
+    for ((job_id, dispatch), (task_exists, status)) in dispatched.into_iter().zip(statuses) {
         let task_id = dispatch.task_id;
         let listed = sessions
             .iter()
             .find(|s| s.id.as_deref() == Some(job_id.as_str()));
-        match reap_verdict(status, listed) {
+        let mut memory = dispatch;
+        match reap_verdict(status, listed, &mut memory, now) {
             ReapVerdict::Keep => {}
             ReapVerdict::Forget => forget_dispatch(state, &job_id),
             ReapVerdict::Stop => match agents::stop(&job_id) {
                 Ok(()) => {
                     let why = if dispatch.superseded {
                         "was re-dispatched"
+                    } else if memory.work_alerted {
+                        "is closed and its live work outran the grace"
                     } else {
                         "is closed"
                     };
@@ -1199,7 +1396,65 @@ fn todo_reaper_tick(state: &AppState) {
                 // running and still holding whatever it holds.
                 Err(e) => eprintln!("todo-watcher: stopping session {job_id} failed: {e}"),
             },
+            ReapVerdict::AlertLiveWork => {
+                // The verdict only names this for a listed, live session.
+                let Some(session) = listed else {
+                    continue;
+                };
+                let body = reaper_live_work_body(&job_id, task_id, session, dispatch.superseded);
+                match file_reaper_alert(state, task_exists, task_id, &job_id, &body) {
+                    Ok(()) => memory.work_alerted = true,
+                    Err(e) => eprintln!(
+                        "todo-watcher: filing the live-work alert for session {job_id} failed: {e}"
+                    ),
+                }
+            }
+            ReapVerdict::AlertAbandoned => {
+                let body = reaper_abandoned_body(&job_id, task_id);
+                match file_reaper_alert(state, task_exists, task_id, &job_id, &body) {
+                    Ok(()) => {
+                        eprintln!(
+                            "todo-watcher: session {job_id} ended without closing task \
+                             {task_id}; filed an inbox alert"
+                        );
+                        forget_dispatch(state, &job_id);
+                        continue;
+                    }
+                    // Kept, so the next pass files again.
+                    Err(e) => eprintln!(
+                        "todo-watcher: filing the abandoned-task alert for session {job_id} \
+                         failed: {e}"
+                    ),
+                }
+            }
+            ReapVerdict::AlertStalled => {
+                let body = reaper_stalled_body(&job_id, task_id);
+                match file_reaper_alert(state, task_exists, task_id, &job_id, &body) {
+                    Ok(()) => memory.stalled_alerted = true,
+                    Err(e) => eprintln!(
+                        "todo-watcher: filing the stalled alert for session {job_id} failed: {e}"
+                    ),
+                }
+            }
         }
+        remember_dispatch(state, &job_id, memory);
+    }
+}
+
+/// Writes one pass's timers and alert flags back to `todo_dispatched`. Only
+/// the reaper's own fields: `superseded` may have been flipped by a dispatch
+/// since the pass took its snapshot, and an entry the pass forgot stays
+/// forgotten.
+fn remember_dispatch(state: &AppState, job_id: &str, memory: DispatchedSession) {
+    let mut map = match state.todo_dispatched.lock() {
+        Ok(d) => d,
+        Err(e) => e.into_inner(),
+    };
+    if let Some(entry) = map.get_mut(job_id) {
+        entry.work_since = memory.work_since;
+        entry.work_alerted = memory.work_alerted;
+        entry.idle_since = memory.idle_since;
+        entry.stalled_alerted = memory.stalled_alerted;
     }
 }
 
@@ -10893,22 +11148,63 @@ exit 2
     fn seed_dispatch(state: &AppState, job_id: &str, task_id: i64) {
         state.todo_dispatched.lock().unwrap().insert(
             job_id.to_string(),
-            DispatchedSession {
-                task_id,
-                superseded: false,
-            },
+            DispatchedSession::new(task_id, Instant::now()),
         );
+    }
+
+    /// A fresh dispatch's memory, as the map would hold it at `now`.
+    fn fresh_memory(now: Instant) -> DispatchedSession {
+        DispatchedSession::new(7, now)
+    }
+
+    /// `session_row` with live work on it.
+    fn working_row(pid: Option<i64>, status: Option<&str>, shells: u32) -> AgentSession {
+        let mut row = session_row(pid, status);
+        row.live_shells = shells;
+        row
+    }
+
+    /// Reads an inbox row as `(author, kind, task_id)`, the three facts a
+    /// reaper alert is checked on.
+    fn inbox_rows(state: &AppState) -> Vec<(Option<String>, InboxKind, Option<i64>)> {
+        state
+            .store
+            .lock()
+            .unwrap()
+            .list_inbox_items(None)
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.author, i.kind, i.task_id))
+            .collect()
+    }
+
+    /// Rewrites one reaper timer on a seeded entry, standing in for the
+    /// passes that would otherwise have to elapse.
+    fn backdate(
+        state: &AppState,
+        job_id: &str,
+        by: Duration,
+        f: impl FnOnce(&mut DispatchedSession, Instant),
+    ) {
+        let then = Instant::now()
+            .checked_sub(by)
+            .expect("the monotonic clock is older than the grace being backdated");
+        let mut map = state.todo_dispatched.lock().unwrap();
+        f(map.get_mut(job_id).expect("entry seeded"), then);
     }
 
     #[test]
     fn reap_verdict_keeps_an_in_progress_task_whatever_the_session_says() {
+        let now = Instant::now();
+        // A fresh dispatch: even an unlisted job is "not listed *yet*".
         for row in [
             Some(session_row(Some(4242), Some("idle"))),
-            Some(session_row(None, None)),
+            Some(session_row(Some(4242), Some("busy"))),
             None,
         ] {
+            let mut memory = fresh_memory(now);
             assert_eq!(
-                reap_verdict(Some(Status::InProgress), row.as_ref()),
+                reap_verdict(Some(Status::InProgress), row.as_ref(), &mut memory, now),
                 ReapVerdict::Keep
             );
         }
@@ -10916,6 +11212,7 @@ exit 2
 
     #[test]
     fn reap_verdict_stops_a_live_idle_session_of_a_closed_task() {
+        let now = Instant::now();
         // Every non-`in_progress` status means the agent is finished with the
         // work it was started for -- including a task pushed back to `todo`.
         for status in [
@@ -10926,35 +11223,213 @@ exit 2
             // A deleted task counts as closed.
             None,
         ] {
+            let mut memory = fresh_memory(now);
             assert_eq!(
-                reap_verdict(status, Some(&session_row(Some(4242), Some("idle")))),
+                reap_verdict(
+                    status,
+                    Some(&session_row(Some(4242), Some("idle"))),
+                    &mut memory,
+                    now
+                ),
                 ReapVerdict::Stop,
                 "status {status:?} must be reaped"
             );
         }
         // No status at all is still a live session with nothing to do.
+        let mut memory = fresh_memory(now);
         assert_eq!(
-            reap_verdict(Some(Status::Done), Some(&session_row(Some(4242), None))),
+            reap_verdict(
+                Some(Status::Done),
+                Some(&session_row(Some(4242), None)),
+                &mut memory,
+                now
+            ),
             ReapVerdict::Stop
         );
     }
 
     #[test]
     fn reap_verdict_waits_out_a_busy_session_and_forgets_a_dead_one() {
+        let now = Instant::now();
+        let mut memory = fresh_memory(now);
         // Still writing its closing report: stop it on a later pass.
         assert_eq!(
             reap_verdict(
                 Some(Status::Done),
-                Some(&session_row(Some(4242), Some("busy")))
+                Some(&session_row(Some(4242), Some("busy"))),
+                &mut memory,
+                now
             ),
             ReapVerdict::Keep
         );
         // Process gone, and not listed at all: nothing to stop either way.
         assert_eq!(
-            reap_verdict(Some(Status::Done), Some(&session_row(None, Some("idle")))),
+            reap_verdict(
+                Some(Status::Done),
+                Some(&session_row(None, Some("idle"))),
+                &mut memory,
+                now
+            ),
             ReapVerdict::Forget
         );
-        assert_eq!(reap_verdict(Some(Status::Done), None), ReapVerdict::Forget);
+        assert_eq!(
+            reap_verdict(Some(Status::Done), None, &mut memory, now),
+            ReapVerdict::Forget
+        );
+    }
+
+    #[test]
+    fn reap_verdict_reports_then_waits_out_live_work_of_a_closed_task() {
+        let now = Instant::now();
+        let mut memory = fresh_memory(now);
+        let working = working_row(Some(4242), Some("idle"), 1);
+        // First sight of live work on a closed task: say so, and start the
+        // grace clock.
+        assert_eq!(
+            reap_verdict(Some(Status::Done), Some(&working), &mut memory, now),
+            ReapVerdict::AlertLiveWork
+        );
+        assert_eq!(memory.work_since, Some(now));
+        // Filing failed: the next pass files again, off the same clock.
+        let later = now + Duration::from_secs(20);
+        assert_eq!(
+            reap_verdict(Some(Status::Done), Some(&working), &mut memory, later),
+            ReapVerdict::AlertLiveWork
+        );
+        assert_eq!(memory.work_since, Some(now));
+        // Filed: wait, whatever the session's status says.
+        memory.work_alerted = true;
+        let busy_working = working_row(Some(4242), Some("busy"), 1);
+        for row in [&working, &busy_working] {
+            assert_eq!(
+                reap_verdict(Some(Status::Done), Some(row), &mut memory, later),
+                ReapVerdict::Keep
+            );
+        }
+        // Still there at the grace: stopped anyway, busy or not.
+        let overdue = now + REAP_LIVE_WORK_GRACE;
+        assert_eq!(
+            reap_verdict(
+                Some(Status::Done),
+                Some(&busy_working),
+                &mut memory,
+                overdue
+            ),
+            ReapVerdict::Stop
+        );
+        // The work ends inside the grace: the ordinary rule resumes, and the
+        // grace clock is dropped with it.
+        let mut memory = fresh_memory(now);
+        memory.work_since = Some(now);
+        memory.work_alerted = true;
+        assert_eq!(
+            reap_verdict(
+                Some(Status::Done),
+                Some(&session_row(Some(4242), Some("busy"))),
+                &mut memory,
+                later
+            ),
+            ReapVerdict::Keep
+        );
+        assert_eq!(memory.work_since, None);
+        assert_eq!(
+            reap_verdict(
+                Some(Status::Done),
+                Some(&session_row(Some(4242), Some("idle"))),
+                &mut memory,
+                later
+            ),
+            ReapVerdict::Stop
+        );
+        // A superseded or deleted task reads as closed here too.
+        let mut memory = fresh_memory(now);
+        assert_eq!(
+            reap_verdict(None, Some(&working), &mut memory, now),
+            ReapVerdict::AlertLiveWork
+        );
+    }
+
+    #[test]
+    fn reap_verdict_reports_an_in_progress_task_whose_session_is_gone() {
+        let now = Instant::now();
+        // Listed with no pid: the process has exited without closing the
+        // task, and there is no grace to wait out.
+        let mut memory = fresh_memory(now);
+        assert_eq!(
+            reap_verdict(
+                Some(Status::InProgress),
+                Some(&session_row(None, Some("idle"))),
+                &mut memory,
+                now
+            ),
+            ReapVerdict::AlertAbandoned
+        );
+        // Unlisted: only once the dispatch is old enough that the daemon
+        // would have listed it by now.
+        let mut memory = fresh_memory(now);
+        let almost = now + REAP_ABANDON_GRACE - Duration::from_secs(1);
+        assert_eq!(
+            reap_verdict(Some(Status::InProgress), None, &mut memory, almost),
+            ReapVerdict::Keep
+        );
+        assert_eq!(
+            reap_verdict(
+                Some(Status::InProgress),
+                None,
+                &mut memory,
+                now + REAP_ABANDON_GRACE
+            ),
+            ReapVerdict::AlertAbandoned
+        );
+    }
+
+    #[test]
+    fn reap_verdict_reports_an_in_progress_session_idle_for_an_hour() {
+        let now = Instant::now();
+        let mut memory = fresh_memory(now);
+        let idle = session_row(Some(4242), Some("idle"));
+        // First idle sighting starts the clock and reports nothing.
+        assert_eq!(
+            reap_verdict(Some(Status::InProgress), Some(&idle), &mut memory, now),
+            ReapVerdict::Keep
+        );
+        assert_eq!(memory.idle_since, Some(now));
+        let almost = now + REAP_STALL_AFTER - Duration::from_secs(1);
+        assert_eq!(
+            reap_verdict(Some(Status::InProgress), Some(&idle), &mut memory, almost),
+            ReapVerdict::Keep
+        );
+        let stale = now + REAP_STALL_AFTER;
+        assert_eq!(
+            reap_verdict(Some(Status::InProgress), Some(&idle), &mut memory, stale),
+            ReapVerdict::AlertStalled
+        );
+        // Filed: once, and the entry is kept rather than stopped.
+        memory.stalled_alerted = true;
+        assert_eq!(
+            reap_verdict(Some(Status::InProgress), Some(&idle), &mut memory, stale),
+            ReapVerdict::Keep
+        );
+        // Seen busy, or with live work, the clock is dropped: idleness must
+        // be continuous to count.
+        let mut memory = fresh_memory(now);
+        memory.idle_since = Some(now);
+        for row in [
+            session_row(Some(4242), Some("busy")),
+            working_row(Some(4242), Some("idle"), 1),
+        ] {
+            assert_eq!(
+                reap_verdict(Some(Status::InProgress), Some(&row), &mut memory, stale),
+                ReapVerdict::Keep
+            );
+            assert_eq!(memory.idle_since, None);
+        }
+        assert_eq!(
+            reap_verdict(Some(Status::InProgress), Some(&idle), &mut memory, stale),
+            ReapVerdict::Keep,
+            "an hour of idleness is counted from the last time it was seen working"
+        );
+        assert_eq!(memory.idle_since, Some(stale));
     }
 
     #[test]
@@ -11058,6 +11533,265 @@ exit 2
                 dispatched_task(&state, "job0003"),
                 Some(task),
                 "a failed stop keeps its entry for the next pass"
+            );
+
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
+    }
+
+    #[test]
+    fn todo_reaper_tick_reports_a_closed_task_whose_session_still_has_live_work() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN / MESA_CONFIG_FILE / MESA_CC_PROJECTS_DIR for its
+        // duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let agents_file = stub_dir.path().join("agents.json");
+            let stop_log = stub_dir.path().join("stops.log");
+            let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+            // A subagent transcript written just now is live work on job0001
+            // (the same signal `todo_watcher_tick` counts a slot on).
+            let cc_dir = tempfile::tempdir().unwrap();
+            let subagents = cc_dir
+                .path()
+                .join("-proj")
+                .join("job0001-0000-0000-0000-000000000000")
+                .join("subagents");
+            std::fs::create_dir_all(&subagents).unwrap();
+            let transcript = subagents.join("agent-1.jsonl");
+            std::fs::write(&transcript, "{}").unwrap();
+            unsafe { std::env::set_var("MESA_CC_PROJECTS_DIR", cc_dir.path()) };
+
+            let (_dir, state) = test_state();
+            let project = new_project(&state, None);
+            let task = new_task(&state, project);
+            seed_dispatch(&state, "job0001", task);
+            set_status(&state, task, Status::Done);
+            std::fs::write(
+                &agents_file,
+                agents_listing("job0001", Some(4242), Some("idle")),
+            )
+            .unwrap();
+
+            // Closed, with a live subagent: one alert, no stop, entry kept.
+            todo_reaper_tick(&state);
+            assert!(stops(&stop_log).is_empty(), "live work must not be stopped");
+            assert_eq!(dispatched_task(&state, "job0001"), Some(task));
+            let expected = vec![(
+                Some(TODO_REAPER_AUTHOR.to_string()),
+                InboxKind::TaskSummary,
+                Some(task),
+            )];
+            assert_eq!(inbox_rows(&state), expected);
+            let body = state.store.lock().unwrap().list_inbox_items(None).unwrap()[0]
+                .body
+                .clone();
+            assert!(body.contains("job0001"), "the alert names the job: {body}");
+            assert!(
+                body.contains("1 live subagent"),
+                "the alert counts the work: {body}"
+            );
+            assert!(body.contains("claude attach job0001") && body.contains("claude stop job0001"));
+
+            // Later passes file nothing more while the work runs.
+            todo_reaper_tick(&state);
+            assert_eq!(inbox_rows(&state), expected, "the alert is filed once");
+            assert!(stops(&stop_log).is_empty());
+
+            // Past the grace it is stopped anyway, and forgotten.
+            backdate(&state, "job0001", REAP_LIVE_WORK_GRACE, |d, then| {
+                d.work_since = Some(then)
+            });
+            todo_reaper_tick(&state);
+            assert_eq!(stops(&stop_log), vec!["job0001".to_string()]);
+            assert_eq!(dispatched_task(&state, "job0001"), None);
+            assert_eq!(inbox_rows(&state), expected);
+
+            // Work that ends inside the grace: stopped on the ordinary rule.
+            seed_dispatch(&state, "job0001", task);
+            todo_reaper_tick(&state);
+            assert_eq!(
+                inbox_rows(&state).len(),
+                2,
+                "a fresh dispatch is a fresh alert"
+            );
+            std::fs::remove_file(&transcript).unwrap();
+            todo_reaper_tick(&state);
+            assert_eq!(
+                stops(&stop_log),
+                vec!["job0001".to_string(), "job0001".to_string()]
+            );
+            assert_eq!(dispatched_task(&state, "job0001"), None);
+
+            // A deleted task has nothing to file against: nothing is filed,
+            // and the session still waits out its grace.
+            std::fs::write(&transcript, "{}").unwrap();
+            let gone = new_task(&state, project);
+            seed_dispatch(&state, "job0001", gone);
+            state.store.lock().unwrap().delete_task(gone).unwrap();
+            todo_reaper_tick(&state);
+            assert_eq!(inbox_rows(&state).len(), 2, "no task, no alert");
+            assert_eq!(stops(&stop_log).len(), 2);
+            assert_eq!(dispatched_task(&state, "job0001"), Some(gone));
+
+            // A superseded session with live work: the task is `in_progress`
+            // again under its new session, so the alert says re-dispatched,
+            // not closed.
+            set_status(&state, task, Status::InProgress);
+            seed_dispatch(&state, "job0001", task);
+            state
+                .todo_dispatched
+                .lock()
+                .unwrap()
+                .get_mut("job0001")
+                .unwrap()
+                .superseded = true;
+            todo_reaper_tick(&state);
+            assert_eq!(stops(&stop_log).len(), 2, "live work must not be stopped");
+            let rows = state.store.lock().unwrap().list_inbox_items(None).unwrap();
+            assert_eq!(
+                rows.len(),
+                3,
+                "a superseded session with live work is an alert"
+            );
+            let body = &rows.iter().max_by_key(|i| i.id).unwrap().body;
+            assert!(
+                body.contains(&format!(
+                    "Task {task} was re-dispatched while its previous agent session job0001 \
+                     still had work running"
+                )),
+                "the alert must not call a re-dispatched task closed: {body}"
+            );
+            assert!(!body.contains("closed"), "{body}");
+
+            unsafe { std::env::remove_var("MESA_CC_PROJECTS_DIR") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
+    }
+
+    #[test]
+    fn todo_reaper_tick_reports_an_in_progress_task_whose_session_died() {
+        // SAFETY: ENV_LOCK, as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let agents_file = stub_dir.path().join("agents.json");
+            let stop_log = stub_dir.path().join("stops.log");
+            let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+            let (_dir, state) = test_state();
+            let project = new_project(&state, None);
+            let task = new_task(&state, project);
+            set_status(&state, task, Status::InProgress);
+
+            // Listed with no pid: the process exited without closing the task.
+            seed_dispatch(&state, "job0001", task);
+            std::fs::write(&agents_file, agents_listing("job0001", None, Some("idle"))).unwrap();
+            todo_reaper_tick(&state);
+            let expected = vec![(
+                Some(TODO_REAPER_AUTHOR.to_string()),
+                InboxKind::TaskSummary,
+                Some(task),
+            )];
+            assert_eq!(inbox_rows(&state), expected);
+            let body = state.store.lock().unwrap().list_inbox_items(None).unwrap()[0]
+                .body
+                .clone();
+            assert!(
+                body.contains(&format!("mesa task update {task} --status todo")),
+                "the alert says how to unstall the loop: {body}"
+            );
+            assert_eq!(
+                dispatched_task(&state, "job0001"),
+                None,
+                "filed, then forgotten"
+            );
+            assert_eq!(
+                state.store.lock().unwrap().get_task(task).unwrap().status,
+                Status::InProgress,
+                "the reaper never moves the task"
+            );
+            assert!(stops(&stop_log).is_empty());
+            todo_reaper_tick(&state);
+            assert_eq!(inbox_rows(&state), expected, "the alert is filed once");
+
+            // Not listed at all: only once the dispatch is old enough.
+            seed_dispatch(&state, "job0002", task);
+            std::fs::write(&agents_file, "[]").unwrap();
+            todo_reaper_tick(&state);
+            assert_eq!(
+                inbox_rows(&state),
+                expected,
+                "a fresh dispatch may not be listed yet"
+            );
+            assert_eq!(dispatched_task(&state, "job0002"), Some(task));
+            backdate(&state, "job0002", REAP_ABANDON_GRACE, |d, then| {
+                d.dispatched_at = then
+            });
+            todo_reaper_tick(&state);
+            assert_eq!(inbox_rows(&state).len(), 2);
+            assert_eq!(dispatched_task(&state, "job0002"), None);
+
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
+    }
+
+    #[test]
+    fn todo_reaper_tick_reports_an_in_progress_session_idle_for_an_hour() {
+        // SAFETY: ENV_LOCK, as above.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let agents_file = stub_dir.path().join("agents.json");
+            let stop_log = stub_dir.path().join("stops.log");
+            let bin = stub_claude_reaper(stub_dir.path(), &agents_file, &stop_log);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+            let (_dir, state) = test_state();
+            let project = new_project(&state, None);
+            let task = new_task(&state, project);
+            set_status(&state, task, Status::InProgress);
+            seed_dispatch(&state, "job0001", task);
+            std::fs::write(
+                &agents_file,
+                agents_listing("job0001", Some(4242), Some("idle")),
+            )
+            .unwrap();
+
+            // Idle, but not for long: nothing yet.
+            todo_reaper_tick(&state);
+            assert!(inbox_rows(&state).is_empty());
+            backdate(&state, "job0001", REAP_STALL_AFTER, |d, then| {
+                d.idle_since = Some(then)
+            });
+            todo_reaper_tick(&state);
+            let expected = vec![(
+                Some(TODO_REAPER_AUTHOR.to_string()),
+                InboxKind::TaskSummary,
+                Some(task),
+            )];
+            assert_eq!(inbox_rows(&state), expected);
+            let body = state.store.lock().unwrap().list_inbox_items(None).unwrap()[0]
+                .body
+                .clone();
+            assert!(body.contains("claude attach job0001"), "{body}");
+            // Kept, not stopped, and not reported twice.
+            assert_eq!(dispatched_task(&state, "job0001"), Some(task));
+            assert!(stops(&stop_log).is_empty());
+            todo_reaper_tick(&state);
+            assert_eq!(inbox_rows(&state), expected, "the alert is filed once");
+            assert_eq!(
+                state.store.lock().unwrap().get_task(task).unwrap().status,
+                Status::InProgress
             );
 
             unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };

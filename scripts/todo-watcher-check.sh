@@ -684,8 +684,12 @@ REAP_LOG="$TMP/reap-bg.log"
 REAP_IDS="$TMP/reap-ids"
 REAP_STOPS="$TMP/reap-stops.log"
 REAP_STATUS="$TMP/reap-status"
+# The pid every listed job reports: a number no process has, or `null` once
+# the "process" has exited (mesa task 1191's abandoned-task case below).
+REAP_PID="$TMP/reap-pid"
 touch "$REAP_LOG" "$REAP_IDS" "$REAP_STOPS"
 echo idle > "$REAP_STATUS"
+echo 424242 > "$REAP_PID"
 # Each dispatch gets its own receipt id, so a stop can be attributed to the
 # session it belongs to rather than to "the" job.
 REAP_COUNTER="$TMP/reap-counter"
@@ -714,13 +718,14 @@ if [ "\$1" = "--bg" ]; then
 fi
 if [ "\$1" = "agents" ]; then
   STATUS=\$(cat "$REAP_STATUS")
+  PID=\$(cat "$REAP_PID")
   FIRST=1
   printf '['
   while read -r id; do
     [ -z "\$id" ] && continue
     [ "\$FIRST" = 1 ] || printf ','
     FIRST=0
-    printf '{"pid":424242,"id":"%s","cwd":"$REAP_DIR","kind":"background","startedAt":1783000000000,"sessionId":"%s-0000-0000-0000-000000000000","name":"reap","status":"%s","state":"done"}' "\$id" "\$id" "\$STATUS"
+    printf '{"pid":%s,"id":"%s","cwd":"$REAP_DIR","kind":"background","startedAt":1783000000000,"sessionId":"%s-0000-0000-0000-000000000000","name":"reap","status":"%s","state":"done"}' "\$PID" "\$id" "\$id" "\$STATUS"
   done < "$REAP_IDS"
   printf ']\n'
   exit 0
@@ -801,6 +806,36 @@ wait_stop_lines 2
 grep -qx "$REAP_J2" "$REAP_STOPS" ||
   fail "a task set back to todo must stop its old session ($REAP_J2); got: $(cat "$REAP_STOPS")"
 ok "a dispatched task set back to todo has its old session stopped too"
+
+# A session that exits without closing its in_progress task (mesa task 1191):
+# the reaper files one todo-reaper alert against the task, forgets the
+# dispatch, and moves nothing — the task stays in_progress, and there is no
+# stop, since there is no process to stop. The task set back to todo above is
+# re-dispatched as the third job; the stub's pid then goes `null` for every
+# listed job, but the two earlier jobs are already stopped and forgotten, so
+# only that one can be reported.
+wait_reap_bg_lines 3
+REAP_J3=$(cut -d'|' -f4 < "$REAP_LOG" | sed -n '3p')
+[ "$(cut -d'|' -f3 < "$REAP_LOG" | sed -n '3p')" = "/execute-mesa-task $REAP_T2" ] ||
+  fail "expected the third dispatch to be task $REAP_T2 picked up again; log:\n$(cat "$REAP_LOG")"
+echo null > "$REAP_PID"
+for _ in $(seq 1 60); do
+  [ "$("$MESA" inbox list | jq 'length')" -ge 1 ] && break
+  sleep 0.1
+done
+sleep 1
+run 0 "$MESA" inbox list
+[ "$(jqs 'length')" -eq 1 ] ||
+  fail "expected exactly one reaper alert, got $(jqs 'length'): $STDOUT"
+[ "$(jqs '.[0].author')" = "todo-reaper" ] || fail "the alert must be authored todo-reaper: $STDOUT"
+[ "$(jqs '.[0].kind')" = "task-summary" ] || fail "the alert is a task summary: $STDOUT"
+[ "$(jqs '.[0].task_id')" = "$REAP_T2" ] || fail "the alert must name task $REAP_T2: $STDOUT"
+grep -q "$REAP_J3" <<<"$(jqs '.[0].body')" || fail "the alert must name session $REAP_J3: $STDOUT"
+[ "$("$MESA" task show "$REAP_T2" | jq -r .status)" = "in_progress" ] ||
+  fail "the reaper must never move the task; got $("$MESA" task show "$REAP_T2" | jq -r .status)"
+[ "$(wc -l < "$REAP_STOPS")" -eq 2 ] ||
+  fail "a dead session has nothing to stop: $(cat "$REAP_STOPS")"
+ok "a session that exits with its task still in_progress is reported once, and the task left alone"
 
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
 

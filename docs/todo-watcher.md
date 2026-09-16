@@ -177,6 +177,38 @@ because someone ran `mesa serve`.
     that has just closed its task is usually still writing its closing report
     or its inbox summary, and cutting that off would lose the very thing the
     run was for.
+  - **A closed task whose session still has live work is reported, then
+    waited out** (mesa task 1191). A session holding a live shell child or a
+    live subagent after its task closed — a dev server it started, a check
+    script, a delegate still writing — is not stopped on that pass: the
+    reaper files **one** inbox alert (kind `task-summary`, author
+    `todo-reaper`, against the task) naming the job id, the shell/subagent
+    counts, and `claude attach <id>` / `claude stop <id>`, then keeps the
+    entry and stops the session once the work has ended (and it is not
+    `busy`), as above. The wait is capped: `REAP_LIVE_WORK_GRACE` (10 minutes,
+    from the pass that first saw the work) after which it is stopped anyway.
+    A task deleted in the meantime has nothing to file against, so nothing
+    is filed (one stderr line) and the grace still runs.
+  - **An `in_progress` task is not left alone blindly** (mesa task 1191).
+    The watcher's dispatch reads task status, not the session, as the "in
+    process" signal, so a dispatched agent that died or wedged used to leave
+    its project quiet until a person noticed. The reaper now reports both,
+    and moves nothing — the task's status stays the person's to change:
+    - a session that is **gone** (listed with no `pid`, or unlisted for
+      `REAP_ABANDON_GRACE` = 60s after the dispatch, since a job `claude
+      --bg` has only just backgrounded may not be listed on the very next
+      pass) files one alert saying the session ended without closing the
+      task and the project's loop is stalled until it is moved (e.g. `mesa
+      task update <id> --status todo`), then forgets the dispatch;
+    - a session that is listed, alive, not `busy`, with no live work, and has
+      been so **continuously** for `REAP_STALL_AFTER` — the same
+      `STALE_CLAIM_MINUTES` (60) hour `task next`'s stale-claim diagnostic
+      uses; the clock resets whenever it is seen busy or with live work —
+      files one alert per job id saying the agent looks stalled and naming
+      `claude attach <id>`, and keeps the entry.
+    Each alert is fire-once through flags on the dispatch's own in-memory
+    entry, set only once the filing succeeded, so a failed filing is retried
+    on the next pass.
   - **Re-dispatching a task stops the session it supersedes**, at the moment
     of the spawn rather than on a reaper pass: mesa starting a second agent on
     a task says the first is finished with it, whatever the task's status
@@ -191,8 +223,9 @@ because someone ran `mesa serve`.
     an empty map returns before any lock and spawns no process at all.
   - The map is **in memory**, like `inbox_dispatched` and the cost guard's
     `cost_stopped`, and deliberately not persisted: a `serve` restart forgets
-    the sessions spawned before it, which leaves them to be stopped by hand.
-    A replacement `todo-watcher` template that prints no `backgrounded · <id>`
+    the sessions spawned before it, which leaves them to be stopped by hand
+    — and forgets the three alerts above with them, so a session dispatched
+    before a restart is neither reaped nor reported. A replacement `todo-watcher` template that prints no `backgrounded · <id>`
     receipt records nothing and so leaves nothing to stop — the same
     limitation the attach pane already has. (A multi-line **script** template
     is not that case: its stdout is read exactly as an argv command's is, so
@@ -203,8 +236,9 @@ because someone ran `mesa serve`.
     `MESA_WATCH_TODO_TICK_MS` rather than adding a seam of its own — the two
     loops are one feature.
   - Regressions: `api::tests::todo_reaper_tick_stops_a_dispatched_session_once_its_task_closes`,
-    `api::tests::todo_watcher_tick_stops_the_session_a_re_dispatch_supersedes`
-    and the three `reap_verdict_*` unit tests, plus the reaper block in
+    `api::tests::todo_watcher_tick_stops_the_session_a_re_dispatch_supersedes`,
+    the three `todo_reaper_tick_reports_*` tests (one per alert) and the six
+    `reap_verdict_*` unit tests, plus the reaper block in
     `scripts/todo-watcher-check.sh` end-to-end.
 - The tick cadence is a fixed internal constant (`WATCH_TODO_TICK`, 60s), not
   user-configurable. `MESA_WATCH_TODO_TICK_MS` overrides it, a test-only seam
@@ -224,5 +258,7 @@ because someone ran `mesa serve`.
   against a stub `claude`
   binary — plus the reaper (a dispatched session left alone while its task is
   in_progress and while it is still `busy`, stopped exactly once when its task
-  closes, and the old session stopped when a task goes back to `todo`) — no CLI surface of its own beyond the `serve` flag, matching the
+  closes, the old session stopped when a task goes back to `todo`, and a
+  session that dies with its task still `in_progress` reported once as a
+  `todo-reaper` inbox alert with the task left alone) — no CLI surface of its own beyond the `serve` flag, matching the
   agents surface's "no `mesa agent` CLI" precedent.

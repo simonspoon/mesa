@@ -29,7 +29,7 @@ pub use store::{
     ArtifactPatch, DiagramPatch, EdgeNew, EdgePatch, Error, FrameNew, FramePatch,
     INBOX_ARCHIVE_REASON_MAX, ImportDoc, LIVE_AUDIO_MAX, LIVE_BOARD_BODY_MAX, LIVE_BOARD_KEEP,
     LIVE_TEXT_MAX, LIVE_TURNS_MAX, LibraryPatch, NextResult, ProjectPatch, ReceiptPatch, Result,
-    ScriptPatch, Store, TaskPatch, default_db_path,
+    STALE_CLAIM_MINUTES, ScriptPatch, Store, TaskPatch, default_db_path,
 };
 pub use types::{
     ARTIFACT_CONTENT_TYPES, AgentSession, AgentSpawned, AnchorSide, Artifact, ArtifactSummary,

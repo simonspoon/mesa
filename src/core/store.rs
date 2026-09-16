@@ -960,7 +960,7 @@ const PRIORITY_RANK: &str = "CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' TH
 /// Threshold for the `next_task` stale-claim diagnostic. Fixed, not
 /// configurable: nobody types a flag at a diagnostic, and a tunable would
 /// be a third source of truth for one concept.
-const STALE_CLAIM_MINUTES: u32 = 60;
+pub const STALE_CLAIM_MINUTES: u32 = 60;
 
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let id: i64 = row.get(0)?;

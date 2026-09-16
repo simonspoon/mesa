@@ -17,8 +17,8 @@
 //!     "inbox-watcher":  "claude --bg --agent inbox-triage --name {name} -- \"Triage mesa inbox item {id}.\"",
 //!     "agent-spawn":    "claude --bg --agent swe -- {prompt}",
 //!     "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
-//!     "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}",
-//!     "live-dream":     "claude --bg --agent swe --name {name} -- {prompt}"
+//!     "live-summary":   "claude --bg --name {name} -- {prompt}",
+//!     "live-dream":     "claude --bg --name {name} -- {prompt}"
 //!   }
 //! }
 //! ```
@@ -274,13 +274,14 @@ pub const DEFAULT_LIVE_AGENT: &str = "claude --bg --agent mesa-live --name {name
 /// [`DEFAULT_LIVE_AGENT`]: the summariser is also a mesa record (a session
 /// id and a name) carrying a prompt mesa supplies
 /// (`core::live::summary_prompt`), so it works with no user configuration.
-/// It runs as the literal `swe`.
-pub const DEFAULT_LIVE_SUMMARY: &str = "claude --bg --agent swe --name {name} -- {prompt}";
+/// It names no agent — plain `claude` — since the prompt holds the whole
+/// job and an unseeded agent name makes `claude` fail at once.
+pub const DEFAULT_LIVE_SUMMARY: &str = "claude --bg --name {name} -- {prompt}";
 /// Built-in default for [`LIVE_DREAM`] — [`DEFAULT_LIVE_SUMMARY`]'s shape
 /// again: `{id}` is the newest conversation's id, `{name}` a fixed
 /// `live memory dream`, and `{prompt}` is `core::live::dream_prompt`, the
-/// instructions plus the active notebook. Runs as the literal `swe`.
-pub const DEFAULT_LIVE_DREAM: &str = "claude --bg --agent swe --name {name} -- {prompt}";
+/// instructions plus the active notebook. Names no agent, as above.
+pub const DEFAULT_LIVE_DREAM: &str = "claude --bg --name {name} -- {prompt}";
 /// Built-in default for [`RETRO`] — [`DEFAULT_INBOX_WATCHER`]'s shape: the
 /// run is a mesa record (`retro_runs`, so `{id}` is the run id and `{name}`
 /// the `mesa retro <id>` session name) and the prompt is one sentence, since

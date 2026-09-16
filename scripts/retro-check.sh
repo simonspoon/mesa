@@ -48,12 +48,18 @@ keys() { jq -r 'keys | join(",")' <<<"$1"; }
 STUB_DIR="$TMP/stub"
 mkdir -p "$STUB_DIR"
 BG_LOG="$TMP/bg.log"
-touch "$BG_LOG"
+# One line per --bg invocation refused while the `fail` marker exists: the
+# observable signal that the watcher retried, and therefore that the previous
+# attempt's run row was rolled back (a row left behind would make the next
+# tick "not due" for 72 hours, so a second refused call can only follow a
+# deleted row).
+FAIL_LOG="$TMP/fail.log"
+touch "$BG_LOG" "$FAIL_LOG"
 cat > "$STUB_DIR/claude" <<EOS
 #!/usr/bin/env bash
 if [ "\$1" = "--bg" ]; then
   shift
-  [ -e "$STUB_DIR/fail" ] && { echo "stub claude is down" >&2; exit 1; }
+  [ -e "$STUB_DIR/fail" ] && { echo "stub claude is down" >&2; echo refused >> "$FAIL_LOG"; exit 1; }
   AGENT=""
   if [ "\$1" = "--agent" ]; then shift; AGENT="\$1"; shift; fi
   echo "\$AGENT" > "$STUB_DIR/last-agent"
@@ -307,6 +313,14 @@ wait_bg_lines() { # wait_bg_lines <n> -> blocks until BG_LOG has >= n lines, or 
   done
   fail "timed out waiting for $n bg dispatch(es); log:\n$(cat "$BG_LOG")"
 }
+wait_fail_lines() { # wait_fail_lines <n> -> blocks until the stub has refused >= n spawns, or fails
+  local n=$1
+  for _ in $(seq 1 50); do
+    [ "$(wc -l < "$FAIL_LOG")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n refused spawn(s); got $(wc -l < "$FAIL_LOG")"
+}
 start_server() { # start_server <flags...>
   MESA_WATCH_RETRO_TICK_MS=150 "$MESA" serve --port "$PORT" "$@" >/dev/null 2>&1 &
   SERVER_PID=$!
@@ -361,13 +375,17 @@ rm -f "$MESA_CONFIG_FILE"
 stop_server
 ok "watch_retro off: no dispatch; GET/PUT /api/config/watchers carry retro_interval_hours (422 on a bad value writing nothing, null restores 72, siblings preserved)"
 
-# spawn failure: no run row, so a later tick retries.
+# spawn failure: the run row is rolled back, so a later tick retries. The
+# proof is the RETRY, not a point-in-time read of the row: each tick inserts
+# the row, spawns, and deletes it again on failure, so `retro status` sampled
+# at a random instant may land inside that window and see a row that is
+# about to go. A second refused spawn, on the other hand, can only happen
+# because the first attempt's row was deleted (a leftover row makes the next
+# tick "not due" for 72 hours).
 touch "$STUB_DIR/fail"
 start_server --watch-retro
-sleep 1
+wait_fail_lines 2
 [ "$(wc -l < "$BG_LOG")" -eq 0 ] || fail "a failing spawn must log nothing"
-run 0 "$MESA" retro status
-[ "$(jqs .last_run)" = "null" ] || fail "a failed watcher spawn must leave no run row: $STDOUT"
 rm -f "$STUB_DIR/fail"
 
 # flag ON: exactly one dispatch, trigger watcher, and not again inside the interval.

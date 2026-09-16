@@ -12158,15 +12158,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            60,
-            "a fresh db should report user_version 60"
+            61,
+            "a fresh db should report user_version 61"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 60);
+        assert_eq!(version, 61);
     }
 
     /// Pins the dream-pass migration (mesa task 1152) at index 57: the

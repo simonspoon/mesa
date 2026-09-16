@@ -1453,6 +1453,8 @@ ALTER TABLE live_turns DROP COLUMN notice;
 ALTER TABLE live_sessions DROP COLUMN resting_since;
 ALTER TABLE live_sessions DROP COLUMN dream_agent_id;
 ALTER TABLE inbox DROP COLUMN archive_reason;
+DROP TABLE retro_findings;
+DROP TABLE retro_runs;
 INSERT INTO library_items (kind, scope, name, body, synced_body, synced_at, created_at, updated_at)
   VALUES ('command', 'user', 'execute-todo', 'Claim task $ARGS', 'Claim task $ARGS', datetime('now'), datetime('now'), datetime('now'));
 INSERT INTO library_versions (item_id, body, source, created_at) VALUES (1, 'v1', 'edit', datetime('now'));

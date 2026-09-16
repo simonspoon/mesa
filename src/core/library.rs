@@ -65,7 +65,11 @@ pub struct Builtin {
 /// `live-summary-prompt` is still a `prompt` (mesa task 921): the instructions
 /// for the short-lived agent that writes a live conversation's memory once it
 /// ends, body `core::live::SUMMARY_PROMPT`, spawned as a plain prompt rather
-/// than by name.
+/// than by name. `task-stop-guard` is the second hook (mesa task 1190): a
+/// `Stop` hook that keeps a task agent from ending its turn while its mesa
+/// task is still `in_progress` with nothing pending, or closed with
+/// background work still running — body `core::stop_guard::STOP_GUARD_HOOK`,
+/// installed by `mesa library hook enable task-stop-guard --event Stop`.
 pub const BUILTINS: &[Builtin] = &[
     Builtin {
         id: crate::core::live::LIVE_AGENT_BUILTIN,
@@ -128,6 +132,13 @@ following on purpose.
 # (terminal-notifier, osascript, a curl to your own webhook, ...).
 echo \"Claude Code stopped in $(pwd)\"
 ",
+    },
+    Builtin {
+        id: crate::core::stop_guard::STOP_GUARD_HOOK_BUILTIN,
+        name: crate::core::stop_guard::STOP_GUARD_HOOK_NAME,
+        kind: LibraryKind::Hook,
+        scope: LibraryScope::User,
+        body: crate::core::stop_guard::STOP_GUARD_HOOK,
     },
 ];
 
@@ -3327,6 +3338,7 @@ mod tests {
         assert!(builtin("live-summary-prompt").is_some());
         assert!(builtin("starter-claude-md").is_some());
         assert!(builtin("stop-notify").is_some());
+        assert!(builtin("task-stop-guard").is_some());
         assert!(builtin("no-such-builtin").is_none());
     }
 

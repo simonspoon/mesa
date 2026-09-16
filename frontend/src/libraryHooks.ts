@@ -38,9 +38,10 @@ export const HOOK_MATCHER_MAX = 200
  * registration at all.
  *
  * An unshadowed built-in is included even though it has no numeric id and so
- * is not reachable on the route — the shipped `stop-notify` is the only hook
- * on a stock install, and gating it out hid the control on the one hook most
- * people have, with no affordance anywhere to get to a row that had it. The
+ * is not reachable on the route — the shipped `stop-notify` and
+ * `task-stop-guard` are the only hooks on a stock install, and gating them
+ * out hid the control on the hooks most people have, with no affordance
+ * anywhere to get to a row that had it. The
  * page **forks it on the press** and opens the panel against the row that
  * creates, which is the order the rest of this surface already imposes on
  * editing a built-in.

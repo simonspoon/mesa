@@ -110,7 +110,7 @@ That split is the whole point:
   `Store::create_library_item`/the fork route both check
   `Store::find_library_fork` first and answer `conflict` on a second attempt.
 
-The starter set is deliberately tiny — six rows:
+The starter set is deliberately tiny — seven rows:
 
 | `id` | kind | scope | what it is |
 | --- | --- | --- | --- |
@@ -120,6 +120,7 @@ The starter set is deliberately tiny — six rows:
 | `live-summary-prompt` | `prompt` | `user` | The instructions for the short-lived agent that writes a live conversation's memory once it ends (mesa task 921) — literally `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it belongs beside |
 | `starter-claude-md` | `claude-md` | `user` | A short starting-point CLAUDE.md |
 | `stop-notify` | `hook` | `user` | A minimal shell hook that echoes when Claude Code stops — its *name* is `stop-notify.sh`, since a hook's name carries its own extension |
+| `task-stop-guard` | `hook` | `user` | A `Stop` hook that keeps a task agent from ending its turn before its mesa task is handled — literally `core::stop_guard::STOP_GUARD_HOOK` (mesa task 1190, "The task-stop-guard hook" below); name `task-stop-guard.sh` |
 
 `mesa-live`'s body being the literal `AGENT_DEFINITION` constant (and
 `live-summary-prompt`'s the literal `SUMMARY_PROMPT`) is what lets
@@ -452,6 +453,56 @@ Invalid JSON, a top level that is not an object, a `hooks` that is not an
 object, an event whose value is not an array — each is `validation` naming
 the file, with the file left exactly as it was. A best-effort repair would
 destroy configuration mesa did not write and cannot reconstruct.
+
+### The task-stop-guard hook
+
+`task-stop-guard` (mesa task 1190, body `core::stop_guard::STOP_GUARD_HOOK`)
+is a Claude Code **Stop** hook for *task agents* — sessions the todo-watcher
+(or a person) dispatched with the task-execute prompt. Installed through the
+ordinary registration flow, user scope:
+
+```
+mesa library hook enable task-stop-guard --event Stop
+```
+
+which seeds `~/.claude/hooks/task-stop-guard.sh` and names it under `Stop`
+in `~/.claude/settings.json`. It needs only `bash`, `jq` and `mesa` on PATH
+(`MESA_DB` is honoured, since mesa reads it itself) and **never wedges a
+session**: a missing tool, an unreadable transcript, an unknown task or any
+mesa error is an allow — exit 0, nothing printed — and `stop_hook_active`
+is the loop guard.
+
+It reads the Stop payload's `transcript_path` once. The task id is the
+**first** user message — `/execute-mesa-task <id>` (`DEFAULT_TASK_EXECUTE`),
+the same slash command recorded as `<command-name>` + `<command-args>`, or
+a one-line customised prompt ending in `task: <id>` — that loose form only
+in a session launched with `--agent`, which writes an `agent-setting`
+header record no interactive session has, so "please take a look at task
+1" typed into a plain session is not a task agent; a session whose first
+message names no task is left alone either way (the task's `owner` is not
+used, being cleared when the task leaves `in_progress`).
+Pending background work is every `run_in_background` shell (`Command
+running in background with ID: …`) and async `Agent` launch (`agentId: …`)
+minus every close — a `<task-notification>` for that id whether it arrived
+as a user turn or was absorbed mid-turn into a `queue-operation` record, a
+`KillShell`/`TaskStop` naming it, or a subagent hand-back — counted
+conservatively. A question is any inbox item with that `task_id` filed at
+or after the transcript's first timestamp (`mesa inbox list`, archived
+included). Then, off `mesa task show <id>`:
+
+| status | pending work | question filed | verdict |
+| --- | --- | --- | --- |
+| `in_progress` | yes | — | allow — the harness will wake the agent |
+| `in_progress` | no | no | **block**: keep going, close it (`mesa task update <id> --status done\|cancelled`), park it in `todo`/`backlog` with a result, or file the question (`mesa inbox add --task <id> --kind change-request …`) |
+| `in_progress` | no | yes | allow |
+| anything else | yes | — | **block**, listing the shell/agent ids to stop |
+| anything else | no | — | allow |
+
+Waiting on a notification is the legitimate way to wait, which is why
+pending work allows rather than blocks — blocking it would force polling.
+A block is `{"decision":"block","reason":"…"}` on stdout, exit 0.
+`scripts/stop-guard-check.sh` runs the extracted body against synthetic
+transcripts and a throwaway `MESA_DB`/`HOME`.
 
 ### Hooks wired from outside `.claude/hooks/`
 

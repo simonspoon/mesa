@@ -17,6 +17,7 @@ pub mod retro;
 
 pub mod scripts;
 pub mod speech;
+pub mod stop_guard;
 mod store;
 pub mod supervisor;
 pub mod system;

@@ -101,6 +101,26 @@ export function nextUnplayed(
 }
 
 /**
+ * Hands a turn back to the run so it is said again from its start (mesa task
+ * 1161): the one the player was sounding when a pause cut it off.
+ *
+ * `run()` takes a turn in hand *before* it sounds and `played_at` is stamped
+ * only when it ends, so a turn silenced mid-sentence is in `handled` and
+ * nowhere else — Resume would skip it and the sentence would be lost. Removing
+ * it is the whole repair: it is the oldest unplayed mesa turn by id, so
+ * `nextUnplayed` returns it first and everything queued behind it follows in
+ * order. Nothing sounding (a second "hold on" while already paused, a pause
+ * between turns) releases nothing, and an id already absent is a no-op — the
+ * set is edited in place, as the hub edits it.
+ */
+export function releaseForReplay(
+  handled: Set<number>,
+  sounding: number | null,
+): void {
+  if (sounding !== null) handled.delete(sounding)
+}
+
+/**
  * What a turn says out loud, or null when it says nothing. A pure action turn
  * carries no text — it changes the page and is silent — so the page must
  * be able to tell "nothing to speak" from "speak an empty string", which the

@@ -4,6 +4,7 @@ import {
   mergeTurns,
   navigateTarget,
   nextUnplayed,
+  releaseForReplay,
   sidebarsIntent,
   spokenText,
   transcriptFor,
@@ -130,6 +131,28 @@ describe('nextUnplayed', () => {
   it('is null when there is nothing left to say', () => {
     expect(nextUnplayed([], new Set())).toBeNull()
     expect(nextUnplayed([turn(4)], new Set([4]))).toBeNull()
+  })
+})
+
+describe('releaseForReplay', () => {
+  it('hands the turn a pause cut off back to the run', () => {
+    // Taken in hand before it sounded, never stamped: without the release
+    // Resume would skip it and the sentence would be lost.
+    const handled = new Set([4])
+    releaseForReplay(handled, 4)
+    expect(nextUnplayed([turn(4), turn(7)], handled)?.id).toBe(4)
+  })
+
+  it('releases nothing when nothing was sounding', () => {
+    const handled = new Set([4])
+    releaseForReplay(handled, null)
+    expect(handled).toEqual(new Set([4]))
+  })
+
+  it('is a no-op for an id the page never took in hand', () => {
+    const handled = new Set([4])
+    releaseForReplay(handled, 9)
+    expect(handled).toEqual(new Set([4]))
   })
 })
 

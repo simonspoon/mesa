@@ -2329,11 +2329,17 @@ conversation") working with no backend change.
   pausing is how a person reads what was said instead of being talked at.
 
   Pausing silences the player through the same `silence()` that ending a
-  conversation uses, so **the sentence a pause interrupts is not repeated** —
-  it is already in the hub's `handled` set, exactly as `End` leaves it, and it
-  is still there to *read*. Everything that lands while paused is caught up on
-  Resume, in transcript order, navigates included; Resume needs no new gesture,
-  since `unlocked` was never given up. A conversation ending clears the pause,
+  conversation uses, but first hands the turn it cut off back to the run
+  (`liveTurns.ts::releaseForReplay`, mesa task 1161), so **the sentence a
+  pause interrupts is said again from its start on Resume**. The run takes a
+  turn in hand before it sounds and `played_at` lands only when it ends, so a
+  turn silenced mid-sentence was in the hub's `handled` set and nowhere else —
+  before 1161 Resume skipped it and the half-heard sentence was lost, still
+  there to read but never finished. Removing it is the whole repair: it is the
+  oldest unplayed mesa turn by id, so it plays first and everything that landed
+  while paused follows in transcript order, navigates included, nothing skipped
+  and nothing twice (`End` releases nothing, since its transcript resets
+  anyway). Resume needs no new gesture, since `unlocked` was never given up. A conversation ending clears the pause,
   so the next `Go live` starts talking rather than starting silently with the
   control gone.
 

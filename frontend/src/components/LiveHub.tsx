@@ -97,6 +97,7 @@ import {
   advanceCursor,
   navigateTarget,
   nextUnplayed,
+  releaseForReplay,
   sidebarsIntent,
   spokenText,
   transcriptFor,
@@ -192,7 +193,9 @@ import { useFetch } from '../useFetch'
  * - **Pause is this browser's own** (task 882). Stepping out stops the run
  *   whole — no speech, no `navigate`, no sidebar fold — and shuts the
  *   microphone, while the session stays `live` and the agent keeps working;
- *   the turns pile up in the transcript and Resume performs them in order.
+ *   the turns pile up in the transcript and Resume performs them in order,
+ *   starting with the sentence the pause cut off, from its beginning (mesa
+ *   task 1161).
  *   No route, no session state: pausing a conversation is not the same event
  *   as ending one, and only one of the two is recoverable.
  * - **While joined and not recognizing, the capture box holds the keyboard**
@@ -1013,12 +1016,17 @@ export function LiveHub({
   /**
    * The pause branch of `togglePause` (task 882), factored out because a
    * spoken pause phrase (mesa task 1160, `livePausePhrase.ts`) performs the
-   * same press from inside a capture effect. Idempotent: a second "hold on"
-   * while already paused silences a player that is already silent and writes
-   * a `true` that is already there. The ref beside it is what the capture
-   * handlers call, since they fire long after the render that made it.
+   * same press from inside a capture effect. The turn sounding at the press is
+   * handed back to the run first (`releaseForReplay`, mesa task 1161), so
+   * Resume says it again from its start rather than skipping it — `End` does
+   * no such thing, since its transcript resets anyway. Idempotent: a second
+   * "hold on" while already paused finds nothing sounding, silences a player
+   * that is already silent and writes a `true` that is already there. The ref
+   * beside it is what the capture handlers call, since they fire long after
+   * the render that made it.
    */
   const pauseNow = useCallback(() => {
+    releaseForReplay(handled.current, sounding.current)
     silence()
     setPausedNow(true)
   }, [silence, setPausedNow])
@@ -2446,10 +2454,10 @@ export function LiveHub({
    *
    * Deliberately not part of `act`: this calls no route, spends no gesture and
    * touches neither `unlocked` nor the session. Pausing silences whatever was
-   * sounding — the same `silence()` ending a conversation uses, so the turn it
-   * cut off stays in `handled` and is not said again on Resume; it is still
-   * there to read in the transcript. Resuming just starts the run, which
-   * catches up on everything that landed in the meantime, in order.
+   * sounding — the same `silence()` ending a conversation uses — after handing
+   * the turn it cut off back to the run (mesa task 1161). Resuming just starts
+   * the run, which says that sentence again from its start and then catches up
+   * on everything that landed in the meantime, in order.
    */
   function togglePause(button: LiveButton) {
     if (button.action === 'pause') {

@@ -280,6 +280,17 @@ export function shouldBargeIn(input: {
  * separately from the send itself (`heldFlush` does the actual joining) so
  * this predicate stays a pure yes/no over what the caller already has in
  * hand.
+ *
+ * `segmentOpen` and `outstanding` (mesa task 1189) are the auris path's two
+ * ways of not yet knowing whether the person is still talking: an utterance
+ * the VAD has not closed, and segments queued for or in flight to the
+ * transcriber. The clock only moves once a segment comes back as words
+ * (`speechHeardAt`), so while either is pending `idleMs` may be stale —
+ * measured from the last *speech*, not from the sound still being judged —
+ * and a flush on it would post the held text with the rest of the thought
+ * still on its way. Withheld, not reset: a segment that resolves to nothing
+ * leaves the clock where it was, and the caller re-judges at the settle.
+ * The browser-recognizer path has neither and leaves both at their defaults.
  */
 export function shouldFlushSilence(input: {
   listening: boolean
@@ -287,10 +298,30 @@ export function shouldFlushSilence(input: {
   interim: string
   idleMs: number
   idleThresholdMs: number
+  segmentOpen?: boolean
+  outstanding?: number
 }): boolean {
   if (!input.listening) return false
   if (input.recording.trim() === '' && input.interim.trim() === '') return false
+  if (input.segmentOpen || (input.outstanding ?? 0) > 0) return false
   return input.idleMs >= input.idleThresholdMs
+}
+
+/**
+ * Where the silence clock moves to once a segment has been transcribed
+ * (mesa task 1189), or `null` for a segment that turned out not to be speech.
+ *
+ * The clock used to restart on every audible VAD frame, which read a fan, a
+ * keyboard or a road as the person still talking: in a room that never falls
+ * quiet a ten-second wait never elapsed. Sound the transcriber turned into
+ * words is the only sound that counts, and it counts from the segment's own
+ * last loud frame — the moment the person actually stopped — rather than
+ * from when the transcript came back, so the transcription round trip is not
+ * added to the wait. Empty is what auris returns for noise, so a noise-only
+ * segment leaves the clock exactly where it was.
+ */
+export function speechHeardAt(text: string, lastLoudAt: number): number | null {
+  return utteranceFrom(text) === null ? null : lastLoudAt
 }
 
 /**

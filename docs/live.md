@@ -2128,12 +2128,24 @@ conversation") working with no backend change.
     rest of it, and the person had to talk to the pauses the detector chose
     rather than to mesa; silence after the whole thought is the pause that
     means something. The silence timer is measured on `shouldListen`, not
-    `recognizesSpeech`, and is now driven by `markHeard` firing on **audible
-    audio frames** rather than on recognizer results — a truer answer to the
-    same question, since it no longer depends on a guess at words to know the
-    person is still talking. While mesa is talking there is no pause of the
-    person's to read, and a mid-sentence pause they fill back in must not be
-    mistaken for the end of the thought. The switch remains an explicit early
+    `recognizesSpeech`, and on the auris path is driven by **transcribed
+    speech**, not by audible frames (mesa task 1189): a segment that comes
+    back from `auris` as words moves the clock to that segment's own last
+    loud frame (`liveRecognition.ts::speechHeardAt`, backdated so the
+    transcription round trip is not added to the wait), and a segment that
+    comes back empty — a fan, a keyboard, traffic — leaves it where it was.
+    Before 1189 `markHeard` fired on every loud VAD frame, and a room that
+    never fell quiet postponed the auto-send for as long as the noise ran.
+    The trade is that mid-utterance the clock may read stale, so
+    `shouldFlushSilence` is withheld while the VAD has an utterance open
+    (`segmentOpen`) or the `SegmentChain` has a segment in flight
+    (`outstanding`), and re-judged once at the settle edge — a noise-only
+    segment therefore delays the flush only until it resolves empty, bounded
+    by the VAD's maximum segment plus one transcription. The
+    browser-recognizer path is unchanged: `markHeard` fires on every
+    `onresult`, interim included. While mesa is talking there is no pause of
+    the person's to read, and a mid-sentence pause they fill back in must not
+    be mistaken for the end of the thought. The switch remains an explicit early
     send for whenever the wait would be too slow or too fast for what was just
     said.
 

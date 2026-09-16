@@ -78,6 +78,7 @@ import {
   recognizesSpeech,
   shouldBargeIn,
   shouldFlushSilence,
+  speechHeardAt,
   shouldListen,
   showsHearing,
   statusPill,
@@ -578,11 +579,26 @@ export function LiveHub({
   // person fills back in, not only on a settled sentence. A ref because the
   // timer reads it long after the render that bumped it; the tick is what
   // gets the effect that owns the timer to re-run and restart the wait.
+  // `at` is for the auris path (mesa task 1189), which learns the person was
+  // talking only when a segment comes back as words and backdates the stamp
+  // to that segment's last loud frame; the browser path stamps "now".
   const heardAt = useRef(0)
   const [heardTick, setHeardTick] = useState(0)
-  const markHeard = useCallback(() => {
-    heardAt.current = Date.now()
+  const markHeard = useCallback((at: number = Date.now()) => {
+    heardAt.current = at
     setHeardTick((t) => t + 1)
+  }, [])
+  // Whether the VAD has an utterance open right now (mesa task 1189) — the
+  // auris path's other "not yet known" beside `hearing`: the silence clock no
+  // longer moves on audible frames, so while a segment is still being spoken
+  // it may read as stale, and the flush waits for the segment instead.
+  // Written only on the open/close edges, never per frame. The ref is what
+  // the silence timer reads when it fires; the state is the settle edge.
+  const [segmentOpen, setSegmentOpen] = useState(false)
+  const segmentOpenRef = useRef(false)
+  const setSegmentOpenNow = useCallback((next: boolean) => {
+    segmentOpenRef.current = next
+    setSegmentOpen(next)
   }, [])
   // The microphone was refused — by the person or by the browser's policy.
   // Terminal for this page: retrying would reopen the permission prompt for
@@ -1321,24 +1337,44 @@ export function LiveHub({
   // The recording's other boundary (mesa task 917): silence, not just the
   // switch. A timeout re-armed on every dependency change, reading the live
   // answer through refs rather than the closure, because the person may have
-  // gone silent well before this effect's own render.
+  // gone silent well before this effect's own render. An open VAD segment or
+  // a segment still on the chain withholds it (mesa task 1189): the clock
+  // moves only on transcribed speech, so sound not yet judged may leave it
+  // stale, and the held text must wait. Both are read through the ref and
+  // the chain at fire time, deliberately *not* as dependencies: re-arming a
+  // full wait on every segment edge would let a noisy room push the timer
+  // for ever — the very bug — where the settle effect below asks once.
+  const silenceVerdict = useCallback(
+    () =>
+      shouldFlushSilence({
+        listening: wants.current,
+        recording: recordingRef.current,
+        interim: interimRef.current,
+        idleMs: Date.now() - heardAt.current,
+        idleThresholdMs: autoSendMs,
+        segmentOpen: segmentOpenRef.current,
+        outstanding: chainRef.current?.outstanding ?? 0,
+      }),
+    [autoSendMs],
+  )
   useEffect(() => {
     if (!wantsMic || (recording.trim() === '' && interim.trim() === '')) return
     const timer = window.setTimeout(() => {
-      if (
-        shouldFlushSilence({
-          listening: wants.current,
-          recording: recordingRef.current,
-          interim: interimRef.current,
-          idleMs: Date.now() - heardAt.current,
-          idleThresholdMs: autoSendMs,
-        })
-      ) {
-        flushRef.current()
-      }
+      if (silenceVerdict()) flushRef.current()
     }, autoSendMs)
     return () => window.clearTimeout(timer)
-  }, [heardTick, wantsMic, recording, interim, autoSendMs])
+  }, [heardTick, wantsMic, recording, interim, autoSendMs, silenceVerdict])
+  // The settle (mesa task 1189): a timer the effect above withheld is not
+  // re-armed by anything once the segment it waited on resolves to nothing —
+  // a noise-only segment moves no clock and grows no recording — so the same
+  // verdict is asked again the moment nothing is open or in flight, and a
+  // wait that had already elapsed flushes now rather than never. Only the
+  // settle edge is a dependency, so mesa finishing a reply (`wantsMic`
+  // rising) still starts the wait fresh as it always has.
+  useEffect(() => {
+    if (segmentOpen || hearing > 0) return
+    if (silenceVerdict()) flushRef.current()
+  }, [segmentOpen, hearing, silenceVerdict])
 
   const toggleListening = useCallback(
     (next: boolean) => {
@@ -1446,6 +1482,16 @@ export function LiveHub({
     // not hold an hour of it.
     let frames: CapturedFrame[] = []
     let vad = initialVad()
+    // Mirrors `vad.startedAt !== null` into `segmentOpen`, written only when
+    // it changes so the hub is not re-rendered per frame.
+    let segmentWasOpen = false
+    const trackSegment = () => {
+      const open = vad.startedAt !== null
+      if (open !== segmentWasOpen) {
+        segmentWasOpen = open
+        setSegmentOpenNow(open)
+      }
+    }
     // The level meter is throttled here rather than in `setLevel` itself: a
     // 128-sample block at 16 kHz is on the order of 125 blocks a second, and
     // re-rendering the hub that often for a bar nobody can watch move that
@@ -1488,14 +1534,25 @@ export function LiveHub({
      * that press and is folded in for the flush queued behind it. So "mesa
      * started speaking and nothing else happened" and "the person switched
      * the microphone off" both reach the recording; a pause and an end do not.
+     *
+     * `lastLoudAt` is the segment's last loud frame (`endedAt` from `vadStep`
+     * or `vadCut`): where the silence clock moves to if this segment turns
+     * out to be speech (mesa task 1189, `speechHeardAt`).
      */
-    const send = async (wav: Uint8Array, outlives = false) => {
+    const send = async (wav: Uint8Array, lastLoudAt: number, outlives = false) => {
       try {
         const { text: raw } = await transcribeAudio(toBase64(wav))
         if (!running && !outlives) return
         // A segment that came back is proof this page is still in touch, so
         // whatever the last failure was, it is over.
         setActionError(null)
+        // The silence clock (mesa task 1189): restarted by sound that turned
+        // out to be speech, backdated to when that speech ended — not by
+        // every audible frame, which read a noisy room as the person still
+        // talking and postponed the auto-send for as long as the noise ran.
+        // A segment auris heard nothing in leaves the clock where it was.
+        const heard = speechHeardAt(raw, lastLoudAt)
+        if (heard !== null) markHeard(heard)
         const text = utteranceFrom(correctVocabulary(raw, vocabRef.current))
         if (text === null) return
         // The preview is cleared here rather than waiting for the next
@@ -1559,9 +1616,10 @@ export function LiveHub({
       const cut = vadCut(vad)
       if (cut !== null && ctx !== null) {
         const wav = wavFromFrames(frames, cut.startedAt - PRE_ROLL_MS, cut.endedAt, ctx.sampleRate)
-        if (wav.length > 44) chain.enqueue(() => send(wav, true))
+        if (wav.length > 44) chain.enqueue(() => send(wav, cut.endedAt, true))
       }
       vad = initialVad()
+      trackSegment()
     }
     cutRef.current = cutOpen
 
@@ -1590,13 +1648,15 @@ export function LiveHub({
       }
       const step = vadStep(vad, { rms, at })
       vad = step.state
-      // The silence clock now comes from audible audio rather than a
-      // recognizer result: `markHeard` used to fire on every result, interim
-      // included, precisely so a mid-sentence pause the person fills back in
-      // was not read as them having finished. Audible sound is a *truer*
-      // answer to the same question than a guess at words was, and
-      // `shouldFlushSilence` above is unchanged.
-      if (step.loud) markHeard()
+      // The silence clock is *not* touched here (mesa task 1189). It used to
+      // restart on every loud frame, on the reasoning that audible sound was
+      // a truer "still talking" than a recognizer's guess at words — but a
+      // fan, a keyboard or traffic is loud and is not the person, and in a
+      // room that never falls quiet the auto-send never came. Now `send`
+      // moves it once the segment comes back as words, backdated to the
+      // segment's last loud frame, and `segmentOpen` tells the flush effect
+      // to wait while an utterance is still being spoken.
+      trackSegment()
       // Windowed **synchronously**, and before the buffer is bounded below.
       // `send` runs a microtask later at the earliest, and the VAD resets on
       // the very frame that ends an utterance — so by the time a deferred
@@ -1605,15 +1665,11 @@ export function LiveHub({
       // trailing pre-roll instead of what the person said. Encoding here is
       // the one place the frames the segment names are all still in hand.
       if (step.ended !== null && ctx !== null) {
-        const wav = wavFromFrames(
-          frames,
-          step.ended.startedAt - PRE_ROLL_MS,
-          step.ended.endedAt,
-          ctx.sampleRate,
-        )
+        const { startedAt, endedAt } = step.ended
+        const wav = wavFromFrames(frames, startedAt - PRE_ROLL_MS, endedAt, ctx.sampleRate)
         // A header-only WAV is a window with nothing in it — nothing anybody
         // said, so nothing worth waking a decoder for.
-        if (wav.length > 44) chain.enqueue(() => send(wav))
+        if (wav.length > 44) chain.enqueue(() => send(wav, endedAt))
       }
       frames = dropBefore(frames, (vad.startedAt ?? at) - PRE_ROLL_MS)
     }
@@ -1759,7 +1815,17 @@ export function LiveHub({
       stream?.getTracks().forEach((t) => t.stop())
       if (blobUrl) URL.revokeObjectURL(blobUrl)
     }
-  }, [wantsMic, transcribes, path, chosen, listInputs, markHeard, setInterimNow, setRecordingNow])
+  }, [
+    wantsMic,
+    transcribes,
+    path,
+    chosen,
+    listInputs,
+    markHeard,
+    setInterimNow,
+    setRecordingNow,
+    setSegmentOpenNow,
+  ])
 
   // Barge-in (mesa task 1160): the microphone while mesa is speaking. The
   // effect above closes it for the length of every reply so she never hears

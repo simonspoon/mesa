@@ -16,6 +16,7 @@ import {
   recognitionCtor,
   recognizesSpeech,
   shouldFlushSilence,
+  speechHeardAt,
   shouldBargeIn,
   shouldListen,
   showsHearing,
@@ -252,6 +253,34 @@ describe('shouldFlushSilence', () => {
     // `listening` is `shouldListen`, not `recognizesSpeech` — while mesa is
     // speaking the caller passes false here, and the timer must not fire.
     expect(shouldFlushSilence({ ...open, listening: false })).toBe(false)
+  })
+
+  it('withholds the flush while a VAD segment is still open (mesa task 1189)', () => {
+    // The clock moves only on transcribed speech, so mid-utterance it may be
+    // stale — the held text waits for the segment rather than firing on it.
+    expect(shouldFlushSilence({ ...open, idleMs: 30000, segmentOpen: true })).toBe(false)
+  })
+
+  it('withholds the flush while a segment is queued or in flight (mesa task 1189)', () => {
+    expect(shouldFlushSilence({ ...open, idleMs: 30000, outstanding: 1 })).toBe(false)
+    expect(shouldFlushSilence({ ...open, idleMs: 30000, outstanding: 2 })).toBe(false)
+  })
+
+  it('a settled chain and a closed segment are the ordinary rule again', () => {
+    expect(shouldFlushSilence({ ...open, segmentOpen: false, outstanding: 0 })).toBe(true)
+  })
+})
+
+describe('speechHeardAt', () => {
+  it('a speech segment moves the clock to its last loud frame', () => {
+    expect(speechHeardAt('make a task', 4200)).toBe(4200)
+  })
+
+  it('a noise-only segment does not move the clock', () => {
+    // Empty is what auris returns for a fan or a keyboard: the sound was
+    // never speech, so the wait it was postponing carries on where it was.
+    expect(speechHeardAt('', 4200)).toBeNull()
+    expect(speechHeardAt('  \n', 4200)).toBeNull()
   })
 })
 

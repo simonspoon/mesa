@@ -937,6 +937,15 @@ const MIGRATIONS: &[&str] = &[
         last_seen_at TEXT NOT NULL,
         inbox_item_id INTEGER REFERENCES inbox(id) ON DELETE SET NULL
     );",
+    // Task 1187: when a retro run's agent was actually spawned. A run row is
+    // written before the spawn (the claim), so a process that died between
+    // the claim and the spawn left a row that held the whole interval.
+    // `last_retro_run` now counts a row only once `spawned_at` is stamped, or
+    // while it is younger than `RETRO_CLAIM_GRACE_MINUTES`. Every existing
+    // row was spawned (a failed spawn deleted its row), so they are
+    // backfilled from `started_at`.
+    "ALTER TABLE retro_runs ADD COLUMN spawned_at TEXT;
+    UPDATE retro_runs SET spawned_at = started_at;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1331,15 +1340,22 @@ fn row_to_live_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSummary>
     })
 }
 
-const RETRO_RUN_COLUMNS: &str = "id, started_at, trigger";
+const RETRO_RUN_COLUMNS: &str = "id, started_at, trigger, spawned_at";
 
 fn row_to_retro_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetroRun> {
     Ok(RetroRun {
         id: row.get(0)?,
         started_at: row.get(1)?,
         trigger: row.get(2)?,
+        spawned_at: row.get(3)?,
     })
 }
+
+/// How long a claimed-but-unspawned retro run still counts (mesa task 1187).
+/// Long enough to cover the seed and the `claude --bg` shell-out, so an
+/// in-flight claim still stops a concurrent one; short enough that a row
+/// stranded by a process dying mid-spawn stops holding the interval soon.
+pub const RETRO_CLAIM_GRACE_MINUTES: u32 = 10;
 
 const RETRO_FINDING_COLUMNS: &str = "id, fingerprint, subject, kind, summary, count, evidence, \
                                      first_seen_at, last_seen_at, inbox_item_id";
@@ -5345,13 +5361,38 @@ impl Store {
         )?)
     }
 
-    /// The newest run, or `None` on an install that has never run one.
+    /// Stamps `spawned_at` on a claimed run once its agent is spawned, and
+    /// answers the updated row. `not_found` for an unknown id.
+    pub fn mark_retro_run_spawned(&mut self, id: i64) -> Result<RetroRun> {
+        let n = self.conn.execute(
+            "UPDATE retro_runs SET spawned_at = datetime('now') WHERE id = ?1",
+            [id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("retro run {id} not found")));
+        }
+        Ok(self.conn.query_row(
+            &format!("SELECT {RETRO_RUN_COLUMNS} FROM retro_runs WHERE id = ?1"),
+            [id],
+            row_to_retro_run,
+        )?)
+    }
+
+    /// The newest run that counts, or `None` when none does. A run counts
+    /// once it was spawned, or while its claim is younger than
+    /// [`RETRO_CLAIM_GRACE_MINUTES`] (still spawning, so a concurrent claim
+    /// is still refused) — a row stranded by a process that died between
+    /// claim and spawn is ignored once the grace passes (mesa task 1187).
     pub fn last_retro_run(&self) -> Result<Option<RetroRun>> {
         Ok(self
             .conn
             .query_row(
-                &format!("SELECT {RETRO_RUN_COLUMNS} FROM retro_runs ORDER BY id DESC LIMIT 1"),
-                [],
+                &format!(
+                    "SELECT {RETRO_RUN_COLUMNS} FROM retro_runs \
+                     WHERE spawned_at IS NOT NULL OR started_at > datetime('now', ?1) \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                [format!("-{RETRO_CLAIM_GRACE_MINUTES} minutes")],
                 row_to_retro_run,
             )
             .optional()?)
@@ -5370,8 +5411,8 @@ impl Store {
     }
 
     /// Whether a retrospective is due, judged on the store's own clock: due
-    /// when nothing has ever run, or when the last run started at least
-    /// `interval_hours` ago. `next_due_at` is that deadline, for the CLI to
+    /// when no run counts ([`Store::last_retro_run`]), or when the last one
+    /// that does started at least `interval_hours` ago. `next_due_at` is that deadline, for the CLI to
     /// print; the counts are the finding log's size and how many of its rows
     /// still point at an inbox item.
     pub fn retro_status(&self, interval_hours: u32) -> Result<RetroStatus> {
@@ -12453,15 +12494,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            62,
-            "a fresh db should report user_version 62"
+            63,
+            "a fresh db should report user_version 63"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 62);
+        assert_eq!(version, 63);
     }
 
     // ---- the session retrospective (mesa task 1158) ----
@@ -12513,6 +12554,80 @@ mod tests {
             store.delete_retro_run(run.id).unwrap_err(),
             Error::NotFound(_)
         ));
+    }
+
+    /// Mesa task 1187: a claim whose spawn never happened (the process died
+    /// in between) holds the interval only for the grace; a young claim
+    /// still blocks (dedup), and a spawned run holds the whole interval.
+    #[test]
+    fn an_unspawned_retro_claim_stops_counting_after_the_grace() {
+        let (mut store, _dir) = temp_store();
+        let backdate = |store: &Store, id: i64| {
+            store
+                .conn
+                .execute(
+                    "UPDATE retro_runs SET started_at = datetime('now', ?1) WHERE id = ?2",
+                    (format!("-{} minutes", RETRO_CLAIM_GRACE_MINUTES + 1), id),
+                )
+                .unwrap();
+        };
+
+        let claim = store.record_retro_run("watcher").unwrap();
+        assert_eq!(claim.spawned_at, None);
+        assert!(
+            !store.retro_status(72).unwrap().due,
+            "a claim still spawning blocks a second one"
+        );
+
+        backdate(&store, claim.id);
+        let status = store.retro_status(72).unwrap();
+        assert!(status.due, "a stranded claim past the grace: {status:?}");
+        assert_eq!(status.last_run, None);
+        assert!(matches!(
+            store.mark_retro_run_spawned(9999).unwrap_err(),
+            Error::NotFound(_)
+        ));
+
+        let run = store.record_retro_run("manual").unwrap();
+        let spawned = store.mark_retro_run_spawned(run.id).unwrap();
+        assert!(spawned.spawned_at.is_some());
+        backdate(&store, run.id);
+        let status = store.retro_status(72).unwrap();
+        assert!(!status.due, "a spawned run holds the interval: {status:?}");
+        assert_eq!(status.last_run.map(|r| r.id), Some(run.id));
+    }
+
+    /// Pins the `spawned_at` column (mesa task 1187) at index 62, and checks
+    /// that a run recorded before it is backfilled and still holds its
+    /// interval after the upgrade.
+    #[test]
+    fn the_retro_spawned_at_column_arrives_at_migration_62() {
+        const SPAWNED: usize = 62;
+        assert!(
+            MIGRATIONS[SPAWNED].contains("ADD COLUMN spawned_at"),
+            "migration {SPAWNED} is no longer the retro spawned_at migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..SPAWNED] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", SPAWNED as i64)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO retro_runs (started_at, trigger) \
+                 VALUES (datetime('now', '-1 hours'), 'watcher')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let run = store.last_retro_run().unwrap().expect("the old row counts");
+        assert_eq!(run.spawned_at.as_deref(), Some(run.started_at.as_str()));
+        assert!(!store.retro_status(72).unwrap().due);
     }
 
     #[test]

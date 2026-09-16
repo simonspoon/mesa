@@ -5215,6 +5215,7 @@ fn run_retro(cmd: RetroCmd) -> Result<()> {
                     "retro run {id} could not spawn its agent, so it was deleted again: {e}"
                 )));
             }
+            let run = store.mark_retro_run_spawned(run.id)?;
             print_record(&run, quiet, &[]);
         }
         RetroCmd::Status { quiet } => {
@@ -7115,10 +7116,11 @@ mod tests {
             id: 1,
             started_at: "2026-09-01 00:00:00".into(),
             trigger: "manual".into(),
+            spawned_at: Some("2026-09-01 00:00:01".into()),
         };
         assert_eq!(
             sorted_owned(keys(&run)),
-            sorted(&["id", "started_at", "trigger"]),
+            sorted(&["id", "started_at", "trigger", "spawned_at"]),
             "RetroRun gained/lost a field: decide whether --quiet should drop it"
         );
         let status = RetroStatus {

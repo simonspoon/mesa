@@ -239,7 +239,8 @@ ok "retro run with a failing claude is unavailable and leaves no run row"
 run 0 "$MESA" retro run
 RUN1=$(jqs .id)
 [ "$(jqs .trigger)" = "manual" ] || fail "a CLI run is trigger manual: $STDOUT"
-[ "$(keys "$STDOUT")" = "id,started_at,trigger" ] || fail "run key set: $(keys "$STDOUT")"
+[ "$(keys "$STDOUT")" = "id,spawned_at,started_at,trigger" ] || fail "run key set: $(keys "$STDOUT")"
+[ "$(jqs .spawned_at)" != "null" ] || fail "a run that spawned prints spawned_at: $STDOUT"
 [ "$(wc -l < "$BG_LOG")" -eq 1 ] || fail "one spawn: $(cat "$BG_LOG")"
 LINE=$(head -1 "$BG_LOG")
 EXPECT="$WORKSPACE|mesa retro $RUN1|Run mesa session retrospective $RUN1."
@@ -272,7 +273,7 @@ run 0 "$MESA" retro status
 run 0 "$MESA" retro run --force --quiet
 RUN2=$(jqs .id)
 [ "$RUN2" -gt "$RUN1" ] || fail "--force records a new run: $STDOUT"
-[ "$(keys "$STDOUT")" = "id,started_at,trigger" ] || fail "a run has nothing to drop under --quiet: $(keys "$STDOUT")"
+[ "$(keys "$STDOUT")" = "id,spawned_at,started_at,trigger" ] || fail "a run has nothing to drop under --quiet: $(keys "$STDOUT")"
 [ "$(wc -l < "$BG_LOG")" -eq 2 ] || fail "--force spawns: $(cat "$BG_LOG")"
 grep -q "|mesa retro $RUN2|Run mesa session retrospective $RUN2." "$BG_LOG" || fail "the forced run carries its own id"
 ok "retro run inside the interval is conflict; --force runs and records a new run; next_due_at is started_at + interval"

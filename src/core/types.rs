@@ -3805,6 +3805,11 @@ pub struct RetroRun {
     pub started_at: String,
     /// `watcher` | `manual`.
     pub trigger: String,
+    /// When the agent was spawned (mesa task 1187); null while the claim is
+    /// still spawning. An unspawned row stops counting toward the interval
+    /// after `RETRO_CLAIM_GRACE_MINUTES`, so a process dying between claim
+    /// and spawn cannot hold it.
+    pub spawned_at: Option<String>,
 }
 
 /// One entry in the retrospective's **finding log** (mesa task 1158): a piece

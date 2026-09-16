@@ -359,7 +359,7 @@ fn retro_watcher_tick(state: &AppState) {
     // Phase two: the shell-out, off the lock.
     let dispatch_dir = config::workspace_dir().to_string_lossy().into_owned();
     let session_name = retro::session_name(run.id);
-    if let Err(e) = seeded.and_then(|prompts| {
+    let spawn = seeded.and_then(|prompts| {
         agents::spawn_bg(
             config::RETRO,
             &dispatch_dir,
@@ -368,17 +368,31 @@ fn retro_watcher_tick(state: &AppState) {
             None,
             &prompts,
         )
-    }) {
-        eprintln!("retro-watcher: spawn failed for retro run {}: {e}", run.id);
-        let mut store = match state.store.lock() {
-            Ok(s) => s,
-            Err(e) => e.into_inner(),
-        };
-        if let Err(e) = store.delete_retro_run(run.id) {
-            eprintln!(
-                "retro-watcher: could not roll back retro run {}: {e}",
-                run.id
-            );
+    });
+    let mut store = match state.store.lock() {
+        Ok(s) => s,
+        Err(e) => e.into_inner(),
+    };
+    match spawn {
+        // Stamping `spawned_at` is what makes the claim hold the whole
+        // interval; an unstamped row only counts for the grace (mesa task
+        // 1187). A failed stamp is left to that grace.
+        Ok(_) => {
+            if let Err(e) = store.mark_retro_run_spawned(run.id) {
+                eprintln!(
+                    "retro-watcher: could not mark retro run {} spawned: {e}",
+                    run.id
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("retro-watcher: spawn failed for retro run {}: {e}", run.id);
+            if let Err(e) = store.delete_retro_run(run.id) {
+                eprintln!(
+                    "retro-watcher: could not roll back retro run {}: {e}",
+                    run.id
+                );
+            }
         }
     }
 }
@@ -13005,6 +13019,10 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 .unwrap()
                 .expect("the run row is the claim");
             assert_eq!(run.trigger, "watcher");
+            assert!(
+                run.spawned_at.is_some(),
+                "a successful spawn stamps spawned_at: {run:?}"
+            );
             assert!(
                 log.contains(&format!(
                     "|mesa retro {}|Run mesa session retrospective {}.",

@@ -124,6 +124,16 @@ pointer goes. `mesa retro status` reports both counts (`findings`, `linked`).
 - A failed spawn **deletes the run row** and logs to stderr, so the next tick
   retries rather than waiting out a 72-hour interval on a run that never
   happened — the inbox-watcher's claim release, in the db.
+- A successful spawn stamps the row's **`spawned_at`** (mesa task 1187,
+  migration index 62). Only a stamped row holds the whole interval; an
+  unstamped one counts for `RETRO_CLAIM_GRACE_MINUTES` (10) after
+  `started_at` — long enough that an in-flight claim still stops a
+  concurrent one — and is ignored after that, so a process that dies between
+  the claim and the spawn (where the rollback never runs) costs ten minutes,
+  not 72 hours. `Store::last_retro_run`, and so `retro status`'s `last_run`,
+  returns only a row that counts; the stranded row itself is left in place.
+  Rows from before the migration are backfilled with `spawned_at =
+  started_at`.
 - Two-phase like every other tick: the store lock is dropped before the
   blocking `claude --bg` shell-out.
 

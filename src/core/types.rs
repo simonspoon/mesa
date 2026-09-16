@@ -1510,6 +1510,12 @@ pub struct InboxItem {
     /// while it is live (mesa task 845). Unlike `read_at` this toggles:
     /// archiving is a place an item sits, so un-archiving clears the stamp.
     pub archived_at: Option<String>,
+    /// Why the item was set aside (mesa task 1168) — the archiver's verdict
+    /// ("duplicate of task 12", "shipped in abc123", "completion summary; the
+    /// record is task 40's result"), at most 1000 chars, or null. Written only
+    /// by an archive and cleared by the un-archive, so it is null exactly when
+    /// `archived_at` is.
+    pub archive_reason: Option<String>,
     /// The task this item is **about** (mesa task 847) — required at creation,
     /// because every item arrives from an agent working a task and an item with
     /// no origin cannot say where it came from. Null only on a row that

@@ -53,6 +53,12 @@ pub struct Builtin {
 /// `core::supervisor::SUPERVISOR_DEFINITION`, at
 /// `.claude/agents/supervisor.md`, seeded by
 /// `core::supervisor::ensure_agent_definition` on the first dispatch.
+/// `inbox-triage` is the third (mesa task 1168): the agent definition a
+/// `serve --watch-inbox` dispatch triages one item as, body
+/// `core::inbox_triage::INBOX_TRIAGE_DEFINITION`, at
+/// `.claude/agents/inbox-triage.md`, seeded by
+/// `core::inbox_triage::ensure_agent_definition` before the `inbox-watcher`
+/// spawn.
 /// `live-summary-prompt` is still a `prompt` (mesa task 921): the instructions
 /// for the short-lived agent that writes a live conversation's memory once it
 /// ends, body `core::live::SUMMARY_PROMPT`, spawned as a plain prompt rather
@@ -71,6 +77,13 @@ pub const BUILTINS: &[Builtin] = &[
         kind: LibraryKind::Agent,
         scope: LibraryScope::User,
         body: crate::core::supervisor::SUPERVISOR_DEFINITION,
+    },
+    Builtin {
+        id: crate::core::inbox_triage::INBOX_TRIAGE_AGENT_BUILTIN,
+        name: crate::core::inbox_triage::INBOX_TRIAGE_AGENT_BUILTIN,
+        kind: LibraryKind::Agent,
+        scope: LibraryScope::User,
+        body: crate::core::inbox_triage::INBOX_TRIAGE_DEFINITION,
     },
     Builtin {
         id: "live-summary-prompt",

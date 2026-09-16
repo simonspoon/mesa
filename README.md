@@ -259,15 +259,20 @@ UI does not live-sync; it refetches on window focus.
   agents and people building the same board over time can see each other's
   edits. The web renders the graph as a draggable canvas; agents read and write
   it as JSON.
-- **Inbox item** — a free-text update request sent to one shared, global inbox
-  that lives *above* projects. Every item names the task it came from
-  (`mesa inbox add --task <id> …`, required), and the reader's first line is
-  that task's project and name, derived on every read. A person triages it:
-  `mesa inbox assign <id> <project>` converts the item into a `backlog` task in
-  that project (one transaction — the item never vanishes without a task to show
-  for it). `mesa inbox {add,list,show,assign,read,archive,delete}`. `mesa serve --watch-inbox`
-  triages the whole inbox for you, spawning a Claude Code agent per pending
-  item; off by default.
+- **Inbox item** — the queue of things that need a *decision* and have no home
+  yet: a `change-request` (an agent, a retrospective or a supervisor asking for
+  work in some project) or an alert addressed to a person (`task-summary`, the
+  cost guard's kind — never a task's close-out summary, whose record is the
+  task's own `result`). One shared, global inbox that lives *above* projects.
+  Every item names the task it came from (`mesa inbox add --task <id> --kind
+  change-request …`), and the reader's first line is that task's project and
+  name, derived on every read. A person triages it: `mesa inbox assign <id>
+  <project>` converts the item into a `backlog` task in that project (one
+  transaction — the item never vanishes without a task to show for it), or
+  `mesa inbox archive <id> --reason "<why>"` sets it aside with the verdict
+  kept beside it. `mesa inbox {add,list,show,assign,read,archive,delete}`.
+  `mesa serve --watch-inbox` triages the change requests for you, spawning the
+  `inbox-triage` agent per pending item; off by default.
 - **Attachment** — an arbitrary file (screenshot, PDF, notes) hung off one
   task. The bytes live *outside* the database, in mesa's own data directory,
   with a 25 MiB per-file cap; deleting the task (or an ancestor of it) removes

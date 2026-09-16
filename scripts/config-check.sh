@@ -287,7 +287,7 @@ api GET /api/config
   fail "GET /api/config: configured value wrong: $STDOUT"
 [ "$(jq -r '.[1].value' <<<"$STDOUT")" = "null" ] ||
   fail "an unconfigured action must report value: null, got $STDOUT"
-[ "$(jq -r '.[1].default' <<<"$STDOUT")" = 'claude --bg --agent swe --name {name} -- "/inbox-triage {id}"' ] ||
+[ "$(jq -r '.[1].default' <<<"$STDOUT")" = 'claude --bg --agent inbox-triage --name {name} -- "Triage mesa inbox item {id}."' ] ||
   fail "GET /api/config: built-in default wrong: $STDOUT"
 [ "$(jq -r '.[2].placeholders | join(" ")' <<<"$STDOUT")" = "{prompt}" ] ||
   fail "GET /api/config: agent-spawn's placeholder vocabulary wrong: $STDOUT"
@@ -1397,9 +1397,9 @@ ok "the unconfigured todo-watcher keeps its built-in \`--agent supervisor --name
 run 0 "$MESA" inbox add --task "$TASK_B" --kind change-request "loki: find exits 0 on no match"
 ITEM_2=$(jqs .id)
 wait_lines "$CLAUDE_LOG" 3
-grep -qx "$WORKSPACE|--agent|swe|--name|inbox $ITEM_2: loki: find exits 0 on no match|--|/inbox-triage $ITEM_2" "$CLAUDE_LOG" ||
+grep -qx "$WORKSPACE|--agent|inbox-triage|--name|inbox $ITEM_2: loki: find exits 0 on no match|--|Triage mesa inbox item $ITEM_2." "$CLAUDE_LOG" ||
   fail "the built-in inbox-watcher argv changed: $(cat "$CLAUDE_LOG")"
-ok "the unconfigured inbox-watcher keeps its built-in \`--name inbox <id>: <body> -- /inbox-triage <id>\` argv"
+ok "the unconfigured inbox-watcher keeps its built-in \`--agent inbox-triage --name inbox <id>: <body> -- Triage mesa inbox item <id>.\` argv"
 
 # ---- a saved template still holding the retired {bin}/{agent} (mesa task 1141) ----
 

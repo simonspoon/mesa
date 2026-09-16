@@ -158,8 +158,8 @@ enum Command {
         #[arg(long, default_value_t = false)]
         watch_todo: bool,
         /// Periodically auto-start a background `claude` agent to triage each
-        /// pending item in the global inbox (default prompt:
-        /// `/inbox-triage <id>`, configurable in ~/.mesa/config.json; cwd
+        /// pending item in the global inbox (default: the `inbox-triage` agent
+        /// definition, configurable in ~/.mesa/config.json; cwd
         /// `~/.mesa/workspace` — an inbox item belongs to no project). Off by
         /// default:
         /// this spawns real agents (API cost, code execution) with no user
@@ -919,13 +919,19 @@ EXAMPLES
     /// Archiving sets an item aside without triaging or destroying it — the
     /// third thing that can happen to an item, beside `assign` and `delete`.
     /// Unlike `read` this toggles: `--undo` puts the item back in the live
-    /// inbox. Both directions are idempotent.
+    /// inbox. Both directions are idempotent. `--reason` records why
+    /// ("duplicate of task 12", "shipped in abc123"); it is stored as
+    /// `archive_reason` and cleared by `--undo`.
     Archive {
         /// Inbox item id
         id: i64,
         /// Put the item back in the live inbox instead of archiving it
         #[arg(long)]
         undo: bool,
+        /// Why the item is being set aside (at most 1000 chars); stored as
+        /// `archive_reason`. Meaningless with `--undo`, so the pair is a usage error
+        #[arg(long, value_name = "TEXT", conflicts_with = "undo")]
+        reason: Option<String>,
         /// Print the item without its `body` instead of in full
         #[arg(long)]
         quiet: bool,
@@ -4462,9 +4468,15 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
             print_task(&store.assign_inbox_item(id, project)?, quiet);
         }
         InboxCmd::Read { id, quiet } => print_inbox_item(&store.mark_inbox_item_read(id)?, quiet),
-        InboxCmd::Archive { id, undo, quiet } => {
-            print_inbox_item(&store.set_inbox_item_archived(id, !undo)?, quiet)
-        }
+        InboxCmd::Archive {
+            id,
+            undo,
+            reason,
+            quiet,
+        } => print_inbox_item(
+            &store.set_inbox_item_archived(id, !undo, reason.as_deref())?,
+            quiet,
+        ),
         InboxCmd::Delete { id, quiet } => print_inbox_item(&store.delete_inbox_item(id)?, quiet),
     }
     Ok(())
@@ -6116,6 +6128,7 @@ mod tests {
             updated_at: "2026-01-02 00:00:00".into(),
             read_at: Some("2026-01-02 00:00:00".into()),
             archived_at: None,
+            archive_reason: None,
             kind: InboxKind::TaskSummary,
             task_id: Some(3),
             task_name: Some("the task this report is about".into()),
@@ -6433,6 +6446,10 @@ mod tests {
                 // Task 845: bounded the same way, and the field `inbox
                 // archive` exists to write — same reasoning as `read_at`.
                 "archived_at",
+                // Task 1168: capped at 1000 chars, and it is what `inbox
+                // archive --reason` exists to write — a quiet echo that
+                // dropped it would read as "the reason didn't take".
+                "archive_reason",
                 // Task 846: one of two fixed words, so bounded — and it is
                 // what decides who reads the item, which a quiet echo that
                 // dropped it could not show.

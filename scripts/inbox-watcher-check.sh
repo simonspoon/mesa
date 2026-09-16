@@ -141,19 +141,26 @@ sleep 1
 [ "$(wc -l < "$BG_LOG")" -eq 0 ] || fail "a failing spawn must log nothing"
 rm -f "$STUB_DIR/fail"
 
-# ---- flag ON: dispatches the pending item in the workspace with /inbox-triage <id> ----
+# ---- flag ON: dispatches the pending item in the workspace with "Triage mesa inbox item <id>." ----
 
 wait_bg_lines 1
 LINE=$(head -1 "$BG_LOG")
-EXPECT="$WORKSPACE|inbox $ITEM_1: khora: eval errors on undefined|/inbox-triage $ITEM_1"
+EXPECT="$WORKSPACE|inbox $ITEM_1: khora: eval errors on undefined|Triage mesa inbox item $ITEM_1."
 [ "$LINE" = "$EXPECT" ] || fail "expected '$EXPECT', got '$LINE'"
 [ -d "$WORKSPACE" ] || fail "the dispatch folder ~/.mesa/workspace must be created on demand"
-ok "spawn failure releases the claim; the next tick retries and dispatches in ~/.mesa/workspace (created on demand), prompt '/inbox-triage <id>', session named 'inbox <id>: <first body line>'"
+ok "spawn failure releases the claim; the next tick retries and dispatches in ~/.mesa/workspace (created on demand), prompt 'Triage mesa inbox item <id>.', session named 'inbox <id>: <first body line>'"
 
-# Triage sessions run under an agent persona too (default `swe`).
-[ "$(cat "$STUB_DIR/last-agent")" = "swe" ] ||
-  fail "triage dispatch must pass --agent swe, got '$(cat "$STUB_DIR/last-agent")'"
-ok "triage session is spawned with --agent swe"
+# Triage runs as the `inbox-triage` agent definition (mesa task 1168), which
+# the watcher seeds to ~/.claude/agents/inbox-triage.md before the spawn —
+# `claude --agent` errors on an agent it has never seen.
+[ "$(cat "$STUB_DIR/last-agent")" = "inbox-triage" ] ||
+  fail "triage dispatch must pass --agent inbox-triage, got '$(cat "$STUB_DIR/last-agent")'"
+AGENT_FILE="$FAKE_HOME/.claude/agents/inbox-triage.md"
+[ -f "$AGENT_FILE" ] || fail "the inbox-triage agent definition must be seeded at $AGENT_FILE before the spawn"
+grep -q '^name: inbox-triage$' "$AGENT_FILE" || fail "the seeded definition must name the agent: $(head -3 "$AGENT_FILE")"
+grep -q '^tools: ' "$AGENT_FILE" || fail "the seeded definition must carry a tool list"
+! grep -E '^tools: .*\b(Edit|Write)\b' "$AGENT_FILE" || fail "the triage agent must not be able to Edit/Write: $(grep '^tools:' "$AGENT_FILE")"
+ok "triage session is spawned with --agent inbox-triage, its definition seeded to ~/.claude/agents/inbox-triage.md with no Edit/Write"
 
 # ---- already dispatched: no re-dispatch, tick after tick ----
 
@@ -173,7 +180,7 @@ run 0 "$MESA" inbox add --task "$TASK_A" --kind change-request "loki: find exits
 ITEM_2=$(jqs .id)
 wait_bg_lines 2
 LINE=$(sed -n 2p "$BG_LOG")
-EXPECT="$WORKSPACE|inbox $ITEM_2: loki: find exits 0 on no match|/inbox-triage $ITEM_2"
+EXPECT="$WORKSPACE|inbox $ITEM_2: loki: find exits 0 on no match|Triage mesa inbox item $ITEM_2."
 [ "$LINE" = "$EXPECT" ] || fail "expected '$EXPECT', got '$LINE'"
 ok "a new inbox item is dispatched on the next tick, with its own id"
 
@@ -201,7 +208,7 @@ ITEM_SUMMARY=$(jqs .id)
 sleep 1
 [ "$(wc -l < "$BG_LOG")" -eq 5 ] ||
   fail "a task summary must never dispatch: $(cat "$BG_LOG")"
-! grep -q "/inbox-triage $ITEM_SUMMARY" "$BG_LOG" ||
+! grep -q "Triage mesa inbox item $ITEM_SUMMARY." "$BG_LOG" ||
   fail "a task summary must never be triaged"
 run 0 "$MESA" inbox show "$ITEM_SUMMARY"
 [ "$(jqs .kind)" = "task-summary" ] || fail "the watcher must not touch the item at all"

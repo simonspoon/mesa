@@ -904,6 +904,12 @@ const MIGRATIONS: &[&str] = &[
     // `predecessor_agent_id`; `resting_since` does, so the page can show it.
     "ALTER TABLE live_sessions ADD COLUMN resting_since TEXT;
     ALTER TABLE live_sessions ADD COLUMN dream_agent_id TEXT;",
+    // Task 1168: why an inbox item was set aside. Written only by an archive
+    // (`set_inbox_item_archived`, optional, at most `INBOX_ARCHIVE_REASON_MAX`
+    // chars) and cleared by the un-archive, so it is null exactly when
+    // `archived_at` is — the triage agent's verdict ("duplicate of task 12",
+    // "shipped in abc123") kept beside the item it decided.
+    "ALTER TABLE inbox ADD COLUMN archive_reason TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1049,7 +1055,11 @@ const DIAGRAM_EVENT_COLUMNS: &str = "id, diagram_id, actor, action, summary, at"
 /// and its project's name. Both arrive through `INBOX_FROM`'s left joins, so
 /// they are null exactly when `task_id` is.
 const INBOX_COLUMNS: &str = "i.id, i.project_id, i.author, i.body, i.created_at, i.updated_at, \
-     i.read_at, i.archived_at, i.kind, i.task_id, t.description, p.name";
+     i.read_at, i.archived_at, i.kind, i.task_id, t.description, p.name, i.archive_reason";
+
+/// Longest `archive_reason` an archive may carry (mesa task 1168): a verdict,
+/// not a report — the item's body is where the long text already is.
+pub const INBOX_ARCHIVE_REASON_MAX: usize = 1000;
 
 /// The joins `INBOX_COLUMNS` reads the derived columns from. Left joins: an
 /// item whose origin task was deleted (or that predates task 847) still reads.
@@ -1077,6 +1087,7 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
             _ => None,
         },
         project_name: row.get(11)?,
+        archive_reason: row.get(12)?,
     })
 }
 
@@ -4472,20 +4483,40 @@ impl Store {
     /// sits, not a fact about the past — so `archived_at` is the moment it was
     /// last archived, and un-archiving clears it. Idempotent in both
     /// directions: re-archiving an archived item leaves its stamp alone.
-    pub fn set_inbox_item_archived(&mut self, id: i64, archived: bool) -> Result<InboxItem> {
+    ///
+    /// An archive may say **why** (mesa task 1168): `reason` is stored beside
+    /// the stamp (at most [`INBOX_ARCHIVE_REASON_MAX`] chars, else
+    /// `validation`; blank is none) and rides with the stamp — re-archiving
+    /// an archived item leaves both alone, and un-archiving clears both.
+    /// `reason` is ignored on the way back, so a caller cannot store one on a
+    /// live item.
+    pub fn set_inbox_item_archived(
+        &mut self,
+        id: i64,
+        archived: bool,
+        reason: Option<&str>,
+    ) -> Result<InboxItem> {
         // The read first, for the `not_found` the caller expects; the write
         // then decides on the row itself (see `mark_inbox_item_read`) so a
         // second archiver cannot move a stamp the first one set.
         self.get_inbox_item(id)?;
         if archived {
+            let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+            if reason.is_some_and(|r| r.chars().count() > INBOX_ARCHIVE_REASON_MAX) {
+                return Err(Error::Validation(format!(
+                    "archive reason must be at most {INBOX_ARCHIVE_REASON_MAX} characters"
+                )));
+            }
             self.conn.execute(
-                "UPDATE inbox SET archived_at = datetime('now'), updated_at = datetime('now') \
+                "UPDATE inbox SET archived_at = datetime('now'), archive_reason = ?2, \
+                 updated_at = datetime('now') \
                  WHERE id = ?1 AND archived_at IS NULL",
-                [id],
+                rusqlite::params![id, reason],
             )?;
         } else {
             self.conn.execute(
-                "UPDATE inbox SET archived_at = NULL, updated_at = datetime('now') \
+                "UPDATE inbox SET archived_at = NULL, archive_reason = NULL, \
+                 updated_at = datetime('now') \
                  WHERE id = ?1 AND archived_at IS NOT NULL",
                 [id],
             )?;
@@ -10889,33 +10920,68 @@ mod tests {
             .unwrap();
         assert_eq!(item.archived_at, None);
 
-        let archived = store.set_inbox_item_archived(item.id, true).unwrap();
+        let archived = store
+            .set_inbox_item_archived(item.id, true, Some("nothing to do"))
+            .unwrap();
         let stamp = archived
             .archived_at
             .clone()
             .expect("archived_at is stamped");
+        assert_eq!(archived.archive_reason.as_deref(), Some("nothing to do"));
         assert!(
             store.list_inbox_items(None).unwrap()[0]
                 .archived_at
                 .is_some()
         );
 
-        let again = store.set_inbox_item_archived(item.id, true).unwrap();
+        // Re-archiving moves neither the stamp nor the reason (mesa task 1168).
+        let again = store
+            .set_inbox_item_archived(item.id, true, Some("a second verdict"))
+            .unwrap();
         assert_eq!(again.archived_at, Some(stamp));
         assert_eq!(again.updated_at, archived.updated_at);
+        assert_eq!(again.archive_reason.as_deref(), Some("nothing to do"));
 
-        // …and back, which clears the stamp rather than adding a second one.
-        let live = store.set_inbox_item_archived(item.id, false).unwrap();
+        // …and back, which clears the stamp rather than adding a second one —
+        // and the reason with it, so it is null exactly when the stamp is.
+        let live = store.set_inbox_item_archived(item.id, false, None).unwrap();
         assert_eq!(live.archived_at, None);
+        assert_eq!(live.archive_reason, None);
         // Archiving is independent of reading: an item can be set aside unread.
         assert_eq!(live.read_at, None);
+    }
+
+    /// The reason is bounded (mesa task 1168): a verdict, not a second body.
+    /// Over the cap is `validation` and nothing is written — the item stays
+    /// live — while a blank reason is simply none.
+    #[test]
+    fn set_inbox_item_archived_reason_is_capped_and_blank_is_none() {
+        let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
+        let item = store
+            .create_inbox_item(None, "nothing to do here", InboxKind::TaskSummary, origin)
+            .unwrap();
+        let long = "x".repeat(INBOX_ARCHIVE_REASON_MAX + 1);
+        assert!(matches!(
+            store.set_inbox_item_archived(item.id, true, Some(&long)),
+            Err(Error::Validation(_))
+        ));
+        let still_live = store.get_inbox_item(item.id).unwrap();
+        assert_eq!(still_live.archived_at, None);
+        assert_eq!(still_live.archive_reason, None);
+
+        let archived = store
+            .set_inbox_item_archived(item.id, true, Some("   "))
+            .unwrap();
+        assert!(archived.archived_at.is_some());
+        assert_eq!(archived.archive_reason, None);
     }
 
     #[test]
     fn set_inbox_item_archived_unknown_id_is_not_found() {
         let (mut store, _dir) = temp_store();
         assert!(matches!(
-            store.set_inbox_item_archived(999, true),
+            store.set_inbox_item_archived(999, true, None),
             Err(Error::NotFound(_))
         ));
     }

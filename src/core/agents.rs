@@ -1040,7 +1040,10 @@ echo "backgrounded · 5we00000 · n""#,
             std::fs::read_to_string(&log).unwrap(),
             "dispatch\n--task\n42\n--label\nmesa: a name with spaces\n"
         );
-        assert!(fallback.contains("\"/inbox-triage 7\""), "{fallback:?}");
+        assert!(
+            fallback.contains("\"Triage mesa inbox item 7.\""),
+            "{fallback:?}"
+        );
     }
 
     #[test]

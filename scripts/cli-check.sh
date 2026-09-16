@@ -899,11 +899,11 @@ run 0 "$MESA" inbox add --task "$TIQ" --author agent-q "$BODY"
 IQ=$(jqs .id)
 run 0 "$MESA" inbox show "$IQ"
 printf '%s' "$STDOUT" >"$TMP/ifull.json"
-# non-quiet output is unchanged: the full 12-key inbox item (task 831 added
-# `read_at`, task 845 `archived_at`, task 846 `kind` and task 847 the origin
-# trio `task_id` + the derived `task_name`/`project_name` — all bounded and
-# therefore staying in the quiet shape too)
-[ "$(jqs 'keys | join(",")')" = "archived_at,author,body,created_at,id,kind,project_id,project_name,read_at,task_id,task_name,updated_at" ] ||
+# non-quiet output is unchanged: the full 13-key inbox item (task 831 added
+# `read_at`, task 845 `archived_at`, task 846 `kind`, task 847 the origin
+# trio `task_id` + the derived `task_name`/`project_name`, and task 1168
+# `archive_reason` — all bounded and therefore staying in the quiet shape too)
+[ "$(jqs 'keys | join(",")')" = "archive_reason,archived_at,author,body,created_at,id,kind,project_id,project_name,read_at,task_id,task_name,updated_at" ] ||
   fail "inbox show (no --quiet): full key set must be unchanged"
 [ "$(jqs 'has("body")')" = "true" ] || fail "inbox show (no --quiet): body present"
 run 0 "$MESA" inbox show "$IQ" --quiet
@@ -950,6 +950,29 @@ quiet_is_full_minus_bodies "$TMP/ifull.json" "$TMP/iquiet.json" ||
 run 1 "$MESA" inbox show "$IQ2"
 [ "$(jqe .error.code)" = "not_found" ] || fail "inbox assign --quiet: item must still be consumed"
 ok "inbox assign --quiet: compact task, item still converted and removed"
+
+# archive --reason (mesa task 1168): the verdict rides with the stamp — stored
+# on the archive, kept in the quiet shape (bounded, and the field the flag
+# exists to write), cleared by --undo, refused past 1000 chars (exit 1,
+# validation, nothing written) and a usage error beside --undo (exit 2).
+run 0 "$MESA" inbox add --task "$TIQ" "$BODY"
+IQR=$(jqs .id)
+run 0 "$MESA" inbox archive "$IQR" --reason "duplicate of task $TIQ" --quiet
+[ "$(jqs .archive_reason)" = "duplicate of task $TIQ" ] || fail "inbox archive --reason: must be stored and kept in the quiet shape"
+[ "$(jqs .archived_at)" != "null" ] || fail "inbox archive --reason: archived_at must be stamped"
+run 0 "$MESA" inbox show "$IQR"
+[ "$(jqs .archive_reason)" = "duplicate of task $TIQ" ] || fail "inbox archive --reason: must persist"
+run 0 "$MESA" inbox archive "$IQR" --undo
+[ "$(jqs .archived_at)" = "null" ] || fail "inbox archive --undo: must clear the stamp"
+[ "$(jqs .archive_reason)" = "null" ] || fail "inbox archive --undo: must clear the reason with the stamp"
+run 2 "$MESA" inbox archive "$IQR" --undo --reason "why"
+[ -z "$STDOUT" ] || fail "inbox archive --undo --reason: usage error must print nothing on stdout"
+LONG_REASON=$(printf 'x%.0s' $(seq 1 1001))
+run 1 "$MESA" inbox archive "$IQR" --reason "$LONG_REASON"
+[ "$(jqe .error.code)" = "validation" ] || fail "inbox archive --reason over 1000 chars: must be validation"
+run 0 "$MESA" inbox show "$IQR"
+[ "$(jqs .archived_at)" = "null" ] || fail "inbox archive --reason over 1000 chars: nothing may be written"
+ok "inbox archive --reason: stored and quiet-kept, cleared by --undo, exit 2 beside --undo, over-length is validation writing nothing"
 
 # delete: --quiet is an explicit opt-out of the full recovery transcript.
 run 0 "$MESA" inbox add --task "$TIQ" "$BODY"

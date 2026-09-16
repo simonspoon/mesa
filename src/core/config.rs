@@ -14,7 +14,7 @@
 //! {
 //!   "commands": {
 //!     "todo-watcher":   "claude --bg --agent swe --name {name} -- \"/execute-mesa-task {id}\"",
-//!     "inbox-watcher":  "claude --bg --agent swe --name {name} -- \"/inbox-triage {id}\"",
+//!     "inbox-watcher":  "claude --bg --agent inbox-triage --name {name} -- \"Triage mesa inbox item {id}.\"",
 //!     "agent-spawn":    "claude --bg --agent swe -- {prompt}",
 //!     "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
 //!     "live-summary":   "claude --bg --agent swe --name {name} -- {prompt}",
@@ -239,9 +239,12 @@ pub const ACTIONS: [&str; 6] = [
 pub const DEFAULT_TODO_WATCHER: &str =
     r#"claude --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}""#;
 /// Built-in default for [`INBOX_WATCHER`]; see [`DEFAULT_TODO_WATCHER`]. The
-/// triage runs as mesa's generic engineering agent, `swe`, named literally.
+/// triage runs as the `inbox-triage` agent definition (mesa task 1168,
+/// `core::inbox_triage::INBOX_TRIAGE_DEFINITION`, seeded to
+/// `.claude/agents/inbox-triage.md` before the spawn), named literally; the
+/// prompt is one sentence, since the definition holds the whole procedure.
 pub const DEFAULT_INBOX_WATCHER: &str =
-    r#"claude --bg --agent swe --name {name} -- "/inbox-triage {id}""#;
+    r#"claude --bg --agent inbox-triage --name {name} -- "Triage mesa inbox item {id}.""#;
 /// Built-in default for [`AGENT_SPAWN`]. No `{id}`/`{name}`: this spawn is
 /// driven by a request body, not a mesa record, and the prompt is optional —
 /// absent, the `-- {prompt}` pair drops out and the session starts idle. The
@@ -3736,7 +3739,7 @@ mod tests {
         );
         assert_eq!(
             resolve(INBOX_WATCHER, DEFAULT_INBOX_WATCHER, &vars).unwrap(),
-            r#"claude --bg --agent swe --name 'mesa: do the thing' -- "/inbox-triage 731""#
+            r#"claude --bg --agent inbox-triage --name 'mesa: do the thing' -- "Triage mesa inbox item 731.""#
         );
         let spawn = Vars {
             prompt: Some("look at the tests"),

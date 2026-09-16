@@ -47,8 +47,8 @@ use crate::core::{
     LiveWindow, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree,
     ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch,
     Script, ScriptArg, ScriptPatch, Status, Store, SystemInfo, Task, TaskPatch, TaskSummary,
-    Waypoint, agents, attachments, board, config, files, git, guard, hooks, library, listen, live,
-    receipt, scripts, speech, supervisor, system, version,
+    Waypoint, agents, attachments, board, config, files, git, guard, hooks, inbox_triage, library,
+    listen, live, receipt, scripts, speech, supervisor, system, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -314,24 +314,25 @@ fn inbox_session_name(item: &InboxItem) -> String {
     format!("inbox {}: {head}", item.id)
 }
 
-/// One inbox-watcher pass: dispatch a background `claude` agent running
-/// `/inbox-triage <id>` for every pending inbox item this process has not
-/// already dispatched. The inbox is one **global** queue that lives above
+/// One inbox-watcher pass: dispatch a background `claude` agent (the
+/// `inbox-triage` agent definition, mesa task 1168) for every pending inbox
+/// item this process has not already dispatched. The inbox is one **global** queue that lives above
 /// projects, so — unlike the todo-watcher, which is naturally capped at one
 /// agent per project — every un-dispatched item goes out in the same tick.
 ///
 /// cwd is `~/.mesa/workspace`, not a project folder: an inbox item belongs to
-/// no project (`project_id` is null for its whole life) and the triage skill
+/// no project (`project_id` is null for its whole life) and the triage agent
 /// derives the project itself, reading each candidate repo by absolute
 /// `local_path`. Same folder the global Terminal page uses
 /// (`config::workspace_dir`).
 ///
 /// The dedup set (`AppState::inbox_dispatched`) stands in for the
 /// todo-watcher's `in_progress` claim, which has no inbox equivalent — an
-/// item has no status column. Two of the triage skill's three outcomes remove
-/// the item (a viable request becomes a task and the item is deleted; a
-/// non-viable one is converted by `assign_inbox_item`), but the third leaves
-/// it **untouched** — no confident project match. Without the set, that third
+/// item has no status column. Two of the triage agent's three outcomes remove
+/// the item (a real request is converted into a backlog task by
+/// `assign_inbox_item`; a stale, duplicate or non-actionable one is archived
+/// with a reason), but the third leaves it **untouched** — no confident
+/// project match. Without the set, that third
 /// outcome would re-dispatch an agent for the same item every single tick,
 /// forever. Ids are claimed *before* the spawn (closing the window where a
 /// second tick fires while `claude --bg` is still starting) and released
@@ -390,17 +391,31 @@ fn inbox_watcher_tick(state: &AppState) {
         library::prompts(&store).unwrap_or_default()
     };
     for (id, session_name) in pending {
-        // The command — including which slash command triages an item — comes
-        // from `~/.mesa/config.json`'s `inbox-watcher` entry, defaulting to
-        // `claude --bg … -- /inbox-triage <id>`.
-        if let Err(e) = agents::spawn_bg(
-            config::INBOX_WATCHER,
-            &dispatch_dir,
-            Some(id),
-            Some(&session_name),
-            None,
-            &prompts,
-        ) {
+        // The default template spawns `--agent inbox-triage`, so the
+        // definition has to be on disk before the spawn — `claude --agent`
+        // errors on an agent it has never seen (mesa task 1168, the
+        // todo-watcher's `supervisor` rule). A failure is a failed spawn: the
+        // claim is released below and the next tick retries.
+        let seeded = {
+            let store = match state.store.lock() {
+                Ok(s) => s,
+                Err(e) => e.into_inner(),
+            };
+            inbox_triage::ensure_agent_definition(&store)
+        };
+        // The command — including which agent triages an item — comes from
+        // `~/.mesa/config.json`'s `inbox-watcher` entry, defaulting to
+        // `claude --bg --agent inbox-triage … -- "Triage mesa inbox item <id>."`.
+        if let Err(e) = seeded.and_then(|_| {
+            agents::spawn_bg(
+                config::INBOX_WATCHER,
+                &dispatch_dir,
+                Some(id),
+                Some(&session_name),
+                None,
+                &prompts,
+            )
+        }) {
             eprintln!("inbox-watcher: spawn failed for inbox item {id}: {e}");
             let mut dispatched = match state.inbox_dispatched.lock() {
                 Ok(d) => d,
@@ -2828,6 +2843,10 @@ struct InboxArchive {
     /// Where the item should end up: archived, or back in the live inbox.
     /// Required — the direction is the whole content of the request.
     archived: bool,
+    /// Why (mesa task 1168), stored as `archive_reason`; optional, and
+    /// ignored on the way back — the un-archive clears it.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 async fn list_inbox(
@@ -2886,7 +2905,10 @@ async fn archive_inbox(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
-    Ok(Json(store.set_inbox_item_archived(id, body.archived)?).into_response())
+    Ok(
+        Json(store.set_inbox_item_archived(id, body.archived, body.reason.as_deref())?)
+            .into_response(),
+    )
 }
 
 /// Speaks one inbox item: the item's body, verbatim, through `kokoro-rs`, back
@@ -11473,6 +11495,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             updated_at: String::new(),
             read_at: None,
             archived_at: None,
+            archive_reason: None,
             kind: InboxKind::ChangeRequest,
             task_id: Some(42),
             task_name: Some("make the watcher name sessions".into()),
@@ -11508,106 +11531,112 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `inbox-triage` agent definition under `$HOME`
+        // (mesa task 1168), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let origin = inbox_origin(&state);
-        let first = state
-            .store
-            .lock()
-            .unwrap()
-            .create_inbox_item(
-                Some("agent-7"),
-                "khora: eval errors on undefined",
-                InboxKind::ChangeRequest,
-                origin,
-            )
-            .unwrap();
-        let second = state
-            .store
-            .lock()
-            .unwrap()
-            .create_inbox_item(
-                None,
-                "loki: find exits 0 on no match",
-                InboxKind::ChangeRequest,
-                origin,
-            )
-            .unwrap();
+            let (_dir, state) = test_state();
+            let origin = inbox_origin(&state);
+            let first = state
+                .store
+                .lock()
+                .unwrap()
+                .create_inbox_item(
+                    Some("agent-7"),
+                    "khora: eval errors on undefined",
+                    InboxKind::ChangeRequest,
+                    origin,
+                )
+                .unwrap();
+            let second = state
+                .store
+                .lock()
+                .unwrap()
+                .create_inbox_item(
+                    None,
+                    "loki: find exits 0 on no match",
+                    InboxKind::ChangeRequest,
+                    origin,
+                )
+                .unwrap();
 
-        // The whole pending inbox goes out in one tick — the inbox is one
-        // global queue, with no per-project cap to pace it.
-        inbox_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            2,
-            "both pending items must dispatch in the first tick: {log:?}"
-        );
-        assert!(
-            log.contains(&format!("/inbox-triage {}", first.id))
-                && log.contains(&format!("/inbox-triage {}", second.id)),
-            "each dispatch's prompt must name its own item: {log:?}"
-        );
-        assert!(
-            log.contains(&format!(
-                "inbox {}: khora: eval errors on undefined",
-                first.id
-            )),
-            "session name must identify the item: {log:?}"
-        );
+            // The whole pending inbox goes out in one tick — the inbox is one
+            // global queue, with no per-project cap to pace it.
+            inbox_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                2,
+                "both pending items must dispatch in the first tick: {log:?}"
+            );
+            assert!(
+                log.contains(&format!("Triage mesa inbox item {}.", first.id))
+                    && log.contains(&format!("Triage mesa inbox item {}.", second.id)),
+                "each dispatch's prompt must name its own item: {log:?}"
+            );
+            assert!(
+                log.contains(&format!(
+                    "inbox {}: khora: eval errors on undefined",
+                    first.id
+                )),
+                "session name must identify the item: {log:?}"
+            );
 
-        // Second tick, same inbox: nothing re-dispatches.
-        inbox_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            2,
-            "an already-dispatched item must not dispatch again: {log:?}"
-        );
+            // Second tick, same inbox: nothing re-dispatches.
+            inbox_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                2,
+                "an already-dispatched item must not dispatch again: {log:?}"
+            );
 
-        // A newly-arrived item still dispatches on the next tick.
-        let third = state
-            .store
-            .lock()
-            .unwrap()
-            .create_inbox_item(
-                None,
-                "mesa: add an inbox watcher",
-                InboxKind::ChangeRequest,
-                origin,
-            )
-            .unwrap();
-        inbox_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            3,
-            "a new item must dispatch even though older ones are claimed: {log:?}"
-        );
-        assert!(
-            log.contains(&format!("/inbox-triage {}", third.id)),
-            "the new item's own id must be dispatched: {log:?}"
-        );
+            // A newly-arrived item still dispatches on the next tick.
+            let third = state
+                .store
+                .lock()
+                .unwrap()
+                .create_inbox_item(
+                    None,
+                    "mesa: add an inbox watcher",
+                    InboxKind::ChangeRequest,
+                    origin,
+                )
+                .unwrap();
+            inbox_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                3,
+                "a new item must dispatch even though older ones are claimed: {log:?}"
+            );
+            assert!(
+                log.contains(&format!("Triage mesa inbox item {}.", third.id)),
+                "the new item's own id must be dispatched: {log:?}"
+            );
 
-        // Triage removing an item prunes it from the set, so it can't grow
-        // unboundedly on a long-lived server.
-        state
-            .store
-            .lock()
-            .unwrap()
-            .delete_inbox_item(first.id)
-            .unwrap();
-        inbox_watcher_tick(&state);
-        assert!(
-            !state.inbox_dispatched.lock().unwrap().contains(&first.id),
-            "an item that left the inbox must be pruned from the dedup set"
-        );
+            // Triage removing an item prunes it from the set, so it can't grow
+            // unboundedly on a long-lived server.
+            state
+                .store
+                .lock()
+                .unwrap()
+                .delete_inbox_item(first.id)
+                .unwrap();
+            inbox_watcher_tick(&state);
+            assert!(
+                !state.inbox_dispatched.lock().unwrap().contains(&first.id),
+                "an item that left the inbox must be pruned from the dedup set"
+            );
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     /// Task 846: only a change request is triaged. A task summary is an agent
@@ -11620,58 +11649,64 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `inbox-triage` agent definition under `$HOME`
+        // (mesa task 1168), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let origin = inbox_origin(&state);
-        let summary = state
-            .store
-            .lock()
-            .unwrap()
-            .create_inbox_item(
-                Some("agent-7"),
-                "mesa task 846 is done: added inbox types",
-                InboxKind::TaskSummary,
-                origin,
-            )
-            .unwrap();
-        let request = state
-            .store
-            .lock()
-            .unwrap()
-            .create_inbox_item(
-                None,
-                "mesa: tint the inbox rows",
-                InboxKind::ChangeRequest,
-                origin,
-            )
-            .unwrap();
+            let (_dir, state) = test_state();
+            let origin = inbox_origin(&state);
+            let summary = state
+                .store
+                .lock()
+                .unwrap()
+                .create_inbox_item(
+                    Some("agent-7"),
+                    "mesa task 846 is done: added inbox types",
+                    InboxKind::TaskSummary,
+                    origin,
+                )
+                .unwrap();
+            let request = state
+                .store
+                .lock()
+                .unwrap()
+                .create_inbox_item(
+                    None,
+                    "mesa: tint the inbox rows",
+                    InboxKind::ChangeRequest,
+                    origin,
+                )
+                .unwrap();
 
-        inbox_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(
-            log.lines().count(),
-            1,
-            "only the change request may dispatch: {log:?}"
-        );
-        assert!(
-            log.contains(&format!("/inbox-triage {}", request.id)),
-            "{log:?}"
-        );
-        assert!(
-            !state.inbox_dispatched.lock().unwrap().contains(&summary.id),
-            "a summary is not claimed either — it was never a candidate"
-        );
+            inbox_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(
+                log.lines().count(),
+                1,
+                "only the change request may dispatch: {log:?}"
+            );
+            assert!(
+                log.contains(&format!("Triage mesa inbox item {}.", request.id)),
+                "{log:?}"
+            );
+            assert!(
+                !state.inbox_dispatched.lock().unwrap().contains(&summary.id),
+                "a summary is not claimed either — it was never a candidate"
+            );
 
-        // A second tick is not a delayed dispatch: the kind is fixed.
-        inbox_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert_eq!(log.lines().count(), 1, "{log:?}");
+            // A second tick is not a delayed dispatch: the kind is fixed.
+            inbox_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert_eq!(log.lines().count(), 1, "{log:?}");
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     /// A spawn failure must release the claim, so a transient `claude`
@@ -11683,43 +11718,49 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let stub_dir = tempfile::tempdir().unwrap();
-        let log_path = stub_dir.path().join("bg.log");
-        let bin = stub_claude_bg(stub_dir.path(), &log_path);
-        // `stub_claude_bg`'s `--bg` branch fails while this marker exists.
-        std::fs::write(stub_dir.path().join("fail"), "").unwrap();
-        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+        // A dispatch seeds the `inbox-triage` agent definition under `$HOME`
+        // (mesa task 1168), so this runs against a throwaway one rather than
+        // writing into whoever is running the tests. Taken *after* ENV_LOCK,
+        // the order every other test that needs both uses.
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            // `stub_claude_bg`'s `--bg` branch fails while this marker exists.
+            std::fs::write(stub_dir.path().join("fail"), "").unwrap();
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
 
-        let (_dir, state) = test_state();
-        let origin = inbox_origin(&state);
-        let item = state
-            .store
-            .lock()
-            .unwrap()
-            .create_inbox_item(
-                None,
-                "mesa: something to triage",
-                InboxKind::ChangeRequest,
-                origin,
-            )
-            .unwrap();
+            let (_dir, state) = test_state();
+            let origin = inbox_origin(&state);
+            let item = state
+                .store
+                .lock()
+                .unwrap()
+                .create_inbox_item(
+                    None,
+                    "mesa: something to triage",
+                    InboxKind::ChangeRequest,
+                    origin,
+                )
+                .unwrap();
 
-        inbox_watcher_tick(&state);
-        assert!(
-            !state.inbox_dispatched.lock().unwrap().contains(&item.id),
-            "a failed spawn must not leave the item claimed"
-        );
+            inbox_watcher_tick(&state);
+            assert!(
+                !state.inbox_dispatched.lock().unwrap().contains(&item.id),
+                "a failed spawn must not leave the item claimed"
+            );
 
-        // With the stub healthy again, the next tick dispatches it.
-        std::fs::remove_file(stub_dir.path().join("fail")).unwrap();
-        inbox_watcher_tick(&state);
-        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-        assert!(
-            log.contains(&format!("/inbox-triage {}", item.id)),
-            "the item must dispatch once the spawn succeeds: {log:?}"
-        );
+            // With the stub healthy again, the next tick dispatches it.
+            std::fs::remove_file(stub_dir.path().join("fail")).unwrap();
+            inbox_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(
+                log.contains(&format!("Triage mesa inbox item {}.", item.id)),
+                "the item must dispatch once the spawn succeeds: {log:?}"
+            );
 
-        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
     }
 
     // --- scripts: /api/scripts (mesa task 785) ------------------------------

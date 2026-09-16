@@ -52,6 +52,14 @@ read_at: string | null,
  */
 archived_at: string | null, 
 /**
+ * Why the item was set aside (mesa task 1168) — the archiver's verdict
+ * ("duplicate of task 12", "shipped in abc123", "completion summary; the
+ * record is task 40's result"), at most 1000 chars, or null. Written only
+ * by an archive and cleared by the un-archive, so it is null exactly when
+ * `archived_at` is.
+ */
+archive_reason: string | null, 
+/**
  * The task this item is **about** (mesa task 847) — required at creation,
  * because every item arrives from an agent working a task and an item with
  * no origin cannot say where it came from. Null only on a row that

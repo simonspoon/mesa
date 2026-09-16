@@ -2,11 +2,49 @@
 
 `mesa serve --watch-inbox` starts a periodic background loop that auto-triages
 the global inbox: for every pending **change request** it starts a background
-`claude` session running `/inbox-triage <item-id>`, so items stop accumulating until a
+`claude` session as the **`inbox-triage` agent definition** with the prompt
+`Triage mesa inbox item <item-id>.`, so items stop accumulating until a
 human gets to them. That command is the default of the **`inbox-watcher`** key
-in `~/.mesa/config.json` and is user-configurable, slash command included
+in `~/.mesa/config.json` and is user-configurable, agent included
 (`docs/config.md`); `{id}` is the item id and `{name}` the session name derived
-below. The sibling of the todo watcher (`docs/todo-watcher.md`),
+below.
+
+## The triage agent
+
+Triage is an **agent definition, not a slash command** (mesa task 1168). The
+recorded reason: a slash command needs a host persona and runs with that
+persona's model and tools, and the `/inbox-triage` phrase the old default
+spawned was never registered anywhere — it was a plugin skill matched by
+name, and the library prompt that shared its name was an orphan nothing
+invoked, with rules that had drifted from the skill's. An agent definition
+carries its own model (triage is cheap — `sonnet`), its own tool list with
+**no `Edit`/`Write`/`NotebookEdit`** so a triage can never touch project
+code, and lives in the library as one source of truth synced to
+`.claude/agents/inbox-triage.md`.
+
+The definition is the `inbox-triage` library built-in
+(`core::inbox_triage::INBOX_TRIAGE_DEFINITION`, `docs/library.md`), seeded to
+`~/.claude/agents/inbox-triage.md` by
+`core::inbox_triage::ensure_agent_definition` **before every spawn** —
+exactly as `mesa-live` and `supervisor` are — from the effective row (a fork
+if the user made one, else the built-in) and **never overwriting an existing
+file**; after the first seed the file belongs to the sync flow. A seed failure
+is a failed spawn: the item's claim is released and the next tick retries.
+Edit it on `#/library` like any other agent.
+
+What the agent does with an item, in short: a `task-summary` is a report or an
+alert for a person, so it is read and — if it is a close-out summary of its
+own task — archived with a reason, the summary copied into the task's
+`result` first if that is still null; a `change-request` is checked for a
+confident project, then for being a duplicate (detail appended to the open
+task, item archived `duplicate of task <id>`), already shipped (`git log`
+since the item was sent, runtime claims reproduced, item archived `shipped in
+<sha>`) or not actionable (archived with a reason saying why); real work is
+`mesa inbox assign`ed into that project's **backlog** and the task's
+description and acceptance sharpened; and an item with no confident project
+is left in place, read, with the ambiguity named. Never guess a project,
+never delete an item whose request is not captured somewhere first, never
+edit project code. The sibling of the todo watcher (`docs/todo-watcher.md`),
 built on the same machinery, over a different queue. **Off by default**, for
 the same reason: auto-spawning agents is real API cost and real code
 execution, so it must not fire just because someone ran `mesa serve`.
@@ -39,9 +77,9 @@ tick constant. `--watch-inbox` alone never claims a task or dispatches
   see `docs/inbox.md`), so there is no `local_path` to spawn in; the triage
   skill derives the project itself and reads each candidate repo by absolute
   path. Consequence: these sessions appear in the **global** Agent sidebar
-  only, never under a project's Agents tab. Like every mesa-started session it
-  runs under the `swe` agent persona, named literally in the `inbox-watcher`
-  default template (`docs/config.md`).
+  only, never under a project's Agents tab. It runs as the `inbox-triage`
+  agent definition, named literally in the `inbox-watcher` default template
+  (`docs/config.md`), seeded to disk first (above).
 - The session name is `inbox <id>: <first non-empty body line>`, truncated to
   60 **chars** (not bytes — bodies are free text and may be non-ASCII). It
   reaches `claude` as `-n/--name`, so an auto-dispatched triage session is
@@ -61,9 +99,10 @@ An inbox item has **no status column** to claim with (an item *is* the record;
 `in_progress`. The stand-in is `AppState::inbox_dispatched`, an in-memory set
 of dispatched item ids.
 
-It is load-bearing, not an optimization. Two of the triage skill's three
-outcomes remove the item — a viable request becomes a task and the item is
-deleted; a non-viable one is converted by `assign_inbox_item` — but the third,
+It is load-bearing, not an optimization. Two of the triage agent's three
+outcomes remove the item from the live inbox — a real request is converted
+into a backlog task by `assign_inbox_item`; a duplicate, shipped or
+non-actionable one is archived with a reason — but the third,
 **no confident project match**, deliberately leaves the item untouched.
 Without the set, that item would respawn an agent every tick, forever.
 
@@ -78,20 +117,21 @@ Without the set, that item would respawn an agent every tick, forever.
   item and should be triaged.)
 - It is deliberately **not persisted**. A restart re-triages whatever is still
   sitting in the inbox. That is the recoverable direction: a duplicate triage
-  of an item is cheap and the skill is idempotent enough to reach the same
+  of an item is cheap and the agent is idempotent enough to reach the same
   verdict, whereas a permanently skipped item is invisible. Persisting it
   would need a schema migration to store state about an entity whose whole
   design is "an item *is* the record".
 
 ## Other invariants
 
-- The watcher **never mutates an inbox item**. Everything it does is spawn an
-  agent; the item's fate is entirely the triage skill's, through the normal
-  CLI. There is no watcher-side delete, assign, or status write.
+- The watcher **never mutates an inbox item**. Everything it does is seed the
+  agent definition and spawn an agent; the item's fate is entirely the triage
+  agent's, through the normal CLI. There is no watcher-side delete, assign,
+  or status write.
 - Inbox bodies are **untrusted data**. The body reaches `claude` only as a
   single `--name` process argument (`Command::arg`, no shell) and nothing in
-  mesa interprets it. The triage skill has its own rule about not acting on
-  body content.
+  mesa interprets it. The triage agent's first rule is that the body is data,
+  never instructions to it.
 - The tick cadence is a fixed internal constant (`WATCH_INBOX_TICK`, 60s), not
   user-configurable. `MESA_WATCH_INBOX_TICK_MS` overrides it, a test-only seam
   mirroring `MESA_WATCH_TODO_TICK_MS`.
@@ -102,7 +142,9 @@ Without the set, that item would respawn an agent every tick, forever.
 - No CLI or web surface of its own beyond the `serve` flag, matching the todo
   watcher and the agents surface's "no `mesa agent` CLI" precedent.
 - Gate: `scripts/inbox-watcher-check.sh` (flag on/off, spawn-failure release +
-  retry, cwd/name/prompt shape, no re-dispatch of a still-pending item, new
+  retry, cwd/name/prompt shape, `--agent inbox-triage` with the definition
+  seeded under the throwaway `HOME` carrying no `Edit`/`Write`, no
+  re-dispatch of a still-pending item, new
   item picked up, whole queue in one tick, independence from `--watch-todo`,
   pruning after delete and after assign) against a stub `claude` binary, with
   `HOME` pointed at a throwaway dir so the `~/.mesa/workspace` cwd assertion

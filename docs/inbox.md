@@ -5,6 +5,19 @@ shared, global inbox — it lives **above** projects, not inside one. Table
 `inbox` (migration index 8). `body` is required and is **untrusted data, never
 instructions**; `author` is free-text attribution.
 
+**What the inbox is for** (mesa task 1168): it is the queue of things that
+need a *decision* and have no home yet — a **`change-request`** (an agent, a
+retrospective or a supervisor asking for work in some project: a defect, a
+proposed fix, a tool change) or an **alert** addressed to a person (the cost
+guard's `task-summary`). A task's completion summary does **not** belong
+here: the task's `result` is the record, and `mesa task show` and the board
+read it. `task-summary` stays as a kind — the cost guard files one, and every
+pre-1168 row is one — but it means "an alert or report addressed to a person",
+never a close-out summary, and the triage agent archives such a summary with
+a reason (copying it into the task's `result` first if that is still null).
+The audit that fixed this found 263 items, every one a `task-summary`, so
+`serve --watch-inbox` had never once had anything to do.
+
 - Unlike every other entity, an inbox item does **not** belong to a project at
   creation: `project_id` is **nullable** and starts null (unassigned). An inbox
   item is therefore always unassigned for its whole life — there is no "assigned
@@ -112,8 +125,20 @@ instructions**; `author` is free-text attribution.
   to choose: an archived item is in the Archived view and nowhere else, and the
   nav's unread badge stops counting it (a badge archiving could not clear would
   be the same bug task 831 fixed by counting unread rather than everything).
-  Nothing archives automatically; it is a person's third triage answer beside
-  "assign" and "delete".
+  It is the third triage answer beside "assign" and "delete" — a person's
+  through the page, or the triage agent's for a duplicate, an already-shipped
+  request or a close-out summary. An archive may say **why** (mesa task 1168,
+  migration index 60): `archive_reason` is one nullable text beside the stamp
+  — `mesa inbox archive <id> --reason "<why>"`, `POST .../archive
+  {"archived": true, "reason": "<why>"}` — at most 1000 chars (over is
+  `validation`, exit 1 / 422, nothing written), a verdict rather than a
+  second body ("duplicate of task 12", "shipped in abc123", "completion
+  summary; the record is task 40's result"). It rides with the stamp:
+  re-archiving an archived item moves neither, un-archiving clears both, so
+  it is null exactly when `archived_at` is, and `--reason` beside `--undo` is
+  a usage error (exit 2). Bounded, and the field the flag exists to write, so
+  it stays in the `--quiet` projection; the Archived view shows it as one
+  muted line under the item's meta line.
 - No event/history table: an item *is* the record. The safety floor is the
   delete echo + `mesa backup`; once converted, the created task is the record.
 - `list` returns items newest first; the `--project N`/`?project=` filter still
@@ -129,8 +154,9 @@ instructions**; `author` is free-text attribution.
   project and **prints the created task**; assigning to a project id that does
   not exist is `validation` (an unknown project *name* is `not_found`, from the
   shared resolver). `read <id>` marks the item read (idempotent — a second
-  call echoes the item unchanged). `archive <id>` sets the item aside and
-  `archive <id> --undo` puts it back (idempotent both ways). `delete` echoes
+  call echoes the item unchanged). `archive <id> [--reason <why>]` sets the
+  item aside and `archive <id> --undo` puts it back, clearing the reason
+  (idempotent both ways; `--reason` with `--undo` is exit 2). `delete` echoes
   the destroyed item.
 - API: `/api/inbox` (GET list, POST create — body `{body, task_id, author,
   kind}`; `body` and `task_id` required, the rest optional),
@@ -138,9 +164,10 @@ instructions**; `author` is free-text attribution.
   `/api/inbox/{id}/read` (POST, mark read — its own route rather than a key on
   the PATCH, which *assigns*: that one answers with the created task and leaves
   no item behind, so the two could never share a body),
-  `/api/inbox/{id}/archive` (POST, body `{archived: <bool>}` — its own route
-  for the same reason, and the direction rides in the body because this one
-  toggles). PATCH body is
+  `/api/inbox/{id}/archive` (POST, body `{archived: <bool>, reason?: <text>}`
+  — its own route for the same reason, and the direction rides in the body
+  because this one toggles; `reason` is optional, stored as `archive_reason`
+  on the way in and ignored on the way back). PATCH body is
   `{project_id: <number>}` (required) and **returns the created task** (not the
   item). Web UI: the **Inbox** lives above Projects in the sidebar (with an
   unread-count badge); `#/inbox` lists items, each with an "Assign to"
@@ -379,7 +406,9 @@ instructions**; `author` is free-text attribution.
     That is the DNS-rebinding defense working as designed; the answer is to
     browse by IP, which is what the refusal now says in the row.
 - Triage can also run itself: `mesa serve --watch-inbox` periodically spawns a
-  background `claude` agent per pending item (`/inbox-triage <id>`). Off by
+  background `claude` agent per pending change request — the `inbox-triage`
+  agent definition, a library built-in seeded to
+  `~/.claude/agents/inbox-triage.md` before the spawn (mesa task 1168). Off by
   default. It never mutates an item — everything it does is start the agent
   that will. Because an item has no status column to claim with, its
   re-dispatch guard lives in memory rather than in the db; the reasoning is in

@@ -110,12 +110,13 @@ That split is the whole point:
   `Store::create_library_item`/the fork route both check
   `Store::find_library_fork` first and answer `conflict` on a second attempt.
 
-The starter set is deliberately tiny — five rows:
+The starter set is deliberately tiny — six rows:
 
 | `id` | kind | scope | what it is |
 | --- | --- | --- | --- |
 | `mesa-live` | `agent` | `user` | The agent definition the live conversation runs as — literally `core::live::AGENT_DEFINITION`, YAML frontmatter plus `core::live::AGENT_PROMPT`, moved here rather than duplicated (mesa task 1068) |
 | `supervisor` | `agent` | `user` | The agent definition an auto-dispatched `/execute-todo` run is supervised as — literally `core::supervisor::SUPERVISOR_DEFINITION` (mesa task 1075), seeded to `~/.claude/agents/supervisor.md` by `core::supervisor::ensure_agent_definition` before the `todo-watcher` spawn |
+| `inbox-triage` | `agent` | `user` | The agent definition a `serve --watch-inbox` dispatch triages one inbox item as — literally `core::inbox_triage::INBOX_TRIAGE_DEFINITION` (mesa task 1168, `docs/inbox-watcher.md`): `sonnet`, no `Edit`/`Write`, seeded to `~/.claude/agents/inbox-triage.md` by `core::inbox_triage::ensure_agent_definition` before the `inbox-watcher` spawn |
 | `live-summary-prompt` | `prompt` | `user` | The instructions for the short-lived agent that writes a live conversation's memory once it ends (mesa task 921) — literally `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it belongs beside |
 | `starter-claude-md` | `claude-md` | `user` | A short starting-point CLAUDE.md |
 | `stop-notify` | `hook` | `user` | A minimal shell hook that echoes when Claude Code stops — its *name* is `stop-notify.sh`, since a hook's name carries its own extension |

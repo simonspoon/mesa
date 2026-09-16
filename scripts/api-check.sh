@@ -814,6 +814,29 @@ api 200 GET "/api/inbox/$ARCH_ID"
 [ "$(jqb .archived_at)" = "null" ] || fail "inbox archive: the clear must persist"
 ok "POST /api/inbox/{id}/archive: toggles back, unlike the read mark"
 
+# The archive may say why (mesa task 1168): `reason` is stored as
+# `archive_reason`, rides with the stamp (re-archiving moves neither), is
+# cleared by the un-archive, and is refused past 1000 chars writing nothing.
+# The old `{archived: <bool>}` body still works — the key is optional.
+api 200 POST "/api/inbox/$ARCH_ID/archive" '{"archived":true,"reason":"duplicate of task 12"}'
+[ "$(jqb .archive_reason)" = "duplicate of task 12" ] ||
+  fail "inbox archive: reason must be stored as archive_reason"
+api 200 POST "/api/inbox/$ARCH_ID/archive" '{"archived":true,"reason":"a second verdict"}'
+[ "$(jqb .archive_reason)" = "duplicate of task 12" ] ||
+  fail "inbox archive: re-archiving must not move the reason"
+api 200 GET "/api/inbox/$ARCH_ID"
+[ "$(jqb .archive_reason)" = "duplicate of task 12" ] || fail "inbox archive: the reason must persist"
+api 200 POST "/api/inbox/$ARCH_ID/archive" '{"archived":false}'
+[ "$(jqb .archive_reason)" = "null" ] ||
+  fail "inbox archive: the un-archive must clear the reason with the stamp"
+LONG_REASON=$(printf 'x%.0s' $(seq 1 1001))
+api 422 POST "/api/inbox/$ARCH_ID/archive" "{\"archived\":true,\"reason\":\"$LONG_REASON\"}"
+[ "$(jqb .error.code)" = "validation" ] ||
+  fail "inbox archive: a reason over 1000 chars must be validation"
+api 200 GET "/api/inbox/$ARCH_ID"
+[ "$(jqb .archived_at)" = "null" ] || fail "inbox archive: an over-length reason must write nothing"
+ok "POST /api/inbox/{id}/archive: reason stored as archive_reason, kept on re-archive, cleared by undo, 422 past 1000 chars writing nothing"
+
 api 404 POST "/api/inbox/999999/archive" '{"archived":true}'
 [ "$(jqb .error.code)" = "not_found" ] ||
   fail "inbox archive: unknown id must be not_found"

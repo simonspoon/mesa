@@ -708,6 +708,15 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
                       <span className="inbox-unread"> · unread</span>
                     )}
                   </div>
+                  {/* Why it was set aside (mesa task 1168) — the archiver's
+                      verdict, one muted line under the meta line, only where
+                      there is one: the Archived view is where a reader asks
+                      "why is this here". */}
+                  {item.archive_reason !== null && (
+                    <div className="muted diagram-meta">
+                      archived: {item.archive_reason}
+                    </div>
+                  )}
                   {speakError?.id === item.id && (
                     <span className="error">{speakError.message}</span>
                   )}

@@ -32,7 +32,7 @@ use crate::core::{
     LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority,
     Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch,
     Status, Store, Task, TaskPatch, TaskReceipt, agents, board, cc, config, files, library, live,
-    look, receipt, retro, system,
+    look, migrate, receipt, retro, system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -126,6 +126,10 @@ enum Command {
     /// finding log (mesa task 1158)
     #[command(subcommand)]
     Retro(RetroCmd),
+    /// Move mesa and Claude Code's home directory to a new computer
+    /// (docs/migrate.md)
+    #[command(subcommand)]
+    Migrate(MigrateCmd),
 
     /// Start the HTTP server and web UI
     ///
@@ -1591,6 +1595,70 @@ EXAMPLES
 /// It proposes; it never edits an agent, a skill, a config file or project
 /// code. `serve --watch-retro` runs it every `watchers.retro-interval-hours`;
 /// these verbs run it by hand and hold its finding log.
+#[derive(Subcommand)]
+enum MigrateCmd {
+    /// Dry run: what export would bundle, and the hard-coded paths import
+    /// would rewrite
+    ///
+    /// Read-only. Prints `{home, db, items, hardcoded, projects, repo_root}`:
+    /// every item export would bundle (`path`, `present`, `bytes`, `files`)
+    /// and every absolute path under $HOME found in the text files import
+    /// rewrites (`file`, `line`, `match`).
+    #[command(after_help = "\
+EXAMPLES
+  mesa migrate check
+  mesa migrate check | jq '.hardcoded[] | .file' | sort -u")]
+    Check,
+    /// Bundle the db, ~/.mesa/config.json and ~/.claude into a tar.gz
+    ///
+    /// The db is snapshotted with `VACUUM INTO` (safe while `serve` runs).
+    /// From ~/.claude: CLAUDE.md, settings*.json, keybindings.json,
+    /// statusline-command.sh, agents/, hooks/, commands/, skills/,
+    /// output-styles/, the two plugin lists and every projects/*/memory/.
+    /// Missing items are skipped and listed under `skipped`. The archive must
+    /// not already exist.
+    #[command(after_help = "\
+EXAMPLES
+  mesa migrate export ~/mesa-move.tar.gz
+  mesa migrate export /Volumes/usb/move.tar.gz --with-sessions")]
+    Export {
+        /// Archive to write (.tar.gz); must not already exist
+        archive: PathBuf,
+        /// Also bundle every session transcript under ~/.claude/projects and
+        /// ~/.claude/history.jsonl (large)
+        #[arg(long)]
+        with_sessions: bool,
+    },
+    /// Restore an archive into this $HOME, rewriting absolute paths
+    ///
+    /// Paths under the archive's home move under this $HOME (or as
+    /// --home-map says), and with --repo-root the archive's repo_root moves
+    /// to DIR first — longest prefix wins, matched on a path boundary. Applied
+    /// to every project's local_path, the text of the restored config and
+    /// ~/.claude files, and the names of ~/.claude/projects/<encoded> dirs.
+    /// Refuses with `conflict` (exit 1, nothing written) if the db exists or a
+    /// file it would restore exists with different content, unless --force.
+    #[command(after_help = "\
+EXAMPLES
+  mesa migrate import ~/mesa-move.tar.gz
+  mesa migrate import move.tar.gz --home-map /Users/old=/Users/new
+  mesa migrate import move.tar.gz --repo-root ~/code")]
+    Import {
+        /// Archive written by `mesa migrate export`
+        archive: PathBuf,
+        /// OLD=NEW home prefix mapping (default: the archive's home onto $HOME)
+        #[arg(long, value_name = "OLD=NEW")]
+        home_map: Option<String>,
+        /// Where the archive's repo_root (common ancestor of every project's
+        /// local_path) lives on this machine
+        #[arg(long, value_name = "DIR")]
+        repo_root: Option<String>,
+        /// Overwrite an existing db and differing files
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum RetroCmd {
     /// Start a retrospective now: records a `manual` run and spawns the agent
@@ -3685,6 +3753,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Attachment(cmd) => run_attachment(cmd),
         Command::Cc(cmd) => run_cc(cmd),
         Command::Retro(cmd) => run_retro(cmd),
+        Command::Migrate(cmd) => run_migrate(cmd),
         Command::Serve {
             port,
             lan,
@@ -5177,6 +5246,46 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
 /// the twin of `api::retro_watcher_tick`: the same claim-then-spawn order
 /// (the run row is written first, so a concurrent watcher tick sees it), the
 /// same seeded definition, the same template and the same rollback.
+fn run_migrate(cmd: MigrateCmd) -> Result<()> {
+    let home = migrate::home_dir();
+    let db = crate::core::default_db_path();
+    match cmd {
+        MigrateCmd::Check => {
+            // Read-only: never create a db that is not there.
+            let store = if db.exists() {
+                Some(Store::open(&db)?)
+            } else {
+                None
+            };
+            print_json(&migrate::check(&home, &db, store.as_ref())?);
+        }
+        MigrateCmd::Export {
+            archive,
+            with_sessions,
+        } => {
+            let store = Store::open(&db)?;
+            print_json(&migrate::export(&store, &home, &archive, with_sessions)?);
+        }
+        MigrateCmd::Import {
+            archive,
+            home_map,
+            repo_root,
+            force,
+        } => {
+            let opts = migrate::ImportOptions {
+                home_map: home_map
+                    .as_deref()
+                    .map(migrate::parse_home_map)
+                    .transpose()?,
+                repo_root,
+                force,
+            };
+            print_json(&migrate::import(&archive, &home, &db, &opts)?);
+        }
+    }
+    Ok(())
+}
+
 fn run_retro(cmd: RetroCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {

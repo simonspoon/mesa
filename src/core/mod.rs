@@ -12,6 +12,7 @@ pub mod library;
 pub mod listen;
 pub mod live;
 pub mod look;
+pub mod migrate;
 pub mod receipt;
 pub mod retro;
 

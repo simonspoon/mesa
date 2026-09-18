@@ -73,6 +73,29 @@ tests and checks for isolation, and useful for pointing at a throwaway database:
 MESA_DB=/tmp/test.db mesa task list
 ```
 
+## Moving to a new computer
+
+`mesa migrate` moves the database, `~/.mesa/config.json` and your Claude Code
+setup (`~/.claude` agents, hooks, skills, commands, settings, `CLAUDE.md` and
+per-project memories) in one archive, rewriting absolute paths for a new
+username or repo location:
+
+```bash
+# old machine
+mesa migrate check                     # what would move, and every hard-coded path
+mesa migrate export ~/move.tar.gz      # add --with-sessions for transcripts too
+
+# new machine (copy the archive over first)
+mesa migrate import ~/move.tar.gz      # old home → this $HOME
+mesa migrate import ~/move.tar.gz --repo-root ~/code   # repos live elsewhere now
+```
+
+Import refuses (`conflict`, nothing written) if a database or differing file
+is already there, unless `--force`, and ends with a `todo` list: clone each
+project's repo to its mapped path, install the mesa/qorvex/khora/loki
+binaries, log in to Claude Code, re-enable plugins. Details in
+[`docs/migrate.md`](docs/migrate.md).
+
 ## CLI quick start
 
 Every command prints JSON to stdout. By default mutations and `show` print the

@@ -7359,6 +7359,22 @@ impl Store {
             .execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
         Ok(())
     }
+
+    /// `PRAGMA quick_check`: `validation` naming the first problem unless the
+    /// database file is intact — how `migrate import` proves a snapshot
+    /// before it replaces anything with it.
+    pub fn quick_check(&self) -> Result<()> {
+        let verdict: String = self
+            .conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if verdict == "ok" {
+            Ok(())
+        } else {
+            Err(Error::Validation(format!(
+                "database integrity check failed: {verdict}"
+            )))
+        }
+    }
 }
 
 /// Appends every project under `parent` to `out`, depth-first, each level in

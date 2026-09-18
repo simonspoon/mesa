@@ -82,12 +82,33 @@ The mappings are applied to:
    is renamed to the encoded `to` plus the rest; a name continuing with
    anything else is left alone.
 
+   **The encoding cannot tell `-` from `/`.** A sibling of the home whose name
+   carries a literal hyphen — `/Users/sim-two` — encodes to `-Users-sim-two`,
+   exactly what `/Users/sim/two` encodes to, so it reads as *under*
+   `/Users/sim` and is renamed along with the home
+   (`-Users-new-two`). mesa cannot know which it was; nothing short of Claude
+   Code's own records could tell them apart, so this is documented rather
+   than guessed at. Such a dir is rare (a path outside your home), and a
+   rename it did not need is visible in import's `renamed` list.
+
 File mode bits are preserved (hooks stay executable); a symlink's target is
 rewritten like any other path.
 
 ## Refusal
 
-Import plans every write before making any. If the target db exists, or any
+The database is prepared **before** anything is written: the snapshot is
+opened in the scratch dir (migrating an older schema), proved with `PRAGMA
+quick_check` (`Store::quick_check`), and has its `local_path`s moved there.
+A snapshot that fails any of that is `validation` — even under `--force` —
+with the existing db untouched. Only then is it copied to a temp file beside
+the target and renamed into place (the old `-wal`/`-shm` removed right after,
+so they are never replayed onto it). Empty directories in the archive (an
+empty memory dir) are recreated, renamed like any other path.
+
+Import plans every write before making any. Two archive entries landing on
+one target — two encoded dirs renamed onto the same name — are `conflict`
+naming both, and `--force` does not override it, since either write would
+silently lose the other. If the target db exists, or any
 file it would restore already exists with **different** content, it refuses
 with `conflict` (exit 1) listing every such path and writes nothing. A file
 already holding exactly the restored content counts as `unchanged` and is no

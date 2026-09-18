@@ -84,6 +84,9 @@ DECOY="$(enc "$SRC")x-other"
 mkdir -p "$SRC/.claude/projects/$DECOY/memory"
 echo decoy >"$SRC/.claude/projects/$DECOY/memory/MEMORY.md"
 echo '{"display":"hi"}' >"$SRC/.claude/history.jsonl"
+# An empty memory dir: archived, and it must come back (renamed) on import.
+EMPTY_SRC="$SRC/.claude/projects/$(enc "$SRC/inaros/qorvex")/memory"
+mkdir -p "$EMPTY_SRC"
 
 run 0 as_src project create mesa --path "$SRC/inaros/mesa" --no-git
 run 0 as_src project create qorvex --path "$SRC/inaros/qorvex" --no-git
@@ -137,6 +140,9 @@ MEM_DST="$DST/.claude/projects/$(enc "$DST/inaros/mesa")"
 [ ! -e "$DST/.claude/projects/$(enc "$SRC/inaros/mesa")" ] || fail "import: old encoded dir left behind"
 [ ! -e "$MEM_DST/session-1.jsonl" ] || fail "import: session present without --with-sessions"
 [ -f "$DST/.claude/projects/$DECOY/memory/MEMORY.md" ] || fail "import: decoy dir must keep its name"
+EMPTY_DST="$DST/.claude/projects/$(enc "$DST/inaros/qorvex")/memory"
+[ -d "$EMPTY_DST" ] && [ -z "$(ls -A "$EMPTY_DST")" ] || fail "import: empty memory dir not recreated (renamed)"
+[ ! -e "$DST/.claude/projects/$(enc "$SRC/inaros/qorvex")" ] || fail "import: empty dir kept its old name"
 jqs '.renamed[].to' | grep -qxF -- "$(enc "$DST/inaros/mesa")" || fail "import: rename reported"
 grep -q "$DST/.claude/hooks/guard.sh" "$DST/.claude/settings.json" || fail "import: hook path rewritten"
 grep -q "bash $DST/.claude/statusline-command.sh" "$DST/.claude/settings.json" || fail "import: statusLine rewritten"
@@ -164,6 +170,23 @@ ok "second import without --force is conflict and writes nothing"
 run 0 as_dst migrate import "$TMP/move.tar.gz" --force
 grep -q "$DST/.claude/hooks/guard.sh" "$DST/.claude/settings.json" || fail "--force: settings restored"
 ok "--force overwrites"
+
+# ================= a corrupt snapshot never replaces the db =================
+# A valid archive whose mesa.db is truncated: even --force must refuse it as
+# validation before the existing db (or anything else) is touched.
+mkdir -p "$TMP/bad"
+tar -xzf "$TMP/move.tar.gz" -C "$TMP/bad"
+head -c 4096 "$TMP/bad/mesa.db" >"$TMP/bad/mesa.db.cut"
+mv "$TMP/bad/mesa.db.cut" "$TMP/bad/mesa.db"
+(cd "$TMP/bad" && tar -czf "$TMP/corrupt.tar.gz" manifest.json mesa.db .claude .mesa)
+BEFORE=$(cd "$DST" && find . -type f -exec shasum {} + | sort; shasum "$DST_DB")
+run 1 as_dst migrate import "$TMP/corrupt.tar.gz" --force
+[ "$(jqe .error.code)" = validation ] || fail "corrupt snapshot: validation, got $STDERR"
+jqe .error.message | grep -q "mesa.db is unusable" || fail "corrupt snapshot: message names the db"
+AFTER=$(cd "$DST" && find . -type f -exec shasum {} + | sort; shasum "$DST_DB")
+[ "$BEFORE" = "$AFTER" ] || fail "corrupt snapshot: the existing db or a file changed"
+[ "$(as_dst project list | jq length)" -eq 2 ] || fail "corrupt snapshot: existing db still opens"
+ok "a truncated mesa.db + --force is validation and leaves the db unchanged"
 
 # ================= --with-sessions + --repo-root =================
 run 0 as_src migrate export "$TMP/full.tar.gz" --with-sessions

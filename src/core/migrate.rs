@@ -15,7 +15,7 @@
 //! CLI only: there is no HTTP route, since this reads and writes the home
 //! directory.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -267,6 +267,27 @@ fn walk(base: &Path, root: &Path, out: &mut Vec<String>) -> Result<()> {
     } else {
         let rel = root.strip_prefix(base).unwrap_or(root);
         out.push(rel.to_string_lossy().into_owned());
+    }
+    Ok(())
+}
+
+/// Every directory under `root` (itself included) holding no entries at all,
+/// as paths relative to `base` — `walk` lists only files, so these would
+/// otherwise vanish on import.
+fn walk_empty_dirs(base: &Path, root: &Path, out: &mut Vec<String>) -> Result<()> {
+    if !fs::symlink_metadata(root)?.is_dir() {
+        return Ok(());
+    }
+    let mut entries: Vec<PathBuf> = fs::read_dir(root)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()?;
+    if entries.is_empty() {
+        let rel = root.strip_prefix(base).unwrap_or(root);
+        out.push(rel.to_string_lossy().into_owned());
+    }
+    entries.sort();
+    for e in entries {
+        walk_empty_dirs(base, &e, out)?;
     }
     Ok(())
 }
@@ -591,6 +612,34 @@ fn import_mappings(manifest: &Value, home: &Path, opts: &ImportOptions) -> Resul
     Ok(maps)
 }
 
+/// Opens the extracted snapshot (migrating an older schema), proves it with
+/// `quick_check`, and moves every project's `local_path` through
+/// `Store::update_project` — all on the scratch copy, before the real db is
+/// touched. Returns the remapped projects; the store is closed on return, so
+/// its WAL is checkpointed back into the file.
+fn prepare_snapshot(snapshot: &Path, mappings: &[Mapping]) -> Result<Vec<Value>> {
+    let mut store = Store::open(snapshot)?;
+    store.quick_check()?;
+    let mut remapped = Vec::new();
+    for project in store.list_projects_all()? {
+        let Some(old) = project.local_path.clone() else {
+            continue;
+        };
+        let new = rewrite_text(&old, mappings);
+        if new != old {
+            store.update_project(
+                project.id,
+                &ProjectPatch {
+                    local_path: Some(Some(new.clone())),
+                    ..Default::default()
+                },
+            )?;
+            remapped.push(json!({"id": project.id, "name": project.name, "from": old, "to": new}));
+        }
+    }
+    Ok(remapped)
+}
+
 /// Restores an archive under `home` and the db at `db_path`. Refuses with
 /// `conflict`, writing nothing, when the db exists or any file it would
 /// write already exists with different content — unless `opts.force`.
@@ -637,16 +686,30 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
     }
     let mappings = import_mappings(&manifest, home, opts)?;
 
+    // The db is prepared entirely inside the scratch dir — opened (which
+    // migrates an older schema), integrity-checked, and its local_paths
+    // moved through the Store — so a snapshot that cannot be used is
+    // `validation` before anything at `db_path` is touched.
+    let remapped = prepare_snapshot(&snapshot, &mappings)
+        .map_err(|e| Error::Validation(format!("the archive's mesa.db is unusable: {e}")))?;
+
     // Plan every write before making any, so a refusal writes nothing.
     let mut extracted = Vec::new();
+    let mut empty_dirs = Vec::new();
     for top in [".claude", ".mesa"] {
         let root = scratch.0.join(top);
         if fs::symlink_metadata(&root).is_ok() {
             walk(&scratch.0, &root, &mut extracted)?;
+            walk_empty_dirs(&scratch.0, &root, &mut empty_dirs)?;
         }
     }
     let mut plan = Vec::new();
     let mut renamed = BTreeSet::new();
+    // Every target, with the archive path that planned it: two archive
+    // entries landing on one target (two encoded dirs renamed onto one name)
+    // is a conflict no --force can settle, since either would silently lose.
+    let mut claimed: HashMap<PathBuf, String> = HashMap::new();
+    let mut collisions = Vec::new();
     for rel in extracted {
         let src = scratch.0.join(&rel);
         let meta = fs::symlink_metadata(&src)?;
@@ -676,16 +739,47 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
                 mode: meta.permissions().mode() & 0o7777,
             }
         };
+        let target = home.join(&target_rel);
+        if let Some(first) = claimed.insert(target.clone(), rel.clone()) {
+            collisions.push(format!(
+                "{first} and {rel} both restore to {}",
+                target.display()
+            ));
+        }
         plan.push(Planned {
-            target: home.join(&target_rel),
+            target,
             rel: target_rel,
             content,
             rewritten,
         });
     }
+    if !collisions.is_empty() {
+        return Err(Error::Conflict(format!(
+            "the archive maps more than one entry onto the same path: {}",
+            collisions.join("; ")
+        )));
+    }
     let mut conflicts = Vec::new();
     if fs::symlink_metadata(db_path).is_ok() {
         conflicts.push(db_path.to_string_lossy().into_owned());
+    }
+    // Empty directories (an empty memory dir) are restored too, renamed
+    // like any other path; one that exists as a non-directory conflicts.
+    let mut dirs = Vec::new();
+    for rel in empty_dirs {
+        let (target_rel, rename) = map_rel(&rel, &mappings);
+        if let Some(r) = rename {
+            renamed.insert(r);
+        }
+        let target = home.join(&target_rel);
+        match fs::symlink_metadata(&target) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                conflicts.push(target.to_string_lossy().into_owned());
+                dirs.push(target);
+            }
+            Err(_) => dirs.push(target),
+        }
     }
     let mut unchanged = 0;
     let mut writes = Vec::new();
@@ -707,34 +801,37 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
         )));
     }
 
-    // The db first: a snapshot copied into place, then every project's
-    // local_path moved through the Store.
-    if let Some(dir) = db_path.parent() {
-        fs::create_dir_all(dir)?;
+    // The db first: the prepared snapshot is copied to a temp file beside
+    // `db_path` and renamed into place, so a failed copy leaves the old db
+    // whole. An old -wal/-shm would be replayed onto the new file, so they
+    // go the moment it is in place.
+    let dir = db_path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+    let file_name = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mesa.db".into());
+    let staged = dir.join(format!(".{file_name}.migrate-{}", std::process::id()));
+    if let Err(e) = fs::copy(&snapshot, &staged) {
+        let _ = fs::remove_file(&staged);
+        return Err(e.into());
     }
-    for suffix in ["", "-wal", "-shm"] {
+    if let Err(e) = fs::rename(&staged, db_path) {
+        let _ = fs::remove_file(&staged);
+        return Err(e.into());
+    }
+    for suffix in ["-wal", "-shm"] {
         let mut p = db_path.as_os_str().to_owned();
         p.push(suffix);
         let _ = fs::remove_file(PathBuf::from(p));
     }
-    fs::copy(&snapshot, db_path)?;
-    let mut store = Store::open(db_path)?;
-    let mut remapped = Vec::new();
-    for project in store.list_projects_all()? {
-        let Some(old) = project.local_path.clone() else {
-            continue;
-        };
-        let new = rewrite_text(&old, &mappings);
-        if new != old {
-            store.update_project(
-                project.id,
-                &ProjectPatch {
-                    local_path: Some(Some(new.clone())),
-                    ..Default::default()
-                },
-            )?;
-            remapped.push(json!({"id": project.id, "name": project.name, "from": old, "to": new}));
+    let store = Store::open(db_path)?;
+
+    for d in &dirs {
+        if fs::symlink_metadata(d).is_ok_and(|m| !m.is_dir()) {
+            fs::remove_file(d)?;
         }
+        fs::create_dir_all(d)?;
     }
 
     let mut rewritten = Vec::new();
@@ -778,6 +875,7 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
         "db": db_path,
         "mappings": mappings.iter().map(|m| json!({"from": m.from, "to": m.to})).collect::<Vec<_>>(),
         "restored": writes.len(),
+        "empty_dirs": dirs.len(),
         "unchanged": unchanged,
         "overwritten": conflicts,
         "projects": remapped,
@@ -1001,6 +1099,38 @@ mod tests {
             fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
             "mine"
         );
+    }
+
+    #[test]
+    fn two_entries_landing_on_one_target_are_a_conflict_even_with_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("Users/old");
+        let new = tmp.path().join("Users/new");
+        // `-…-old-repo` renames onto `-…-new-repo`, which the archive
+        // already holds: two entries, one target.
+        for h in [&old, &new] {
+            let dir = old
+                .join(".claude/projects")
+                .join(encode_path(&h.join("repo").to_string_lossy()))
+                .join("memory");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("MEMORY.md"), h.to_string_lossy().as_bytes()).unwrap();
+        }
+        let store = Store::open(&tmp.path().join("src.db")).unwrap();
+        let archive = tmp.path().join("a.tar.gz");
+        export(&store, &old, &archive, false).unwrap();
+        let db = tmp.path().join("new.db");
+        let forced = ImportOptions {
+            force: true,
+            ..Default::default()
+        };
+        let err = import(&archive, &new, &db, &forced).unwrap_err();
+        let Error::Conflict(msg) = err else {
+            panic!("expected conflict, got {err:?}")
+        };
+        assert!(msg.contains("both restore to"), "{msg}");
+        assert!(!db.exists(), "a refused import must not write the db");
+        assert!(!new.join(".claude").exists(), "nor any file");
     }
 
     #[test]

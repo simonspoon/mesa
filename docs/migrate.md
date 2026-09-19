@@ -56,7 +56,28 @@ Import builds a list of prefix **mappings**:
   `source_home` onto the current `$HOME` (both halves must be absolute; bad
   syntax is `validation`);
 - with `--repo-root DIR`, the manifest's `repo_root` onto `DIR` (absolute;
-  `validation` when the archive has no `repo_root`).
+  `validation` when the archive has no `repo_root`);
+- without `--repo-root`, a **detected** repo root (below).
+
+### Detecting a relocated repo root (mesa task 1210)
+
+A move that keeps the username but puts the repos somewhere else
+(`~/m/inaros/projects/...` → `~/m/projects/...`) has an identity home map, so
+without `--repo-root` nothing would move. So when `--repo-root` is not given
+and the manifest's `repo_root`, after the home map, does not exist here,
+import looks for the repos by the `root_commit` each project in the db
+snapshot already carries (older archives work too): it scans the new `$HOME`
+for git repos — at most 6 levels deep, skipping dot-dirs, `node_modules`,
+`target` and `Library`, never descending into a repo or following a symlink
+— and computes each one's root commit the way `project create` does. Each
+project under the old `repo_root` whose repo was found at a path ending with
+its path relative to that root votes for the path minus that suffix; the
+root most projects agree on is pushed as a mapping exactly as `--repo-root`
+would be (so the text files, settings.json included, are rewritten through
+it). A tie, or no vote, maps nothing. Then, per project, a `local_path` the
+mappings still leave missing falls back to the one repo found with its root
+commit (the suffix match if exactly one, else the only match). With
+`--repo-root` there is no scan.
 
 The **longest prefix wins**, so a repo root under the old home is moved by its
 own mapping rather than the home's, and a replacement is never re-scanned (two
@@ -125,8 +146,16 @@ differing files are rewritten.
   with_sessions, skipped}`.
 - `import`: `{archive, source_home, home, db, mappings, restored, unchanged,
   overwritten, projects[{id, name, from, to}], rewritten, renamed[{from, to}],
-  todo}` — `todo` is the hand checklist: clone each project to its mapped
-  `local_path`, install the mesa/qorvex/khora/loki binaries, re-authenticate
-  Claude Code, re-enable plugins.
+  repo_root, unresolved, todo}` — `todo` is the hand checklist: clone each
+  project to its mapped `local_path`, install the mesa/qorvex/khora/loki
+  binaries, re-authenticate Claude Code, re-enable plugins. `repo_root` is how
+  the repo root was moved — `{from, to, source}` with `source` `"flag"` or
+  `"detected"`, or `null`. `unresolved` lists what still points nowhere on
+  this machine: `{kind: "project", id, name, path}` for each project whose
+  final `local_path` does not exist, and `{kind: "file", file, path}` for each
+  absolute path in a restored `settings.json`/`settings.local.json` string
+  value — a whitespace/quote-delimited token starting with `/`, `~/` or
+  `$HOME/` (the latter two expanded onto the new home), at least two
+  components — that does not exist.
 
 None of the three accepts `--quiet` (exit 2).

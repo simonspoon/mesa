@@ -16,6 +16,9 @@
 #   * a second import without --force is `conflict`, exit 1, and writes
 #     nothing; --force overwrites;
 #   * --repo-root maps the manifest's repo_root ahead of the home map;
+#   * with the same HOME on both sides and the repos moved, import detects
+#     the new repo root by root commit, rewrites settings.json through it,
+#     and reports the project and settings paths still missing (task 1210);
 #   * `check` lists the hard-coded home paths, read-only;
 #   * --quiet is refused (exit 2) on all three; bad --home-map / a garbage
 #     archive are `validation`, exit 1.
@@ -201,6 +204,52 @@ MEM3="$THIRD/.claude/projects/$(enc "$TMP/code/mesa")"
 grep -q "Work in $TMP/code/mesa" "$THIRD/.claude/agents/sup.md" || fail "--repo-root: agent rewrite"
 grep -q "$THIRD/.claude/hooks/guard.sh" "$THIRD/.claude/settings.json" || fail "--repo-root: home map still applies"
 ok "--with-sessions carries transcripts; --repo-root outranks the home map"
+
+# ================= same username, relocated repo root (mesa task 1210) ==========
+# One HOME on both sides (the home map is identity), repos moved from
+# old/projects to new/projects and no --repo-root: import finds the new root
+# by the projects' root commits, rewrites settings.json through it, falls back
+# per project to a repo found elsewhere, and reports what is still missing.
+SAME="$TMP/Users/same"
+SAME_DB="$TMP/same.db"
+as_same() { HOME="$SAME" MESA_DB="$SAME_DB" "$MESA" "$@"; }
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_CONFIG_NOSYSTEM=1
+for p in p1 p2 p3; do
+  mkdir -p "$SAME/old/projects/$p/hooks"
+  echo "$p" >"$SAME/old/projects/$p/hooks/h.sh"
+  git -C "$SAME/old/projects/$p" init -q
+  git -C "$SAME/old/projects/$p" add -A
+  git -C "$SAME/old/projects/$p" commit -qm "$p"
+  run 0 as_same project create "$p" --path "$SAME/old/projects/$p"
+done
+mkdir -p "$SAME/old/projects/p4"
+run 0 as_same project create p4 --path "$SAME/old/projects/p4" --no-git
+mkdir -p "$SAME/.claude"
+cat >"$SAME/.claude/settings.json" <<EOF
+{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "bash $SAME/old/projects/p1/hooks/h.sh"}]}]},
+ "statusLine": {"type": "command", "command": "/nonexistent/zz/tool.sh --flag"}}
+EOF
+run 0 as_same migrate export "$TMP/same.tar.gz"
+mkdir -p "$SAME/new/projects" "$SAME/misc"
+mv "$SAME/old/projects/p1" "$SAME/old/projects/p2" "$SAME/new/projects/"
+mv "$SAME/old/projects/p3" "$SAME/misc/p3-renamed"
+rm -rf "$SAME/old" "$SAME/.claude" "$SAME_DB"
+run 0 as_same migrate import "$TMP/same.tar.gz"
+echo "$STDOUT" >"$TMP/same-import.json"
+[ "$(jqs '.repo_root | "\(.from) \(.to) \(.source)"')" = "$SAME/old/projects $SAME/new/projects detected" ] ||
+  fail "same-user: repo_root not detected: $(jqs .repo_root)"
+[ "$(as_same project list | jq -r '[.[].local_path] | join(",")')" = \
+  "$SAME/new/projects/p1,$SAME/new/projects/p2,$SAME/misc/p3-renamed,$SAME/new/projects/p4" ] ||
+  fail "same-user: local_paths: $(as_same project list)"
+grep -q "bash $SAME/new/projects/p1/hooks/h.sh" "$SAME/.claude/settings.json" ||
+  fail "same-user: settings.json hook not moved to the detected root: $(cat "$SAME/.claude/settings.json")"
+[ "$(jqs '[.unresolved[] | select(.kind == "project")] | map(.name) | join(",")')" = p4 ] ||
+  fail "same-user: unresolved projects: $(jqs .unresolved)"
+[ "$(jqs '[.unresolved[] | select(.kind == "file")] | map(.path) | join(",")')" = /nonexistent/zz/tool.sh ] ||
+  fail "same-user: unresolved settings paths: $(jqs .unresolved)"
+[ "$(jqs '[.unresolved[] | select(.kind == "file")][0].file')" = "$SAME/.claude/settings.json" ] ||
+  fail "same-user: unresolved names its settings file"
+ok "same username: relocated repo root detected by root commit, settings.json rewritten, unresolved paths reported"
 
 # ================= usage and validation =================
 for sub in check "export $TMP/q.tar.gz" "import $TMP/move.tar.gz"; do

@@ -207,6 +207,159 @@ pub fn repo_root(paths: &[String]) -> Option<String> {
     (!c.is_empty()).then(|| format!("/{}", c.join("/")))
 }
 
+// ---- finding a relocated repo root (mesa task 1210) ----
+
+/// `path` with `root` and the `/` after it removed: `Some("")` for the root
+/// itself, `None` when `path` is not under `root`.
+fn rel_under<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(root)?;
+    if rest.is_empty() {
+        Some("")
+    } else {
+        rest.strip_prefix('/')
+    }
+}
+
+/// The found repo a project's checkout most likely is: among `found`
+/// (`(path, root_commit)`) sharing its `commit`, the one whose path ends with
+/// `/rel` when exactly one does, else the only match when there is exactly
+/// one. Returns the path and whether it was the suffix match.
+fn repo_for<'a>(rel: &str, commit: &str, found: &'a [(String, String)]) -> Option<(&'a str, bool)> {
+    let matches: Vec<&str> = found
+        .iter()
+        .filter(|(_, c)| c == commit)
+        .map(|(p, _)| p.as_str())
+        .collect();
+    let suffixed: Vec<&str> = matches
+        .iter()
+        .copied()
+        .filter(|p| rel.is_empty() || p.ends_with(&format!("/{rel}")))
+        .collect();
+    match (suffixed.as_slice(), matches.as_slice()) {
+        ([one], _) => Some((one, true)),
+        ([], [one]) => Some((one, false)),
+        _ => None,
+    }
+}
+
+/// Where `old_root` moved to, judged from where each project's repo was
+/// found by its root commit: `projects` is `(local_path, root_commit)`,
+/// `found` is `(path, root_commit)`. Every project under `old_root` whose
+/// repo was found at a path ending with its path relative to `old_root`
+/// votes for that path minus the suffix; the root most projects agree on
+/// wins, and a tie (or no vote) is `None` — never a guess.
+pub fn detect_repo_root(
+    old_root: &str,
+    projects: &[(String, String)],
+    found: &[(String, String)],
+) -> Option<String> {
+    let mut votes: std::collections::BTreeMap<String, usize> = Default::default();
+    for (local, commit) in projects {
+        let Some(rel) = rel_under(local, old_root) else {
+            continue;
+        };
+        if let Some((path, true)) = repo_for(rel, commit, found) {
+            let root = if rel.is_empty() {
+                path
+            } else {
+                &path[..path.len() - rel.len() - 1]
+            };
+            *votes.entry(trim_path(root)).or_default() += 1;
+        }
+    }
+    let best = *votes.values().max()?;
+    let mut winners = votes.into_iter().filter(|(_, n)| *n == best);
+    let (root, _) = winners.next()?;
+    winners.next().is_none().then_some(root)
+}
+
+/// Every git repo under `dir` (a directory holding `.git`, a dir or a file),
+/// not descended into, `depth` levels at most; dot-dirs, `node_modules`,
+/// `target` and `Library` are skipped and symlinks never followed. Sorted.
+fn find_repos(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            !name.starts_with('.')
+                && !matches!(name.as_str(), "node_modules" | "target" | "Library")
+        })
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    for d in dirs {
+        if fs::symlink_metadata(d.join(".git")).is_ok() {
+            out.push(d);
+        } else {
+            find_repos(&d, depth - 1, out);
+        }
+    }
+}
+
+/// The root (first) commit of the repo at `path` — the same
+/// `git rev-list --max-parents=0 --reverse HEAD`, first line, that
+/// `project create` binds — or `None` when git cannot say.
+fn git_root_commit(path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-list", "--max-parents=0", "--reverse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout)
+        .ok()?
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// Every absolute path a settings file names in its string values: tokens
+/// split on whitespace and quotes that begin with `/`, `~/` or `$HOME/`
+/// (the latter two expanded onto `home`) and have at least two components,
+/// in order of appearance, each once.
+pub fn settings_paths(value: &Value, home: &str) -> Vec<String> {
+    fn walk(v: &Value, home: &str, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                for tok in s.split(|c: char| c.is_whitespace() || "\"'`".contains(c)) {
+                    let path = if let Some(r) = tok.strip_prefix("~/") {
+                        format!("{home}/{r}")
+                    } else if let Some(r) = tok.strip_prefix("$HOME/") {
+                        format!("{home}/{r}")
+                    } else if tok.starts_with('/') {
+                        tok.to_string()
+                    } else {
+                        continue;
+                    };
+                    if path.split('/').filter(|c| !c.is_empty()).count() >= 2
+                        && !out.contains(&path)
+                    {
+                        out.push(path);
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|v| walk(v, home, out)),
+            Value::Object(o) => o.values().for_each(|v| walk(v, home, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, home, &mut out);
+    out
+}
+
 /// Whether import rewrites paths inside this file (relative to `$HOME`):
 /// the files that hold hand-written absolute paths. Everything else — the
 /// memories, session transcripts — is restored byte-identical.
@@ -612,20 +765,83 @@ fn import_mappings(manifest: &Value, home: &Path, opts: &ImportOptions) -> Resul
     Ok(maps)
 }
 
-/// Opens the extracted snapshot (migrating an older schema), proves it with
-/// `quick_check`, and moves every project's `local_path` through
-/// `Store::update_project` — all on the scratch copy, before the real db is
-/// touched. Returns the remapped projects; the store is closed on return, so
-/// its WAL is checkpointed back into the file.
-fn prepare_snapshot(snapshot: &Path, mappings: &[Mapping]) -> Result<Vec<Value>> {
-    let mut store = Store::open(snapshot)?;
-    store.quick_check()?;
+/// When no `--repo-root` was given and the archive's `repo_root` (after the
+/// home map) is not on this machine, finds where it moved: scans `home` for
+/// git repos, matches them to the snapshot's projects by root commit, and
+/// pushes the agreed new root as a mapping exactly as `--repo-root` would.
+/// Returns the chosen root (if any) and, per project id, the one repo found
+/// for it — the fallback for a project the mapping still misses.
+fn detect_relocation(
+    projects: &[super::types::Project],
+    old_root: &str,
+    home: &Path,
+    mappings: &mut Vec<Mapping>,
+) -> (Option<String>, HashMap<i64, String>) {
+    let mut fallback = HashMap::new();
+    let under: Vec<(i64, String, String)> = projects
+        .iter()
+        .filter_map(|p| {
+            let local = p.local_path.clone()?;
+            rel_under(&local, old_root)?;
+            Some((p.id, local, p.root_commit.clone()?))
+        })
+        .collect();
+    if under.is_empty() || Path::new(&rewrite_text(old_root, mappings)).exists() {
+        return (None, fallback);
+    }
+    let mut repos = Vec::new();
+    find_repos(home, 6, &mut repos);
+    let found: Vec<(String, String)> = repos
+        .iter()
+        .filter_map(|r| Some((r.to_string_lossy().into_owned(), git_root_commit(r)?)))
+        .collect();
+    let pairs: Vec<(String, String)> = under
+        .iter()
+        .map(|(_, l, c)| (l.clone(), c.clone()))
+        .collect();
+    let root = detect_repo_root(old_root, &pairs, &found);
+    if let Some(to) = &root {
+        mappings.push(Mapping {
+            from: trim_path(old_root),
+            to: to.clone(),
+        });
+    }
+    for (id, local, commit) in &under {
+        let rel = rel_under(local, old_root).unwrap_or_default();
+        if let Some((path, _)) = repo_for(rel, commit, &found) {
+            fallback.insert(*id, path.to_string());
+        }
+    }
+    (root, fallback)
+}
+
+/// Moves every project's `local_path` through `Store::update_project` — on
+/// the scratch copy, before the real db is touched — falling back to the repo
+/// `fallback` found for it when the mapped path is not on this machine.
+/// Returns the remapped projects and those whose path still is not here; the
+/// store is closed on return, so its WAL is checkpointed back into the file.
+fn prepare_snapshot(
+    mut store: Store,
+    mappings: &[Mapping],
+    fallback: &HashMap<i64, String>,
+) -> Result<(Vec<Value>, Vec<Value>)> {
     let mut remapped = Vec::new();
+    let mut unresolved = Vec::new();
     for project in store.list_projects_all()? {
         let Some(old) = project.local_path.clone() else {
             continue;
         };
-        let new = rewrite_text(&old, mappings);
+        let mut new = rewrite_text(&old, mappings);
+        if !Path::new(&new).exists()
+            && let Some(found) = fallback.get(&project.id)
+        {
+            new = found.clone();
+        }
+        if !Path::new(&new).exists() {
+            unresolved.push(
+                json!({"kind": "project", "id": project.id, "name": project.name, "path": new}),
+            );
+        }
         if new != old {
             store.update_project(
                 project.id,
@@ -637,7 +853,7 @@ fn prepare_snapshot(snapshot: &Path, mappings: &[Mapping]) -> Result<Vec<Value>>
             remapped.push(json!({"id": project.id, "name": project.name, "from": old, "to": new}));
         }
     }
-    Ok(remapped)
+    Ok((remapped, unresolved))
 }
 
 /// Restores an archive under `home` and the db at `db_path`. Refuses with
@@ -684,14 +900,31 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
     if !snapshot.is_file() {
         return Err(Error::Validation("the archive holds no mesa.db".into()));
     }
-    let mappings = import_mappings(&manifest, home, opts)?;
+    let mut mappings = import_mappings(&manifest, home, opts)?;
 
     // The db is prepared entirely inside the scratch dir — opened (which
     // migrates an older schema), integrity-checked, and its local_paths
     // moved through the Store — so a snapshot that cannot be used is
     // `validation` before anything at `db_path` is touched.
-    let remapped = prepare_snapshot(&snapshot, &mappings)
-        .map_err(|e| Error::Validation(format!("the archive's mesa.db is unusable: {e}")))?;
+    let unusable = |e: Error| Error::Validation(format!("the archive's mesa.db is unusable: {e}"));
+    let store = Store::open(&snapshot).map_err(unusable)?;
+    store.quick_check().map_err(unusable)?;
+    let old_root = manifest["repo_root"].as_str().map(trim_path);
+    let (repo_root, fallback) = match (&opts.repo_root, &old_root) {
+        (Some(dir), Some(from)) => (
+            Some(json!({"from": from, "to": trim_path(dir), "source": "flag"})),
+            HashMap::new(),
+        ),
+        (None, Some(from)) => {
+            let projects = store.list_projects_all().map_err(unusable)?;
+            let (root, fallback) = detect_relocation(&projects, from, home, &mut mappings);
+            let chosen = root.map(|to| json!({"from": from, "to": to, "source": "detected"}));
+            (chosen, fallback)
+        }
+        _ => (None, HashMap::new()),
+    };
+    let (remapped, mut unresolved) =
+        prepare_snapshot(store, &mappings, &fallback).map_err(unusable)?;
 
     // Plan every write before making any, so a refusal writes nothing.
     let mut extracted = Vec::new();
@@ -854,6 +1087,27 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
         }
     }
 
+    // Every absolute path the restored settings still name that is not on
+    // this machine: what the mappings could not move, for a person to fix.
+    let home_s = trim_path(&home.to_string_lossy());
+    for rel in [".claude/settings.json", ".claude/settings.local.json"] {
+        let file = home.join(rel);
+        if !scratch.0.join(rel).is_file() {
+            continue;
+        }
+        let Some(parsed) = fs::read(&file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        else {
+            continue;
+        };
+        for path in settings_paths(&parsed, &home_s) {
+            if !Path::new(&path).exists() {
+                unresolved.push(json!({"kind": "file", "file": file, "path": path}));
+            }
+        }
+    }
+
     let clone_paths: Vec<String> = store
         .list_projects_all()?
         .into_iter()
@@ -881,6 +1135,8 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
         "projects": remapped,
         "rewritten": rewritten,
         "renamed": renamed.iter().map(|(f, t)| json!({"from": f, "to": t})).collect::<Vec<_>>(),
+        "repo_root": repo_root,
+        "unresolved": unresolved,
         "todo": todo,
     }))
 }
@@ -989,6 +1245,86 @@ mod tests {
         );
         assert_eq!(repo_root(&p(&["/a/x", "/b/y"])), None);
         assert_eq!(repo_root(&[]), None);
+    }
+
+    #[test]
+    fn relocated_repo_root_is_the_one_most_projects_agree_on() {
+        let s = |v: &[(&str, &str)]| {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let old = "/Users/me/m/inaros/projects";
+        let projects = s(&[
+            ("/Users/me/m/inaros/projects/tools/mesa", "c1"),
+            ("/Users/me/m/inaros/projects/tools/khora", "c2"),
+            ("/Users/me/m/inaros/projects/apps/x", "c3"),
+            ("/Users/me/elsewhere/y", "c4"),
+        ]);
+        let found = s(&[
+            ("/Users/me/m/projects/tools/mesa", "c1"),
+            ("/Users/me/scratch/mesa-copy", "c1"),
+            ("/Users/me/m/projects/tools/khora", "c2"),
+            ("/Users/me/other/apps/x", "c3"),
+            ("/Users/me/m/projects/tools/unrelated", "c9"),
+        ]);
+        assert_eq!(
+            detect_repo_root(old, &projects, &found).as_deref(),
+            Some("/Users/me/m/projects")
+        );
+        // A tie is no answer.
+        let tie = s(&[
+            ("/Users/me/a/tools/mesa", "c1"),
+            ("/Users/me/b/tools/khora", "c2"),
+        ]);
+        assert_eq!(detect_repo_root(old, &projects[..2], &tie), None);
+        // No repo found, or none matching by suffix: nothing.
+        assert_eq!(detect_repo_root(old, &projects, &[]), None);
+        assert_eq!(
+            detect_repo_root(old, &projects[2..3], &s(&[("/q/z", "c3")])),
+            None
+        );
+        // The per-project fallback: a suffix match first, else the only match.
+        assert_eq!(
+            repo_for("tools/mesa", "c1", &found),
+            Some(("/Users/me/m/projects/tools/mesa", true))
+        );
+        assert_eq!(
+            repo_for("apps/x", "c3", &found),
+            Some(("/Users/me/other/apps/x", true))
+        );
+        assert_eq!(
+            repo_for("nope", "c2", &found),
+            Some(("/Users/me/m/projects/tools/khora", false))
+        );
+        assert_eq!(repo_for("nope", "c1", &found), None);
+        assert_eq!(rel_under("/a/bc", "/a/b"), None);
+        assert_eq!(rel_under("/a/b", "/a/b"), Some(""));
+    }
+
+    #[test]
+    fn settings_paths_are_the_absolute_tokens_in_string_values() {
+        let v: Value = serde_json::from_str(
+            r#"{
+              "hooks": {"Stop": [{"hooks": [{"command": "bash /opt/x/stop.sh --flag"}]}]},
+              "statusLine": {"command": "~/.claude/s.sh"},
+              "env": {"A": "$HOME/bin/tool", "B": "/tmp", "C": "relative/path"},
+              "list": ["'/a/b c'", "/a/b", 3, true],
+              "/not/a/value": "x"
+            }"#,
+        )
+        .unwrap();
+        let mut got = settings_paths(&v, "/Users/me");
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "/Users/me/.claude/s.sh",
+                "/Users/me/bin/tool",
+                "/a/b",
+                "/opt/x/stop.sh"
+            ]
+        );
     }
 
     #[test]

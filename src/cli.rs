@@ -1633,7 +1633,11 @@ EXAMPLES
     ///
     /// Paths under the archive's home move under this $HOME (or as
     /// --home-map says), and with --repo-root the archive's repo_root moves
-    /// to DIR first — longest prefix wins, matched on a path boundary. Applied
+    /// to DIR first — longest prefix wins, matched on a path boundary. Without
+    /// --repo-root, a repo_root missing here is looked for by the projects'
+    /// root commits under $HOME; `repo_root` in the output says which was
+    /// used, and `unresolved` lists project and settings paths still
+    /// missing. Applied
     /// to every project's local_path, the text of the restored config and
     /// ~/.claude files, and the names of ~/.claude/projects/<encoded> dirs.
     /// Refuses with `conflict` (exit 1, nothing written) if the db exists or a

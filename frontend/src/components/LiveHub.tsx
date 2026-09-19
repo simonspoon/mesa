@@ -116,9 +116,7 @@ import {
   initialWatchdog,
   noticeInSpan,
   shouldNoticePermission,
-  shouldNoticeStalled,
   watchdogAfterPoll,
-  watchdogAfterSpeech,
   type Watchdog,
 } from '../liveWatchdog'
 import { sameBox, windowBox } from '../liveWindow'
@@ -730,40 +728,29 @@ export function LiveHub({
 
   // ---- the watchdog (mesa task 1157) ----
 
-  // The page's clock on the agent's silence (`liveWatchdog.ts`), and the
-  // notices this page has already posted this span — keyed on kind and span
-  // start, so a post whose turn has not yet come back on the poll is not
-  // posted again two seconds later. The server dedupes anyway; this keeps the
-  // page from asking. All refs: read and written off the poll, the tick and
-  // the media events, rendered nowhere.
+  // What the page remembers of the agent between polls (`liveWatchdog.ts`),
+  // and the notices this page has already posted this span — keyed on kind
+  // and span start, so a post whose turn has not yet come back on the poll is
+  // not posted again two seconds later. The server dedupes anyway; this keeps
+  // the page from asking. Both refs: read and written off the poll, rendered
+  // nowhere.
   const watchdog = useRef<Watchdog | null>(null)
   const noticed = useRef<Set<string>>(new Set())
-  // The last poll and the transcript merged from it, as one pair — what the
-  // tick below judges, so it can never see a session from one poll beside
-  // turns from another.
-  const polled = useRef<{ state: LiveState; turns: LiveTurn[] } | null>(null)
-  // The decision, run on every poll (from the transcript effect above, with
-  // that poll's turns) and once a second in between. The tick is what makes
-  // the stall notice fire at all: `useFetch` drops a poll that changed
-  // nothing, and silence is precisely a run of polls that change nothing —
-  // a check keyed on the poll never re-read the clock while it ran out.
-  function judgeWatchdog(state: LiveState, turns: readonly LiveTurn[], now: number) {
+  // The decision, run on every poll (from the transcript effect below, with
+  // that poll's turns). The permission notice is edge-triggered on `blocked`,
+  // which only a poll can change, so nothing needs judging between polls.
+  function judgeWatchdog(state: LiveState, turns: readonly LiveTurn[]) {
     const current = state.session
     // Only a browser that is in the conversation authors a notice — the same
     // condition under which it speaks turns — so a page that merely has mesa
     // open on another machine never reports on a conversation it is not in.
     if (current === null || !isLive(current) || !unlocked) return
     if (watchdog.current?.sessionId !== current.id) {
-      watchdog.current = initialWatchdog(current.id, now)
+      watchdog.current = initialWatchdog(current.id)
       noticed.current = new Set()
     }
     const before = watchdog.current
-    watchdog.current = watchdogAfterPoll(before, {
-      workingSince: current.working_since,
-      turns,
-      blocked: state.blocked ?? null,
-      now,
-    })
+    watchdog.current = watchdogAfterPoll(before, { blocked: state.blocked ?? null })
     // The span the server dedupes by: the working span, or the whole session
     // while nobody is working.
     const spanStart = current.working_since ?? current.started_at
@@ -790,29 +777,10 @@ export function LiveHub({
     ) {
       post('permission')
     }
-    if (
-      shouldNoticeStalled({
-        working: current.working_since !== null,
-        speaking,
-        resting: current.resting_since !== null,
-        now,
-        lastActivityAt: watchdog.current.lastActivityAt,
-        alreadyNoticed: noticeInSpan(turns, 'stalled', spanStart),
-      })
-    ) {
-      post('stalled')
-    }
   }
   // Pointed at the current render's closure below, beside `pump` and
-  // `ended`, so the poll effect and the tick both call the latest one.
+  // `ended`, so the poll effect calls the latest one.
   const judge = useRef<typeof judgeWatchdog | null>(null)
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      const last = polled.current
-      if (last !== null) judge.current?.(last.state, last.turns, Date.now())
-    }, 1000)
-    return () => window.clearInterval(timer)
-  }, [])
 
   // Which session the held transcript belongs to. A new conversation is a new
   // transcript — going live again is a fresh session with its own turns, and
@@ -849,11 +817,9 @@ export function LiveHub({
     }
     cursor.current = advanceCursor(cursor.current, data.turns)
     // The watchdog judges this poll against *this poll's* transcript, never
-    // the `turns` state (set above, seen next render): judged against the
-    // old transcript, the reply that just ended a long silence is unseen and
-    // the stale clock calls it a stall one second after the agent answered.
-    polled.current = { state: data, turns: next }
-    judge.current?.(data, next, Date.now())
+    // the `turns` state (set above, seen next render), so a notice this poll
+    // carries back is already seen by the span check.
+    judge.current?.(data, next)
   }, [data])
 
   useEffect(() => {
@@ -2267,11 +2233,6 @@ export function LiveHub({
     if (sounding.current !== id) return
     sounding.current = null
     setSpeaking(false)
-    // The end of a spoken reply is activity for the watchdog (mesa task
-    // 1157): a long answer must never count as the silence after it.
-    if (watchdog.current !== null) {
-      watchdog.current = watchdogAfterSpeech(watchdog.current, Date.now())
-    }
     markPlayed(id)
     run()
   }
@@ -2687,13 +2648,9 @@ export function LiveHub({
   // the capture effect's cleanup clears it the moment the microphone closes.
   const pill = statusPill({
     speaking: speakingText !== null,
-    // The two reports about the agent (mesa task 1157): its job blocked on a
-    // prompt, straight off the poll; and a stalled notice already posted in
-    // this working span while it is still working.
+    // The report about the agent (mesa task 1157): its job blocked on a
+    // prompt, straight off the poll.
     blocked: (data?.blocked ?? null) !== null,
-    stalled:
-      session?.working_since != null &&
-      noticeInSpan(turns, 'stalled', session.working_since),
     heard: showsHearing({
       recording,
       interim,

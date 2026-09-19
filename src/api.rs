@@ -3538,7 +3538,7 @@ struct LiveUtterance {
 
 #[derive(Deserialize)]
 struct LiveNoticeBody {
-    /// Which report (mesa task 1157): `permission` or `stalled`. A closed
+    /// Which report (mesa task 1157): `permission`. A closed
     /// enum, so serde is the gate and an unknown kind is 422 before the
     /// handler runs.
     kind: LiveNotice,

@@ -2001,17 +2001,16 @@ EXAMPLES
     /// Record mesa's own report about the agent as a spoken turn; prints it
     ///
     /// KIND is `permission` (the agent's Claude Code session is blocked on a
-    /// permission prompt) or `stalled` (it has been working, silently, for
-    /// too long). Not the agent's verb — the web page posts these off its
+    /// permission prompt). Not the agent's verb — the web page posts these off its
     /// poll (mesa task 1157) — so it takes no --lease. Written at most once
     /// per kind per working span: a repeat prints the existing turn and
     /// writes nothing.
     #[command(after_help = "\
 EXAMPLES
   mesa live notice permission
-  mesa live notice stalled --quiet")]
+  mesa live notice permission --quiet")]
     Notice {
-        /// `permission` or `stalled`
+        /// `permission`
         #[arg(value_name = "KIND", value_parser = parse_live_notice)]
         kind: LiveNotice,
         /// Print the turn without its `text` instead of in full
@@ -3165,9 +3164,9 @@ fn parse_sidebars_action(s: &str) -> std::result::Result<LiveAction, String> {
     }
 }
 
-/// `live notice <KIND>` names one of the two reports (mesa task 1157).
+/// `live notice <KIND>` names the report (mesa task 1157).
 fn parse_live_notice(s: &str) -> std::result::Result<LiveNotice, String> {
-    LiveNotice::parse(s).ok_or_else(|| format!("'{s}' is not one of permission|stalled"))
+    LiveNotice::parse(s).ok_or_else(|| format!("'{s}' is not one of permission"))
 }
 
 /// `--kind` on `live board push` names one of the two **text** kinds. The

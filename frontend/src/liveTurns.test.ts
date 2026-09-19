@@ -250,10 +250,10 @@ describe('turnGroups', () => {
     // so it is grouped apart — even between two turns the agent said.
     const groups = turnGroups([
       turn(1),
-      turn(2, { notice: 'stalled' }),
+      turn(2, { notice: 'permission' }),
       turn(3),
       turn(4, { notice: 'permission' }),
-      turn(5, { notice: 'stalled' }),
+      turn(5, { notice: 'permission' }),
     ])
     expect(groups.map((g) => [g.notice, g.turns.map((t) => t.id)])).toEqual([
       [false, [1]],

@@ -3493,30 +3493,27 @@ impl LiveAction {
 /// blocked state — a `claude --bg` session stuck on a permission prompt says
 /// nothing, and so does one that has simply gone quiet — so detection is
 /// external, and the report is written *as a turn* so it is spoken and shown
-/// exactly once, the `played_at` rule, like anything else mesa says. Two
-/// kinds: `permission` (the job is `blocked` on a prompt in `claude agents`)
-/// and `stalled` (working, silent for `liveWatchdog.ts`'s `STALL_MS`). Null on
-/// every turn the agent or the person actually said.
+/// exactly once, the `played_at` rule, like anything else mesa says. One
+/// kind: `permission` (the job is `blocked` on a prompt in `claude agents`).
+/// A second, `stalled`, was removed by mesa task 1218 and its rows cleared
+/// by migration. Null on every turn the agent or the person actually said.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "kebab-case")]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub enum LiveNotice {
     Permission,
-    Stalled,
 }
 
 impl LiveNotice {
     pub fn as_str(self) -> &'static str {
         match self {
             LiveNotice::Permission => "permission",
-            LiveNotice::Stalled => "stalled",
         }
     }
 
     pub fn parse(s: &str) -> Option<LiveNotice> {
         match s {
             "permission" => Some(LiveNotice::Permission),
-            "stalled" => Some(LiveNotice::Stalled),
             _ => None,
         }
     }

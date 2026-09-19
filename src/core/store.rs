@@ -946,6 +946,12 @@ const MIGRATIONS: &[&str] = &[
     // backfilled from `started_at`.
     "ALTER TABLE retro_runs ADD COLUMN spawned_at TEXT;
     UPDATE retro_runs SET spawned_at = started_at;",
+    // Task 1218: the `stalled` notice kind is gone (it fired on nearly every
+    // turn and said nothing), so `LiveNotice` no longer parses it and a row
+    // still carrying it would fail every read of its session. Such a row
+    // keeps its turn and its text and loses only the kind. It was never
+    // indexed into `live_memory_fts` and this does not index it now.
+    "UPDATE live_turns SET notice = NULL WHERE notice = 'stalled';",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -5095,7 +5101,7 @@ impl Store {
     }
 
     /// Records mesa's own report about the agent as a `mesa` turn (mesa task
-    /// 1157) — blocked on a permission prompt, or silent too long — so it is
+    /// 1157) — blocked on a permission prompt — so it is
     /// spoken and shown exactly once like anything else mesa says. The text is
     /// the fixed sentence for the kind (`live::notice_text`), there is no
     /// action, and `notice` names the kind.
@@ -12510,15 +12516,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            63,
-            "a fresh db should report user_version 63"
+            64,
+            "a fresh db should report user_version 64"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 63);
+        assert_eq!(version, 64);
     }
 
     // ---- the session retrospective (mesa task 1158) ----
@@ -12909,6 +12915,53 @@ mod tests {
         assert_eq!(turns[0].notice, None);
     }
 
+    /// Pins the `stalled` clearing (mesa task 1218) at index 63: a db from
+    /// before it that holds a `stalled` notice turn reads it back — text
+    /// intact, kind cleared — instead of failing on the removed variant,
+    /// while a `permission` notice keeps its kind.
+    #[test]
+    fn a_stalled_notice_from_before_its_removal_still_reads_at_migration_63() {
+        const UNSTALL: usize = 63;
+        assert!(
+            MIGRATIONS[UNSTALL].contains("notice = 'stalled'"),
+            "migration {UNSTALL} is no longer the stalled-notice clearing — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..UNSTALL] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", UNSTALL as i64)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO live_sessions (status, started_at, updated_at) \
+                 VALUES ('live', datetime('now'), datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO live_turns (session_id, role, text, notice, created_at) \
+                 VALUES (1, 'mesa', 'The agent is still working, or not responding.', \
+                         'stalled', datetime('now')), \
+                        (1, 'mesa', 'blocked', 'permission', datetime('now'))",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let turns = store.list_live_turns(1, None, 10).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].notice, None);
+        assert_eq!(
+            turns[0].text,
+            "The agent is still working, or not responding."
+        );
+        assert_eq!(turns[1].notice, Some(LiveNotice::Permission));
+    }
+
     /// A notice is a mesa turn mesa writes about the agent (mesa task 1157):
     /// fixed text, no action, the kind on the row, and at most one per kind
     /// per working span — a fresh `next_user_turn` span allows the next one.
@@ -12922,19 +12975,19 @@ mod tests {
         store.next_user_turn(session.id).unwrap().unwrap();
 
         let (first, created) = store
-            .add_live_notice(session.id, LiveNotice::Stalled)
+            .add_live_notice(session.id, LiveNotice::Permission)
             .unwrap();
         assert!(created);
         assert_eq!(first.role, LiveRole::Mesa);
-        assert_eq!(first.notice, Some(LiveNotice::Stalled));
-        assert_eq!(first.text, live::notice_text(LiveNotice::Stalled));
+        assert_eq!(first.notice, Some(LiveNotice::Permission));
+        assert_eq!(first.text, live::notice_text(LiveNotice::Permission));
         assert_eq!(first.action, None);
         assert_eq!(first.target, None);
         assert_eq!(first.played_at, None);
 
         // The same kind in the same span is the existing turn, and no write.
         let (again, created) = store
-            .add_live_notice(session.id, LiveNotice::Stalled)
+            .add_live_notice(session.id, LiveNotice::Permission)
             .unwrap();
         assert!(!created);
         assert_eq!(again.id, first.id);
@@ -12943,15 +12996,6 @@ mod tests {
             store.list_live_turns(session.id, None, 10).unwrap().len(),
             2
         );
-
-        // The other kind is independent of it.
-        let (blocked, created) = store
-            .add_live_notice(session.id, LiveNotice::Permission)
-            .unwrap();
-        assert!(created);
-        assert_ne!(blocked.id, first.id);
-        assert_eq!(blocked.notice, Some(LiveNotice::Permission));
-        assert_eq!(blocked.text, live::notice_text(LiveNotice::Permission));
 
         // A new working span — the agent taking the next utterance — allows
         // a fresh one. The clock is second-grained, so the earlier notice is
@@ -12968,11 +13012,11 @@ mod tests {
             .add_live_turn(session.id, LiveRole::User, "and another", None, None)
             .unwrap();
         store.next_user_turn(session.id).unwrap().unwrap();
-        let (third, created) = store
-            .add_live_notice(session.id, LiveNotice::Stalled)
+        let (fresh, created) = store
+            .add_live_notice(session.id, LiveNotice::Permission)
             .unwrap();
         assert!(created, "a new working span allows a fresh notice");
-        assert_ne!(third.id, first.id);
+        assert_ne!(fresh.id, first.id);
     }
 
     /// With the agent waiting (`working_since` null) the span is the whole
@@ -13001,11 +13045,11 @@ mod tests {
         let session = store.start_live_session(None).unwrap();
         store.end_live_session(session.id).unwrap();
         assert!(matches!(
-            store.add_live_notice(session.id, LiveNotice::Stalled),
+            store.add_live_notice(session.id, LiveNotice::Permission),
             Err(Error::Validation(_))
         ));
         assert!(matches!(
-            store.add_live_notice(999_999, LiveNotice::Stalled),
+            store.add_live_notice(999_999, LiveNotice::Permission),
             Err(Error::Validation(_))
         ));
         assert!(
@@ -13026,9 +13070,6 @@ mod tests {
             .add_live_notice(session.id, LiveNotice::Permission)
             .unwrap();
         store
-            .add_live_notice(session.id, LiveNotice::Stalled)
-            .unwrap();
-        store
             .add_live_turn(session.id, LiveRole::Mesa, "a spoken sentence", None, None)
             .unwrap();
         let indexed: i64 = store
@@ -13041,10 +13082,7 @@ mod tests {
                 .search_live_memory("permission", 10)
                 .unwrap()
                 .is_empty()
-                && store
-                    .search_live_memory("responding", 10)
-                    .unwrap()
-                    .is_empty()
+                && store.search_live_memory("terminal", 10).unwrap().is_empty()
         );
         assert_eq!(store.search_live_memory("spoken", 10).unwrap().len(), 1);
     }

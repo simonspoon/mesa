@@ -105,9 +105,8 @@ screenshot — and not for what you could simply say.
 `mesa task create`, `mesa task update`, and the rest — every command prints \
 JSON) and with whatever other tools you have. `mesa live turns` prints the \
 conversation so far if you need to look back at it. A turn there carrying a \
-`notice` (`permission` or `stalled`) is mesa's own status report about you — \
-that you were blocked on a permission prompt, or silent too long — not \
-something you said: do not repeat it and do not apologise for it, just carry \
+`notice` (`permission`) is mesa's own status report about you — that you \
+were blocked on a permission prompt — not something you said: do not repeat it and do not apologise for it, just carry \
 on.
 
 9. The notebook at the end of your prompt is what earlier conversations left \
@@ -303,17 +302,11 @@ pub const LIVE_SUMMARY_RECALL: usize = 1;
 pub const NOTICE_PERMISSION_TEXT: &str =
     "The agent is blocked on a permission prompt. Check the terminal.";
 
-/// What a `stalled` notice says: the agent is still marked working but has
-/// said nothing for `liveWatchdog.ts`'s `STALL_MS`, and the page cannot tell
-/// a long job from a wedged one — so the sentence says both.
-pub const NOTICE_STALLED_TEXT: &str = "The agent is still working, or not responding.";
-
-/// The fixed text a notice of `kind` is spoken with — the one place the two
-/// sentences are chosen, so `Store::add_live_notice` and the tests agree.
+/// The fixed text a notice of `kind` is spoken with — the one place the
+/// sentence is chosen, so `Store::add_live_notice` and the tests agree.
 pub fn notice_text(kind: crate::core::LiveNotice) -> &'static str {
     match kind {
         crate::core::LiveNotice::Permission => NOTICE_PERMISSION_TEXT,
-        crate::core::LiveNotice::Stalled => NOTICE_STALLED_TEXT,
     }
 }
 
@@ -1206,22 +1199,17 @@ question is a task, not a note",
     }
 
     /// Rule 8 tells the agent what a notice turn is (mesa task 1157), and the
-    /// two sentences are single plain lines the synthesiser can speak.
+    /// sentence is a single plain line the synthesiser can speak.
     #[test]
-    fn agent_prompt_explains_notice_turns_and_the_texts_are_one_sentence_each() {
+    fn agent_prompt_explains_notice_turns_and_the_text_is_one_sentence() {
         assert!(AGENT_PROMPT.contains("carrying a `notice`"));
         assert!(AGENT_PROMPT.contains("do not repeat it"));
-        for text in [NOTICE_PERMISSION_TEXT, NOTICE_STALLED_TEXT] {
-            assert!(!text.contains('\n') && !text.contains('*') && !text.contains('`'));
-            assert!(text.ends_with('.'));
-        }
+        let text = NOTICE_PERMISSION_TEXT;
+        assert!(!text.contains('\n') && !text.contains('*') && !text.contains('`'));
+        assert!(text.ends_with('.'));
         assert_eq!(
             notice_text(crate::core::LiveNotice::Permission),
             NOTICE_PERMISSION_TEXT
-        );
-        assert_eq!(
-            notice_text(crate::core::LiveNotice::Stalled),
-            NOTICE_STALLED_TEXT
         );
     }
 

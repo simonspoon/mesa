@@ -164,7 +164,6 @@ describe('SegmentChain', () => {
       statusPill({
         speaking: false,
         blocked: false,
-        stalled: false,
         heard: p.outstanding() > 0 || p.recording() !== '',
         transcribing: p.outstanding() > 0,
       })

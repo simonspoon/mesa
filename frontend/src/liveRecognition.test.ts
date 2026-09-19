@@ -718,7 +718,7 @@ describe('showsHearing', () => {
 })
 
 describe('statusPill', () => {
-  const idle = { speaking: false, blocked: false, stalled: false, heard: false, transcribing: false }
+  const idle = { speaking: false, blocked: false, heard: false, transcribing: false }
 
   it('says mesa is speaking, over anything the microphone claims', () => {
     // The microphone is shut while she talks, so "hearing" would be
@@ -727,21 +727,17 @@ describe('statusPill', () => {
     expect(statusPill({ ...idle, speaking: true, heard: true, transcribing: true })).toBe(
       'mesa speaking',
     )
-    // And over both reports about the agent: a notice is spoken through this
+    // And over the report about the agent: a notice is spoken through this
     // same pill (mesa task 1157).
-    expect(statusPill({ ...idle, speaking: true, blocked: true, stalled: true })).toBe(
+    expect(statusPill({ ...idle, speaking: true, blocked: true })).toBe(
       'mesa speaking',
     )
   })
 
-  it('says the agent is blocked over stalled, and both over hearing', () => {
+  it('says the agent is blocked, over hearing', () => {
     expect(statusPill({ ...idle, blocked: true })).toBe('agent blocked on a permission prompt')
-    expect(statusPill({ ...idle, blocked: true, stalled: true, heard: true })).toBe(
+    expect(statusPill({ ...idle, blocked: true, heard: true, transcribing: true })).toBe(
       'agent blocked on a permission prompt',
-    )
-    expect(statusPill({ ...idle, stalled: true })).toBe('agent still working…')
-    expect(statusPill({ ...idle, stalled: true, heard: true, transcribing: true })).toBe(
-      'agent still working…',
     )
   })
 

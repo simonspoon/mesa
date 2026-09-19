@@ -259,17 +259,23 @@ utterance; it does not say whether it is thinking, waiting on a Claude Code
 any of that itself, because a `claude --bg` session stuck on a prompt says
 nothing, and so does one that has simply gone quiet. Until this task the
 person found out by attaching a terminal. Detection is therefore external, in
-two halves, and the report is a **turn**.
+two halves, and the report is a **turn**. Only the permission prompt is
+reported: a second notice, `stalled` (working and silent for 30 s), was
+removed by mesa task 1218, because real work routinely runs longer than that,
+so it was spoken on almost every turn and told the person nothing.
 
 ### The notice turn
 
 A **notice** is a `mesa`-role turn mesa itself writes *about* the agent,
 not the agent's own words: `LiveTurn.notice` names the kind — `permission`
-(the job is blocked on a prompt) or `stalled` (working, silent too long) —
-and is null on every turn either side actually said. `text` is one fixed
-plain sentence per kind (`core::live::NOTICE_PERMISSION_TEXT`,
-`NOTICE_STALLED_TEXT`, chosen in one place by `live::notice_text`), there is
-no action, and the column arrives by migration index 58. It is a turn rather
+(the job is blocked on a prompt), the only one — and is null on every turn
+either side actually said. `text` is one fixed plain sentence per kind
+(`core::live::NOTICE_PERMISSION_TEXT`, chosen in one place by
+`live::notice_text`), there is no action, and the column arrives by migration
+index 58. Migration index 63 (mesa task 1218) clears `notice` on any row
+still reading `stalled`, so an old conversation's transcript stays readable
+— the turn and its sentence kept, only the kind gone — rather than failing
+on a kind `LiveNotice` no longer parses. It is a turn rather
 than a flag on the session for one reason: a turn is **spoken and shown
 exactly once** — `played_at`, the same run, the same stamp — which is exactly
 what a status report read aloud needs. The transcript labels it `notice`
@@ -279,7 +285,7 @@ into `live_memory_fts`**: it is not conversation content, so `mesa live
 memory search` never finds one.
 
 The one write path is `Store::add_live_notice(session_id, kind) -> (turn,
-created)`, which both `mesa live notice <permission|stalled>` and
+created)`, which both `mesa live notice permission` and
 `POST /api/live/notice {"kind"}` call. It refuses an ended or unknown session
 exactly as `add_live_turn` does, and it **dedupes per working span**: if a
 notice of that kind already exists with `created_at >= COALESCE(working_since,
@@ -314,17 +320,13 @@ view of a job, read on the API's poll.
 ### The page-side watchdog
 
 `frontend/src/liveWatchdog.ts` holds the decisions and `LiveHub` performs
-them on every poll it already makes **and once a second in between**, **only
-while this browser has joined** — the same condition under which it speaks
-turns — so a page that merely has mesa open never reports on a conversation
-it is not in. The tick is not decoration: `useFetch` drops a poll that
-changed nothing, and silence is precisely a run of polls that change
-nothing, so a check that waited for a poll never re-read the clock while it
-ran out. Each judgement sees **one poll's view** — the session and the
-transcript merged from that same poll, never the `turns` state a later
-render sets — because judged against the previous poll's transcript the
-reply that just ended a long silence is unseen, and the stale clock reported
-a stall one second after the agent answered:
+them on every poll it already makes, **only while this browser has joined**
+— the same condition under which it speaks turns — so a page that merely
+has mesa open never reports on a conversation it is not in. There is no tick
+between polls: the notice is edge-triggered on `blocked`, which only a poll
+can change (the one-second tick went with `stalled`, whose clock it read).
+Each judgement sees **one poll's view** — the session and the transcript
+merged from that same poll, never the `turns` state a later render sets:
 
 - **`permission`** is posted on the **rising edge** of `blocked` — this poll
   non-null where the previous one was null — and no `permission` notice
@@ -335,23 +337,13 @@ a stall one second after the agent answered:
   "permission prompt", and a level rule reported it again there. A value
   that merely persists across a span change is never news; the server's
   per-span dedupe is the second line, not the first.
-- **`stalled`** is posted when the session is working, mesa is **not
-  speaking**, nothing has happened for `STALL_MS` (30 s), and no `stalled`
-  notice exists in this span. "Nothing has happened" is a page-local clock,
-  `lastActivityAt`, reset when a working span **begins** (`working_since`
-  changes to a new value), when a **new mesa turn** arrives, and when
-  **mesa's playback ends** — the last because a long spoken reply is the
-  opposite of silence, and a clock that kept running through it would call a
-  two-minute answer a stall the moment it finished. A user turn is never
-  activity: the person talking says nothing about the agent.
 
 The page also remembers what it has posted this span, keyed on kind and span
 start, so a post whose turn has not yet come back on the poll is not posted
 again two seconds later. While `blocked` is non-null the status pill above
-the composer reads `agent blocked on a permission prompt`, and after a
-`stalled` notice has been posted in a span that is still working it reads
-`agent still working…` — both ranked under `mesa speaking` (the notice is
-spoken through that same pill) and above `hearing` (`statusPill`).
+the composer reads `agent blocked on a permission prompt`, ranked under
+`mesa speaking` (the notice is spoken through that same pill) and above
+`hearing` (`statusPill`).
 
 The agent is told what these are (rule 8 of `AGENT_PROMPT`): a turn carrying
 `notice` is mesa's report about it, not something it said — carry on, do not
@@ -525,8 +517,7 @@ carries `resting_since` on the session, and the panel's aperture shows a
 **resting** state — listening's breathing halo in the agent's violet
 (`liveIndicator.ts`, ranked under being heard and over working, since the
 person can still talk and nothing is being worked on) — with the status
-line saying memory is being tidied. The watchdog posts no `stalled` notice
-while it is set: the successor is idle on purpose. Anything said meanwhile
+line saying memory is being tidied. Anything said meanwhile
 queues, and the successor takes it the moment the rest ends.
 
 ## What a turn may be
@@ -598,7 +589,7 @@ without tracking whether it already has. `list_live_turns` takes an exclusive
 `after` cursor and clamps `limit` into `1..=500`.
 
 `notice` (mesa task 1157) marks a `mesa` turn mesa itself wrote about the
-agent — `permission` or `stalled` — rather than one the agent said; it is
+agent — `permission` — rather than one the agent said; it is
 written only by `Store::add_live_notice`, never by `add_live_turn`, and is
 null everywhere else. See [Telling the person the agent is stuck or
 silent](#telling-the-person-the-agent-is-stuck-or-silent-mesa-task-1157).
@@ -1528,7 +1519,7 @@ flag is an unknown argument, exit 2, exactly as on `turns`.
 | `live sidebars <collapse\|expand>` | `--say <TEXT>`, same rule; takes no route; `--lease <N>` | the `LiveTurn` |
 | `live handoff <NOTE>…` | trailing var arg, `--quiet` **before** the note; takes no `--lease` | the `LiveSession` with its bumped `lease` and the successor's `agent_id` |
 | `live context` | — (no `--quiet`) | `{session_id, agent_id, lease, context_tokens}` |
-| `live notice <permission\|stalled>` | `--quiet`; takes no `--lease` (not the agent's verb — the page's, mesa task 1157) | the notice `LiveTurn`, created or the existing one for this working span |
+| `live notice permission` | `--quiet`; takes no `--lease` (not the agent's verb — the page's, mesa task 1157) | the notice `LiveTurn`, created or the existing one for this working span |
 | `live turns` | `--after <ID>`, `--limit <N>` (clamped to 1..=500) | a bare array of turns, oldest first |
 | `live look` | `--output <PATH>` (default: a temp file named for the session) | the `LiveShot`: `path`, `window_id`, `width`, `height` |
 | `live board push [BODY]…` | exactly one source (body, `--file`, `--image`, `--diagram`), `--kind`, `--title`, `--say` — put every flag **before** the body | the created `LiveBoard` |

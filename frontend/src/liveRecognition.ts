@@ -383,31 +383,26 @@ export function showsHearing(input: {
  * "hearing" — `heard` being `showsHearing`'s verdict, hold included, so the
  * pill is as steady across a sentence as the panel it replaced.
  *
- * Between speaking and hearing sit the two reports about the *agent* (mesa
+ * Between speaking and hearing sits the report about the *agent* (mesa
  * task 1157, `liveWatchdog.ts`): `blocked` — its job is stuck on a
- * permission prompt, the strongest thing the page knows about it — and
- * `stalled`, a stalled notice already posted in this working span while the
- * agent is still working. Both under speaking (a notice is spoken through the
- * same pill), both over hearing (what the agent is doing is the news the
- * person is waiting on), and blocked over stalled, since it is the more
- * specific of the two.
+ * permission prompt, the strongest thing the page knows about it. Under
+ * speaking (a notice is spoken through the same pill), over hearing (what the
+ * agent is doing is the news the person is waiting on). A `stalled` state
+ * under it went with the stalled notice (mesa task 1218).
  */
 export function statusPill(input: {
   speaking: boolean
   blocked: boolean
-  stalled: boolean
   heard: boolean
   transcribing: boolean
 }):
   | 'mesa speaking'
   | 'agent blocked on a permission prompt'
-  | 'agent still working…'
   | 'transcribing…'
   | 'hearing'
   | null {
   if (input.speaking) return 'mesa speaking'
   if (input.blocked) return 'agent blocked on a permission prompt'
-  if (input.stalled) return 'agent still working…'
   if (!input.heard) return null
   return input.transcribing ? 'transcribing…' : 'hearing'
 }

@@ -6,9 +6,9 @@
  * blocked state — a `claude --bg` session stuck on a permission prompt says
  * nothing, and so does one that has simply gone quiet — so detection is
  * external, and the report is written *as a turn* so it is spoken and shown
- * exactly once, the `played_at` rule, like anything else mesa says. Two
- * kinds: `permission` (the job is `blocked` on a prompt in `claude agents`)
- * and `stalled` (working, silent for `liveWatchdog.ts`'s `STALL_MS`). Null on
- * every turn the agent or the person actually said.
+ * exactly once, the `played_at` rule, like anything else mesa says. One
+ * kind: `permission` (the job is `blocked` on a prompt in `claude agents`).
+ * A second, `stalled`, was removed by mesa task 1218 and its rows cleared
+ * by migration. Null on every turn the agent or the person actually said.
  */
-export type LiveNotice = "permission" | "stalled";
+export type LiveNotice = "permission";

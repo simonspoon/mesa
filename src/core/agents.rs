@@ -209,7 +209,10 @@ fn basename(comm: &str) -> &str {
 ///
 /// Subagents run in-process, so there is no child to count; each one writes
 /// `<projects_dir>/<slug>/<session_id>/subagents/agent-*.jsonl`, and a recent
-/// mtime on one of those is the liveness signal. The project slug is unknown
+/// mtime on one of those is the liveness signal — unless its last line shows
+/// the subagent already ended its turn ([`subagent_finished`]), since a
+/// supervisor closes its task seconds after reading the final report. The
+/// project slug is unknown
 /// here, so every slug directory is checked for the session — the same
 /// glob-by-session-id shape `cc.rs` uses.
 fn count_live_subagents(root: &Path, session_id: &str, now: SystemTime) -> u32 {
@@ -235,12 +238,41 @@ fn count_live_subagents(root: &Path, session_id: &str, now: SystemTime) -> u32 {
                     // mtime in the future (clock skew) is as live as it gets.
                     Err(_) => true,
                 });
-            if fresh {
+            if fresh && !subagent_finished(&entry.path()) {
                 live += 1;
             }
         }
     }
     live
+}
+
+/// True iff a subagent transcript's last non-empty line is an `assistant`
+/// message with `stop_reason: "end_turn"` — the subagent has handed back its
+/// report, however recent its mtime. Only the file's tail is read. Anything
+/// else (unreadable, unparseable, a `tool_use` stop, a user line) is `false`,
+/// so an uncertain file still counts as live.
+fn subagent_finished(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 64 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let Some(last) = text.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(last) else {
+        return false;
+    };
+    v["type"] == "assistant" && v["message"]["stop_reason"] == "end_turn"
 }
 
 /// Resolves the script to run for one spawn `action` (`config::TODO_WATCHER`,
@@ -1333,6 +1365,28 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         // Unknown session, and a projects dir that isn't there at all.
         assert_eq!(count_live_subagents(root, "no-such-session", now), 0);
         assert_eq!(count_live_subagents(&root.join("gone"), session, now), 0);
+    }
+
+    #[test]
+    fn a_fresh_subagent_that_ended_its_turn_is_not_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let session = "e34b8ed9-d391-4797-9d39-546d5b463357";
+        let subagents = root.join("-Users-x-proj").join(session).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let user = r#"{"type":"user","message":{"role":"user","content":"go"}}"#;
+        let done = r#"{"type":"assistant","message":{"stop_reason":"end_turn"}}"#;
+        let tool = r#"{"type":"assistant","message":{"stop_reason":"tool_use"}}"#;
+        let now = SystemTime::now();
+
+        // The last line is the subagent's final report: finished, not live.
+        let path = subagents.join("agent-1.jsonl");
+        std::fs::write(&path, format!("{user}\n{done}\n\n")).unwrap();
+        assert_eq!(count_live_subagents(root, session, now), 0);
+
+        // An end_turn earlier in the file, but a tool call last: still live.
+        std::fs::write(&path, format!("{user}\n{done}\n{tool}\n")).unwrap();
+        assert_eq!(count_live_subagents(root, session, now), 1);
     }
 
     #[test]

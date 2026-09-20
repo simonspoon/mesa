@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -13,8 +13,8 @@ use super::types::{
     LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveBoard, LiveBoardKind,
     LiveBoardSummary, LiveContext, LiveMemoryHit, LiveNotebookEntry, LiveNotice, LiveRole,
     LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, RetroFinding,
-    RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind, Status, Task, TaskEvent, TaskReceipt,
-    Waypoint, is_valid_artifact_content_type, task_name,
+    RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind, ScriptRunRecord, ScriptRunStatus,
+    Status, Task, TaskEvent, TaskReceipt, Waypoint, is_valid_artifact_content_type, task_name,
 };
 
 #[derive(Debug)]
@@ -952,6 +952,33 @@ const MIGRATIONS: &[&str] = &[
     // keeps its turn and its text and loses only the kind. It was never
     // indexed into `live_memory_fts` and this does not index it now.
     "UPDATE live_turns SET notice = NULL WHERE notice = 'stalled';",
+    // Task 1224: a *detached* script run — one the Scripts page starts and can
+    // then walk away from, reopen and stop. The two older run routes persist
+    // nothing and still do not; this table is the third shape.
+    //
+    // `events` is the newline-joined NDJSON of the run's own line events,
+    // byte-identical to what went over the wire, so replaying a finished run
+    // is literally "send this column" rather than a reconstruction from two
+    // stdout/stderr blobs that could not preserve arrival order or per-line
+    // `t`. It is bounded by the same 64 KiB per-stream cap the live run wears.
+    // `script_id` CASCADEs (unlike `scripts.project_id`'s SET NULL): a run is
+    // not authored work, it is a record *of* a script and is meaningless
+    // without it.
+    "CREATE TABLE script_runs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        script_id   INTEGER NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
+        values_json TEXT    NOT NULL DEFAULT '{}',
+        cwd         TEXT,
+        status      TEXT    NOT NULL DEFAULT 'running',
+        exit_code   INTEGER,
+        note        TEXT,
+        events      TEXT    NOT NULL DEFAULT '',
+        truncated   INTEGER NOT NULL DEFAULT 0,
+        owner_pid   INTEGER,
+        started_at  TEXT    NOT NULL,
+        ended_at    TEXT
+    );
+    CREATE INDEX script_runs_by_script ON script_runs (script_id, id DESC);",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1586,6 +1613,58 @@ fn validate_script_args(args: &[ScriptArg]) -> Result<()> {
 fn encode_script_args(args: &[ScriptArg]) -> Result<String> {
     serde_json::to_string(args)
         .map_err(|e| Error::Validation(format!("cannot encode script arguments: {e}")))
+}
+
+/// How many detached runs are kept per script. The `live_boards` rule
+/// ([`LIVE_BOARD_KEEP`]) applied per *script* rather than per session: a run
+/// history is a short tail somebody glances back over, not an archive, and
+/// each row carries up to 128 KiB of log. No config key, no UI, no delete
+/// route — the prune inside [`Store::create_script_run`] is the whole policy.
+pub const SCRIPT_RUN_KEEP: i64 = 20;
+
+/// The note on a run a server restart abandoned. A fixed string rather than a
+/// formatted one so `reconcile_script_runs`' verdict is greppable and the gate
+/// can assert on it.
+pub const SCRIPT_RUN_ABANDONED: &str = "the server restarted while this run was in progress";
+
+const SCRIPT_RUN_COLUMNS: &str = "id, script_id, values_json, status, exit_code, note, \
+     truncated, cwd, started_at, ended_at";
+
+/// `values_json` and `status` are stored strings; the struct exposes a typed
+/// map and a typed enum, so the decode lives here and nowhere else — the
+/// `row_to_script` rule. A row either of them cannot be read is a corrupt db,
+/// surfaced as a conversion failure rather than silently becoming an empty
+/// form or a made-up status.
+fn row_to_script_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScriptRunRecord> {
+    let values: String = row.get(2)?;
+    let values: BTreeMap<String, String> = serde_json::from_str(&values).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let status: String = row.get(3)?;
+    let status = ScriptRunStatus::parse(&status).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            format!("unknown script run status {status:?}").into(),
+        )
+    })?;
+    Ok(ScriptRunRecord {
+        id: row.get(0)?,
+        script_id: row.get(1)?,
+        values,
+        status,
+        exit_code: row.get(4)?,
+        note: row.get(5)?,
+        truncated: row.get(6)?,
+        cwd: row.get(7)?,
+        started_at: row.get(8)?,
+        ended_at: row.get(9)?,
+    })
+}
+
+fn encode_script_values(values: &BTreeMap<String, String>) -> Result<String> {
+    serde_json::to_string(values)
+        .map_err(|e| Error::Validation(format!("cannot encode script run values: {e}")))
 }
 
 const ARTIFACT_COLUMNS: &str =
@@ -6266,6 +6345,177 @@ impl Store {
             )));
         }
         Ok(())
+    }
+
+    // ---- detached script runs (mesa task 1224) ----
+
+    /// Opens a run row for a script the server has just started detached, and
+    /// prunes that script's history back to [`SCRIPT_RUN_KEEP`] (the
+    /// `live_boards` rule, per script rather than per session).
+    ///
+    /// `values` is the *resolved* value map `core::scripts` validated, `cwd`
+    /// the directory the server resolved, and `owner_pid` the pid of the
+    /// `serve` process that owns the run — read only by
+    /// [`Store::reconcile_script_runs`]. The row starts `running` with no exit
+    /// code and no `ended_at`; exactly one later call to
+    /// [`Store::finish_script_run`] closes it.
+    pub fn create_script_run(
+        &mut self,
+        script_id: i64,
+        values: &BTreeMap<String, String>,
+        cwd: Option<&str>,
+        owner_pid: i64,
+    ) -> Result<ScriptRunRecord> {
+        // A run names the script it is a record of; an unknown one is
+        // `validation` (it arrives as a field of the record being written),
+        // the `create_script`/`create_inbox_item` posture.
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scripts WHERE id = ?1)",
+            [script_id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(Error::Validation(format!("script {script_id} not found")));
+        }
+        let encoded = encode_script_values(values)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO script_runs (script_id, values_json, cwd, status, owner_pid, started_at) \
+             VALUES (?1, ?2, ?3, 'running', ?4, datetime('now'))",
+            (script_id, &encoded, cwd, owner_pid),
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "DELETE FROM script_runs WHERE script_id = ?1 AND id NOT IN \
+             (SELECT id FROM script_runs WHERE script_id = ?1 ORDER BY id DESC LIMIT ?2)",
+            (script_id, SCRIPT_RUN_KEEP),
+        )?;
+        tx.commit()?;
+        self.get_script_run(id)
+    }
+
+    pub fn get_script_run(&self, id: i64) -> Result<ScriptRunRecord> {
+        self.conn
+            .query_row(
+                &format!("SELECT {SCRIPT_RUN_COLUMNS} FROM script_runs WHERE id = ?1"),
+                [id],
+                row_to_script_run,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("script run {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// Runs newest first (`id DESC`), optionally scoped to one script and
+    /// capped at `limit`. Newest first because the page's question is always
+    /// "what just happened", and the retention rule keeps the tail short
+    /// anyway.
+    pub fn list_script_runs(
+        &self,
+        script: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<Vec<ScriptRunRecord>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SCRIPT_RUN_COLUMNS} FROM script_runs \
+             WHERE (?1 IS NULL OR script_id = ?1) ORDER BY id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(
+            (script, limit.map(i64::from).unwrap_or(-1)),
+            row_to_script_run,
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Closes a run: its terminal status, the exit code if there is one, the
+    /// note if there is not, the NDJSON log and the truncation flag.
+    ///
+    /// **A no-op on a row that is not `running`**, returning it unchanged —
+    /// so an explicit stop landing at the same instant as a natural exit
+    /// cannot double-write, and nothing can resurrect a finished run.
+    pub fn finish_script_run(
+        &mut self,
+        id: i64,
+        status: ScriptRunStatus,
+        exit_code: Option<i32>,
+        note: Option<&str>,
+        events: &str,
+        truncated: bool,
+    ) -> Result<ScriptRunRecord> {
+        let current = self.get_script_run(id)?;
+        if current.status != ScriptRunStatus::Running {
+            return Ok(current);
+        }
+        self.conn.execute(
+            "UPDATE script_runs SET status = ?1, exit_code = ?2, note = ?3, events = ?4, \
+             truncated = ?5, ended_at = datetime('now') WHERE id = ?6 AND status = 'running'",
+            (status.as_str(), exit_code, note, events, truncated, id),
+        )?;
+        self.get_script_run(id)
+    }
+
+    /// The stored NDJSON of a finished run — what the stream route replays.
+    /// Its own method rather than a field on [`ScriptRunRecord`]: the log is
+    /// wire-only, so it is never carried by a list or a show.
+    pub fn script_run_events(&self, id: i64) -> Result<String> {
+        self.conn
+            .query_row("SELECT events FROM script_runs WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    Error::NotFound(format!("script run {id} not found"))
+                }
+                e => Error::Db(e),
+            })
+    }
+
+    /// Closes every `running` row this server cannot possibly own, called once
+    /// by `serve` before it binds. The registry is memory-only, so at start-up
+    /// no `running` row can belong to this process.
+    ///
+    /// `live(pid)` answers whether a pid is a live process. A row is abandoned
+    /// — `failed`, with a note naming the restart — iff its `owner_pid` is
+    /// dead, missing, **or equal to our own** (pid reuse; we know we own
+    /// nothing yet). A row whose owner is some *other* live process is left
+    /// alone: two `serve`s on one db is a real configuration, and a blanket
+    /// flip would have the second declare the first's live runs dead.
+    ///
+    /// The script's own process group survives the server that started it —
+    /// it is its own group and nothing signals it — and mesa holds no handle
+    /// across the restart, so it cannot reattach and does not pretend to. The
+    /// note says so. Returns the ids it closed.
+    pub fn reconcile_script_runs(
+        &mut self,
+        our_pid: i64,
+        live: impl Fn(i64) -> bool,
+    ) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, owner_pid FROM script_runs WHERE status = 'running'")?;
+        let rows: Vec<(i64, Option<i64>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut closed = Vec::new();
+        for (id, owner) in rows {
+            let abandoned = match owner {
+                None => true,
+                Some(pid) => pid == our_pid || !live(pid),
+            };
+            if !abandoned {
+                continue;
+            }
+            self.conn.execute(
+                "UPDATE script_runs SET status = 'failed', note = ?1, \
+                 ended_at = datetime('now') WHERE id = ?2 AND status = 'running'",
+                (SCRIPT_RUN_ABANDONED, id),
+            )?;
+            closed.push(id);
+        }
+        Ok(closed)
     }
 
     // ---- artifacts (agent-written pages, mesa task 974) ----
@@ -14395,6 +14645,224 @@ mod tests {
             store.update_script(999, ScriptPatch::default()),
             Err(Error::NotFound(_))
         ));
+    }
+
+    // ---- detached script runs (mesa task 1224) ----
+
+    fn run_values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn create_script_run_opens_a_running_row_with_typed_values() {
+        let (mut store, _dir) = temp_store();
+        let s = store.create_script(None, "s", None, "true", &[]).unwrap();
+        let run = store
+            .create_script_run(
+                s.id,
+                &run_values(&[("a", "1"), ("b", "two")]),
+                Some("/tmp"),
+                42,
+            )
+            .unwrap();
+        assert_eq!(run.script_id, s.id);
+        assert_eq!(run.status, ScriptRunStatus::Running);
+        assert_eq!(run.values, run_values(&[("a", "1"), ("b", "two")]));
+        assert_eq!(run.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(run.exit_code, None);
+        assert_eq!(run.note, None);
+        assert!(!run.truncated);
+        assert_eq!(run.ended_at, None);
+        assert!(!run.started_at.is_empty());
+        assert_eq!(store.get_script_run(run.id).unwrap(), run);
+        // A run names the script it is a record of; an unknown one is
+        // `validation`, not `not_found` — it is a field of the row.
+        assert!(matches!(
+            store.create_script_run(999, &BTreeMap::new(), None, 42),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(store.get_script_run(999), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn script_runs_are_pruned_to_the_newest_twenty_per_script() {
+        let (mut store, _dir) = temp_store();
+        let a = store.create_script(None, "a", None, "true", &[]).unwrap();
+        let b = store.create_script(None, "b", None, "true", &[]).unwrap();
+        let b_run = store
+            .create_script_run(b.id, &BTreeMap::new(), None, 1)
+            .unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..(SCRIPT_RUN_KEEP + 5) {
+            ids.push(
+                store
+                    .create_script_run(a.id, &BTreeMap::new(), None, 1)
+                    .unwrap()
+                    .id,
+            );
+        }
+        let kept = store.list_script_runs(Some(a.id), None).unwrap();
+        assert_eq!(kept.len(), SCRIPT_RUN_KEEP as usize);
+        // Newest first, and exactly the newest KEEP survived.
+        assert_eq!(kept[0].id, *ids.last().unwrap());
+        assert_eq!(
+            kept.iter().map(|r| r.id).collect::<Vec<_>>(),
+            ids.iter()
+                .rev()
+                .take(SCRIPT_RUN_KEEP as usize)
+                .copied()
+                .collect::<Vec<_>>()
+        );
+        // The prune is per script: the other script's single run is untouched.
+        assert_eq!(
+            store.list_script_runs(Some(b.id), None).unwrap(),
+            vec![b_run]
+        );
+        // Unscoped sees both scripts' runs; `limit` caps the newest.
+        assert_eq!(
+            store.list_script_runs(None, None).unwrap().len(),
+            SCRIPT_RUN_KEEP as usize + 1
+        );
+        assert_eq!(store.list_script_runs(None, Some(3)).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn finish_script_run_closes_a_row_once_and_only_once() {
+        let (mut store, _dir) = temp_store();
+        let s = store.create_script(None, "s", None, "true", &[]).unwrap();
+        let run = store
+            .create_script_run(s.id, &BTreeMap::new(), None, 1)
+            .unwrap();
+        assert_eq!(store.script_run_events(run.id).unwrap(), "");
+
+        let log = "{\"type\":\"line\",\"stream\":\"stdout\",\"t\":1,\"text\":\"hi\"}\n";
+        let done = store
+            .finish_script_run(run.id, ScriptRunStatus::Finished, Some(3), None, log, true)
+            .unwrap();
+        assert_eq!(done.status, ScriptRunStatus::Finished);
+        assert_eq!(done.exit_code, Some(3));
+        assert!(done.truncated);
+        assert!(done.ended_at.is_some());
+        // The log is wire-only: it never rides on the record.
+        assert_eq!(store.script_run_events(run.id).unwrap(), log);
+
+        // A second close — a stop landing at the same instant as a natural
+        // exit — is a no-op returning the row unchanged, never a resurrection.
+        let again = store
+            .finish_script_run(
+                run.id,
+                ScriptRunStatus::Stopped,
+                None,
+                Some("stopped"),
+                "",
+                false,
+            )
+            .unwrap();
+        assert_eq!(again, done);
+        assert_eq!(store.script_run_events(run.id).unwrap(), log);
+    }
+
+    #[test]
+    fn reconcile_script_runs_closes_only_the_rows_no_live_server_owns() {
+        let (mut store, _dir) = temp_store();
+        let s = store.create_script(None, "s", None, "true", &[]).unwrap();
+        let mine = store
+            .create_script_run(s.id, &BTreeMap::new(), None, 100)
+            .unwrap();
+        let dead = store
+            .create_script_run(s.id, &BTreeMap::new(), None, 200)
+            .unwrap();
+        let foreign = store
+            .create_script_run(s.id, &BTreeMap::new(), None, 300)
+            .unwrap();
+        let already = store
+            .create_script_run(s.id, &BTreeMap::new(), None, 200)
+            .unwrap()
+            .id;
+        let closed = store
+            .finish_script_run(already, ScriptRunStatus::Finished, Some(0), None, "", false)
+            .unwrap();
+
+        // 300 is a live foreign server; 200 is dead; 100 is us.
+        let mut ids = store.reconcile_script_runs(100, |pid| pid == 300).unwrap();
+        ids.sort();
+        assert_eq!(ids, vec![mine.id, dead.id]);
+        for id in [mine.id, dead.id] {
+            let row = store.get_script_run(id).unwrap();
+            assert_eq!(row.status, ScriptRunStatus::Failed);
+            assert_eq!(row.note.as_deref(), Some(SCRIPT_RUN_ABANDONED));
+            assert!(row.ended_at.is_some());
+        }
+        // Another live server's run, and an already-closed row, are untouched.
+        assert_eq!(
+            store.get_script_run(foreign.id).unwrap().status,
+            ScriptRunStatus::Running
+        );
+        assert_eq!(store.get_script_run(closed.id).unwrap(), closed);
+        // Idempotent: a second pass has nothing left to close but the foreign
+        // row, and only once its owner dies.
+        assert!(
+            store
+                .reconcile_script_runs(100, |pid| pid == 300)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn deleting_a_script_destroys_its_runs() {
+        let (mut store, _dir) = temp_store();
+        let s = store.create_script(None, "s", None, "true", &[]).unwrap();
+        let run = store
+            .create_script_run(s.id, &BTreeMap::new(), None, 1)
+            .unwrap();
+        // CASCADE, deliberately unlike `scripts.project_id`'s SET NULL: a run
+        // is a record *of* a script, meaningless without it.
+        store.delete_script(s.id).unwrap();
+        assert!(matches!(
+            store.get_script_run(run.id),
+            Err(Error::NotFound(_))
+        ));
+        assert!(store.list_script_runs(None, None).unwrap().is_empty());
+    }
+
+    /// Pins the `script_runs` table at index 64, NOT `MIGRATIONS.len() - 1`:
+    /// the positional form silently follows a reorder, and a shipped
+    /// migration may never be edited or moved.
+    #[test]
+    fn script_runs_arrive_at_migration_64() {
+        const SCRIPT_RUNS: usize = 64;
+        assert!(
+            MIGRATIONS[SCRIPT_RUNS].contains("CREATE TABLE script_runs"),
+            "migration {SCRIPT_RUNS} is no longer the script_runs table — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..SCRIPT_RUNS] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", SCRIPT_RUNS as i64)
+                .unwrap();
+        }
+        // A db from before the table upgrades into one that has it.
+        let mut store = Store::open(&path).unwrap();
+        let v: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+        let s = store.create_script(None, "s", None, "true", &[]).unwrap();
+        assert!(
+            store
+                .create_script_run(s.id, &BTreeMap::new(), None, 1)
+                .is_ok()
+        );
     }
 
     // ---- library ----

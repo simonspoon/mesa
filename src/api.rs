@@ -46,10 +46,10 @@ use crate::core::{
     LiveContext, LiveNotebookEntry, LiveNotice, LiveRole, LiveState, LiveStatus, LiveTranscript,
     LiveWindow, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree,
     ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch,
-    STALE_CLAIM_MINUTES, Script, ScriptArg, ScriptPatch, Status, Store, SystemInfo, Task,
-    TaskPatch, TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard, hooks,
-    inbox_triage, library, listen, live, receipt, retro, scripts, speech, supervisor, system,
-    version,
+    STALE_CLAIM_MINUTES, Script, ScriptArg, ScriptPatch, ScriptRunEvent, Status, Store, SystemInfo,
+    Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard,
+    hooks, inbox_triage, library, listen, live, receipt, retro, script_runs, scripts, speech,
+    supervisor, system, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -224,6 +224,13 @@ struct AppState {
     /// receipt records nothing, since there is no id to stop with (the
     /// limitation the attach pane already has).
     todo_dispatched: Arc<Mutex<HashMap<String, DispatchedSession>>>,
+    /// Every **detached** script run this server owns (mesa task 1224) — the
+    /// runs the Scripts page starts and can then close the tab on. In memory
+    /// beside the watcher bookkeeping above and for the same reason: the run
+    /// is a process this server is pumping, which no column could describe.
+    /// A restart therefore owns nothing, which is exactly what
+    /// `Store::reconcile_script_runs` relies on to close the rows left behind.
+    script_runs: Arc<script_runs::Registry>,
 }
 
 /// How often the todo-watcher (`watch_todo`) checks every project for
@@ -1681,7 +1688,29 @@ pub fn serve(
         cost_alerted: Arc::new(Mutex::new(std::collections::HashSet::new())),
         cost_stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
         todo_dispatched: Arc::new(Mutex::new(HashMap::new())),
+        script_runs: Arc::new(script_runs::Registry::new()),
     };
+    // A detached run is pumped by a thread of *this* process and tracked in
+    // memory, so at start-up no `running` row can be ours. Close the ones this
+    // server (or a previous one that died) left behind before anything can
+    // read them, so the page never shows a run as live that nothing is
+    // driving — a run whose owner is some *other* live `serve` is left alone
+    // (mesa task 1224, `Store::reconcile_script_runs`).
+    {
+        let mut store = state.store.lock().unwrap();
+        let pid = std::process::id() as i64;
+        match store.reconcile_script_runs(pid, script_runs::pid_is_live) {
+            Ok(ids) if !ids.is_empty() => {
+                eprintln!(
+                    "mesa: closed {} script run(s) abandoned by a restart: {:?}",
+                    ids.len(),
+                    ids
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("mesa: could not reconcile script runs: {e}"),
+        }
+    }
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1978,6 +2007,26 @@ fn router(state: AppState) -> Router {
         // The Scripts page's run: the same run, streamed as NDJSON lines as
         // they arrive (mesa task 1196). Same gate, same validation and cwd.
         .route("/api/scripts/{id}/run/stream", post(run_script_stream))
+        // The *detached* run (mesa task 1224): the same pre-flight and the
+        // same `core::scripts` command, but the run belongs to the server
+        // rather than to the request, so it survives the tab that started it
+        // and needs an explicit stop. Same gate as everything else on this
+        // surface.
+        .route("/api/scripts/{id}/run/detach", post(detach_script_run))
+        // Detached runs are their own top-level collection rather than
+        // `/api/scripts/{id}/runs`: nesting would silently reserve the script
+        // id `runs` and make the routing table depend on a literal-beats-param
+        // precedence argument. A separate collection costs nothing and removes
+        // the question. Same `require_agent_access` — a run's stored output is
+        // the output of a program mesa executed.
+        .route("/api/script-runs", get(list_script_runs))
+        .route("/api/script-runs/{id}", get(show_script_run))
+        // Replay-then-follow. A GET, because the global Content-Type gate
+        // covers mutating methods only and there is nothing to send; dropping
+        // this connection deliberately does **not** stop the run, which is the
+        // whole difference between this route and `/run/stream`.
+        .route("/api/script-runs/{id}/stream", get(stream_script_run))
+        .route("/api/script-runs/{id}/stop", post(stop_script_run))
         // Library: agent definitions, skills, hooks, prompts and CLAUDE.md
         // files, each (a prompt only when it exports) mirrored onto disk under
         // `.claude/`. A row becomes code mesa or Claude Code executes, so all
@@ -4831,6 +4880,195 @@ fn script_cwd(state: &AppState, script: &Script) -> Result<Option<String>, ApiEr
         });
     }
     Ok(Some(path))
+}
+
+// ---- detached script runs (mesa task 1224) ----
+
+#[derive(Deserialize)]
+struct ScriptRunsQuery {
+    /// Only this script's runs; absent means every script's.
+    #[serde(default)]
+    script: Option<i64>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// Starts one script **detached** and answers 201 with its run row at once.
+///
+/// Everything before the spawn is [`run_script`]'s, exactly: the same gate,
+/// 404 for an unknown script, 422 for bad values or an unusable cwd, 502 when
+/// bash will not start — and a failed pre-flight writes no row, because the
+/// spawn happens before the row does.
+///
+/// What differs is ownership. The run belongs to the server, not to this
+/// request: it is pumped by a thread of this process, its output is buffered
+/// for whoever attaches later, and **nothing about this connection can stop
+/// it**. `POST /api/script-runs/{id}/stop` is the only stop, which is the
+/// exact inverse of `/run/stream`, where the client hanging up is the stop.
+async fn detach_script_run(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<ScriptRunBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    let script = {
+        let store = state.store.lock().unwrap();
+        store.get_script(id)?
+    };
+    let cwd = script_cwd(&state, &script)?;
+    // Validated here rather than left to `scripts::start`, for `run_script`'s
+    // reason: it is what separates a client mistake about the declared args
+    // (422) from an execution failure (502).
+    scripts::validate_values(&script.args, &body.values).map_err(|message| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "validation",
+        message,
+    })?;
+    let record = state
+        .script_runs
+        .start(&state.store, &script, &body.values, cwd.as_deref())
+        .map_err(|e| match e {
+            script_runs::StartError::Spawn(message) => agents_unavailable(message),
+            script_runs::StartError::Store(e) => ApiError::from(e),
+        })?;
+    Ok((StatusCode::CREATED, Json(record)).into_response())
+}
+
+async fn list_script_runs(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<ScriptRunsQuery>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.list_script_runs(q.script, q.limit)?).into_response())
+}
+
+async fn show_script_run(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(store.get_script_run(id)?).into_response())
+}
+
+/// Replays what a run has printed and then follows it — the same
+/// `application/x-ndjson` body, one [`crate::core::ScriptRunEvent`] per line,
+/// that `/run/stream` emits, so one client parser reads both.
+///
+/// **One code path serves a live run and a finished one.** A run this server
+/// is pumping is attached to under one acquisition of its locks (snapshot,
+/// then subscribe), so nothing is missed at the seam and nothing arrives
+/// twice; a run that is over replays its stored NDJSON and, if that log never
+/// got a terminal event of its own — the restart-abandoned case — one
+/// synthesized from the row.
+///
+/// Dropping this connection does **not** stop the run.
+async fn stream_script_run(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    // An unknown run is 404 before a single byte is on the wire, like every
+    // other pre-flight failure on this surface.
+    let record = {
+        let store = state.store.lock().unwrap();
+        store.get_script_run(id)?
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(64);
+    match state.script_runs.attach(id) {
+        Some((snapshot, mut live)) => {
+            tokio::spawn(async move {
+                for event in snapshot {
+                    if tx.send(Ok(ndjson_line(&event))).await.is_err() {
+                        return;
+                    }
+                }
+                while let Some(event) = live.recv().await {
+                    if tx.send(Ok(ndjson_line(&event))).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        None => {
+            let stored = {
+                let store = state.store.lock().unwrap();
+                store.script_run_events(id)?
+            };
+            tokio::spawn(async move {
+                let ends_terminal = ndjson_ends_terminal(&stored);
+                if !stored.is_empty() && tx.send(Ok(stored.into_bytes())).await.is_err() {
+                    return;
+                }
+                if !ends_terminal && let Some(event) = script_runs::synthesized_terminal(&record) {
+                    let _ = tx.send(Ok(ndjson_line(&event))).await;
+                }
+            });
+        }
+    }
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        Body::from_stream(ReceiverStream::new(rx)),
+    )
+        .into_response())
+}
+
+/// Stops a detached run: sets the registry's stop flag, which the run's own
+/// 100ms cancel poll picks up and turns into a SIGKILL of the whole process
+/// group — the child a body started included.
+///
+/// **Idempotent.** Stopping a run that is already over is a 200 carrying the
+/// record, not an error (the `read_at` / inbox-archive posture); only an
+/// unknown run is 404. The returned record is the row as it stands, so a run
+/// stopped this instant still reads `running` — the terminal status reaches
+/// the page on its open stream or its next poll, within the cancel poll.
+async fn stop_script_run(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let record = {
+        let store = state.store.lock().unwrap();
+        store.get_script_run(id)?
+    };
+    state.script_runs.stop(id);
+    Ok(Json(record).into_response())
+}
+
+/// One event as its NDJSON line — the wire form, shared by both branches of
+/// the stream route so a replayed byte and a live one cannot differ.
+fn ndjson_line(event: &ScriptRunEvent) -> Vec<u8> {
+    let mut line = serde_json::to_vec(event).unwrap_or_default();
+    line.push(b'\n');
+    line
+}
+
+/// Whether a stored log already ends with the run's one terminal event. The
+/// pump always appends one, so this is false only for a row that was closed
+/// without a pump ever finishing it — a run a server restart abandoned.
+fn ndjson_ends_terminal(stored: &str) -> bool {
+    stored
+        .lines()
+        .next_back()
+        .and_then(|line| serde_json::from_str::<ScriptRunEvent>(line).ok())
+        .is_some_and(|event| script_runs::is_terminal(&event))
 }
 
 // ---- library (agents, skills, hooks, prompts, CLAUDE.md) ----
@@ -8835,6 +9073,7 @@ mod tests {
             cost_alerted: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cost_stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
             todo_dispatched: Arc::new(Mutex::new(HashMap::new())),
+            script_runs: Arc::new(script_runs::Registry::new()),
         };
         (dir, state)
     }
@@ -13341,6 +13580,199 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let stored = state.store.lock().unwrap().list_scripts(None).unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].name, "from-the-lan");
+    }
+
+    /// The detached run's five routes carry the same `require_agent_access` as
+    /// the rest of this surface, so the peer-address half needs the same Rust
+    /// test the authoring routes already have: a same-machine curl is always
+    /// a loopback peer, so only a forged `SocketAddr` can reach it. Under
+    /// `--lan` a genuine LAN page may start, read and stop a detached run —
+    /// `--lan` already hands that network the run — while a rebound page
+    /// (DNS-name Host) and a cross-site fetch (foreign Origin) stay refused,
+    /// and default mode refuses a non-loopback peer outright.
+    #[tokio::test]
+    async fn lan_page_may_start_and_stop_a_detached_run_but_not_from_a_rebound_page() {
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        let script = new_script(&state, None, "sleep 30");
+        let local = || hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+        let detach = |state: AppState, headers: HeaderMap, id: i64| async move {
+            detach_script_run(
+                State(state),
+                ConnectInfo(lan_peer()),
+                headers,
+                Path(id),
+                Ok(Json(ScriptRunBody {
+                    values: std::collections::BTreeMap::new(),
+                })),
+            )
+            .await
+        };
+
+        // A rebound page and a cross-site fetch are refused, writing no row.
+        for headers in [
+            hdrs(Some("evil.example.com:0"), None),
+            hdrs(Some("192.168.1.50:0"), Some("http://evil.example.com")),
+        ] {
+            assert!(
+                detach(state.clone(), headers, script.id)
+                    .await
+                    .unwrap_err()
+                    .status
+                    .is_client_error()
+            );
+        }
+        assert!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .list_script_runs(None, None)
+                .unwrap()
+                .is_empty(),
+            "a refused detach must write no run row"
+        );
+
+        // A genuine LAN page may start it, read it and stop it.
+        let started = detach(state.clone(), local(), script.id).await.unwrap();
+        assert_eq!(started.status(), StatusCode::CREATED);
+        let run: crate::core::ScriptRunRecord =
+            serde_json::from_value(json_body(started).await).unwrap();
+        assert_eq!(run.status, crate::core::ScriptRunStatus::Running);
+
+        let listed = list_script_runs(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            local(),
+            Query(ScriptRunsQuery {
+                script: Some(script.id),
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert!(
+            show_script_run(
+                State(state.clone()),
+                ConnectInfo(lan_peer()),
+                local(),
+                Path(run.id),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            stop_script_run(
+                State(state.clone()),
+                ConnectInfo(lan_peer()),
+                local(),
+                Path(run.id),
+            )
+            .await
+            .is_ok()
+        );
+
+        // The reads and the stop are refused from a rebound page too.
+        for headers in [
+            hdrs(Some("evil.example.com:0"), None),
+            hdrs(Some("192.168.1.50:0"), Some("http://evil.example.com")),
+        ] {
+            assert!(
+                show_script_run(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    headers.clone(),
+                    Path(run.id),
+                )
+                .await
+                .unwrap_err()
+                .status
+                .is_client_error()
+            );
+            assert!(
+                stream_script_run(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    headers.clone(),
+                    Path(run.id),
+                )
+                .await
+                .unwrap_err()
+                .status
+                .is_client_error()
+            );
+            assert!(
+                stop_script_run(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    headers,
+                    Path(run.id),
+                )
+                .await
+                .unwrap_err()
+                .status
+                .is_client_error()
+            );
+        }
+
+        // Default mode refuses the non-loopback peer outright, whatever the
+        // headers say.
+        let mut default_mode = state.clone();
+        default_mode.lan = false;
+        assert!(
+            detach(default_mode.clone(), local(), script.id)
+                .await
+                .unwrap_err()
+                .status
+                .is_client_error()
+        );
+        assert!(
+            stop_script_run(
+                State(default_mode),
+                ConnectInfo(lan_peer()),
+                local(),
+                Path(run.id),
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+    }
+
+    /// An unknown run is 404 on every route that names one, before any byte
+    /// of a stream is on the wire — the surface's own pre-flight rule.
+    #[tokio::test]
+    async fn detached_run_routes_404_an_unknown_run() {
+        let (_dir, state) = test_state();
+        for result in [
+            show_script_run(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(999_999),
+            )
+            .await,
+            stream_script_run(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(999_999),
+            )
+            .await,
+            stop_script_run(
+                State(state.clone()),
+                ConnectInfo(loopback()),
+                loopback_agent_headers(),
+                Path(999_999),
+            )
+            .await,
+        ] {
+            let err = result.unwrap_err();
+            assert_eq!(err.status, StatusCode::NOT_FOUND);
+            assert_eq!(err.code, "not_found");
+        }
     }
 
     /// A project's `local_path` is the folder an agent executes in, so writing

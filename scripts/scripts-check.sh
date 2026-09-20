@@ -696,6 +696,212 @@ done
 }
 ok "POST /api/scripts/{id}/run/stream: a client that hangs up stops the run — bash and its child are both killed"
 
+# ---- detached runs (mesa task 1224) ----
+# The third run shape: the server owns it, so it outlives the request that
+# started it, is reattachable, is persisted, and needs an EXPLICIT stop. The
+# assertions below are deliberately the inverse of the hang-up test above —
+# if those two ever agree, the two ownership models have collapsed into one.
+
+gstream() { # gstream <path> [extra curl args...] -> STATUS, BODY, CTYPE
+  local path=$1; shift
+  STATUS=$(curl -sN -o "$TMP/gstream" -D "$TMP/gstream-headers" -w '%{http_code}' \
+    "$@" "http://127.0.0.1:$PORT$path")
+  BODY=$(cat "$TMP/gstream")
+  CTYPE=$(tr -d '\r' <"$TMP/gstream-headers" | awk -F': ' 'tolower($1)=="content-type"{print $2}')
+}
+
+wait_run() { # wait_run <run-id> <status>
+  local i
+  for i in $(seq 1 150); do
+    api 200 GET "/api/script-runs/$1"
+    [ "$(jqb .status)" = "$2" ] && return 0
+    sleep 0.2
+  done
+  fail "run $1 never reached status $2 (got $(jqb .status): $BODY)"
+}
+
+runs_total() { api 200 GET /api/script-runs; jqb 'length'; }
+
+# 1. start → 201 with the row, values echoed, cwd resolved server-side
+BEFORE_ROWS=$(runs_total)
+api 201 POST "/api/scripts/$AECHO/run/detach" '{"values":{"target":"detached"}}'
+RID=$(jqb .id)
+[ "$(jqb .script_id)" = "$AECHO" ] || fail "detach: script_id, got $BODY"
+[ "$(jqb .status)" = "running" ] || fail "detach: a fresh run must be running, got $BODY"
+[ "$(jqb '.values.target')" = "detached" ] || fail "detach: values echoed, got $BODY"
+[ "$(jqb .cwd)" = "$HOME/.mesa/workspace" ] || fail "detach: server-resolved cwd, got $BODY"
+[ "$(jqb .exit_code)" = "null" ] || fail "detach: no exit code while running"
+[ "$(jqb .ended_at)" = "null" ] || fail "detach: no ended_at while running"
+[ "$(jqb 'has("events")')" = "false" ] || fail "detach: the record must never carry the log: $BODY"
+ok "POST /api/scripts/{id}/run/detach: 201 + a running ScriptRunRecord, values echoed, cwd resolved server-side"
+
+# 2. the same pre-flight as the other two run routes — and it writes NO row
+api 404 POST /api/scripts/999999/run/detach '{"values":{}}'
+[ "$(jqb .error.code)" = "not_found" ] || fail "detach unknown script: error.code"
+api 422 POST "/api/scripts/$AS/run/detach" '{"values":{}}'
+[ "$(jqb .error.code)" = "validation" ] || fail "detach missing required: error.code"
+api 422 POST "/api/scripts/$AS/run/detach" '{"values":{"who":"x","nope":"y"}}'
+[ "$(jqb .error.code)" = "validation" ] || fail "detach undeclared key: error.code"
+api 422 POST "/api/scripts/$ANOPATH/run/detach" '{"values":{}}'
+[ "$(jqb .error.code)" = "validation" ] || fail "detach no local_path: error.code"
+[ "$(runs_total)" = "$((BEFORE_ROWS + 1))" ] ||
+  fail "a refused detach wrote a run row: only the one good start should exist"
+ok "POST /api/scripts/{id}/run/detach: unknown id 404, bad values and an unusable cwd 422 — each writing no run row"
+
+# 3. the run is listed, newest first, and the listing carries no log either
+wait_run "$RID" finished
+[ "$(jqb .exit_code)" = "0" ] || fail "detached run: exit_code, got $BODY"
+[ "$(jqb .ended_at)" != "null" ] || fail "detached run: ended_at once it is over"
+[ "$(jqb .note)" = "null" ] || fail "a run that exited normally carries no note: $BODY"
+api 200 GET "/api/script-runs?script=$AECHO"
+[ "$(jqb type)" = "array" ] || fail "GET /api/script-runs: bare array"
+[ "$(jqb '.[0].id')" = "$RID" ] || fail "GET /api/script-runs: newest first, got $BODY"
+[ "$(jqb 'all(.script_id == '"$AECHO"')')" = "true" ] || fail "GET /api/script-runs?script: scoping"
+[ "$(jqb 'all(has("events") | not)')" = "true" ] || fail "the listing must never carry the log: $BODY"
+api 404 GET /api/script-runs/999999
+[ "$(jqb .error.code)" = "not_found" ] || fail "GET /api/script-runs/{id} unknown: error.code"
+ok "GET /api/script-runs[?script=<id>] and /{id}: newest first, scoped, never carrying the log; an unknown run is 404"
+
+# 4. replaying a FINISHED run gives back exactly what the live stream gave —
+#    same interleaving, same t ordering, exactly one terminal event.
+api 201 POST /api/scripts "$(jq -nc '{name:"api-detach-replay", body:"echo one; sleep 0.3; echo two >&2; sleep 0.3; printf three; exit 3"}')"
+AREPLAY=$(jqb .id)
+api 201 POST "/api/scripts/$AREPLAY/run/detach" '{"values":{}}'
+RREPLAY=$(jqb .id)
+wait_run "$RREPLAY" finished
+[ "$(jqb .exit_code)" = "3" ] || fail "replay fixture: a nonzero exit is data, got $BODY"
+gstream "/api/script-runs/$RREPLAY/stream"
+[ "$STATUS" = "200" ] || fail "replay stream: expected 200, got $STATUS: $BODY"
+[ "$CTYPE" = "application/x-ndjson" ] || fail "replay stream: content-type, got '$CTYPE'"
+[ "$(jq -sc '[.[] | select(.type == "line") | [.stream, .text]]' <<<"$BODY")" = '[["stdout","one"],["stderr","two"],["stdout","three"]]' ] ||
+  fail "replay stream: the stored log must replay in arrival order: $BODY"
+[ "$(jq -s '[.[] | select(.type == "line") | .t] | .[1] >= 250 and .[2] >= .[1] + 250' <<<"$BODY")" = "true" ] ||
+  fail "replay stream: the stored per-line timestamps must survive: $BODY"
+[ "$(jq -sc '.[-1] | [.type, .code, .truncated]' <<<"$BODY")" = '["exit",3,false]' ] ||
+  fail "replay stream: last event must be the exit event: $BODY"
+[ "$(jq -s '[.[] | select(.type == "exit" or .type == "error")] | length' <<<"$BODY")" = "1" ] ||
+  fail "replay stream: exactly one terminal event: $BODY"
+ok "GET /api/script-runs/{id}/stream on a finished run: replays the stored NDJSON byte-for-byte — same interleaving, same timestamps, one terminal event"
+
+# 5. THE reattach assertion — the inverse of the hang-up test above.
+#    A reader that walks away mid-run leaves bash AND its child alive, and the
+#    next reader sees both what was printed before it attached and what came
+#    after: replay and follow in one stream.
+PIDS_D="$TMP/detach-pids"
+api 201 POST /api/scripts "$(jq -nc --arg f "$PIDS_D" '{name:"api-detach-follow", body:("sleep 20 >/dev/null 2>&1 & echo \"$$ $!\" > \"" + $f + "\"; echo before; sleep 2; echo after; exit 0")}')"
+AFOLLOW=$(jqb .id)
+api 201 POST "/api/scripts/$AFOLLOW/run/detach" '{"values":{}}'
+RFOLLOW=$(jqb .id)
+set +e
+curl -sN --max-time 0.8 -o "$TMP/detach-abort" "http://127.0.0.1:$PORT/api/script-runs/$RFOLLOW/stream"
+set -e
+grep -q '"before"' "$TMP/detach-abort" ||
+  fail "detached stream: the first line never arrived: $(cat "$TMP/detach-abort")"
+read -r D_BASH_PID D_CHILD_PID <"$PIDS_D"
+sleep 0.3
+kill -0 "$D_BASH_PID" 2>/dev/null ||
+  fail "detached run: bash died when its reader walked away — the run must outlive the reader"
+kill -0 "$D_CHILD_PID" 2>/dev/null ||
+  fail "detached run: the body's child died when its reader walked away"
+api 200 GET "/api/script-runs/$RFOLLOW"
+[ "$(jqb .status)" = "running" ] || fail "detached run: still running after its reader left, got $BODY"
+# A second reader: replay ("before", printed before it attached) then follow
+# ("after", printed after), ending with the one terminal event.
+gstream "/api/script-runs/$RFOLLOW/stream"
+[ "$STATUS" = "200" ] || fail "reattach: expected 200, got $STATUS"
+[ "$(jq -sc '[.[] | select(.type == "line") | .text]' <<<"$BODY")" = '["before","after"]' ] ||
+  fail "reattach: must see the line printed BEFORE it attached and the one after: $BODY"
+[ "$(jq -s '[.[] | select(.type == "exit" or .type == "error")] | length' <<<"$BODY")" = "1" ] ||
+  fail "reattach: exactly one terminal event: $BODY"
+wait_run "$RFOLLOW" finished
+kill "$D_CHILD_PID" 2>/dev/null || true
+ok "GET /api/script-runs/{id}/stream: a reader hanging up does NOT stop the run (bash and its child live on) and the next reader replays what it missed then follows"
+
+# 6. the explicit stop — the only stop this route has — kills the process group
+PIDS_S="$TMP/detach-stop-pids"
+api 201 POST /api/scripts "$(jq -nc --arg f "$PIDS_S" '{name:"api-detach-stop", body:("sleep 60 & echo \"$$ $!\" > \"" + $f + "\"; echo started; wait")}')"
+ASTOP=$(jqb .id)
+api 201 POST "/api/scripts/$ASTOP/run/detach" '{"values":{}}'
+RSTOP=$(jqb .id)
+for _ in $(seq 1 100); do [ -s "$PIDS_S" ] && break; sleep 0.1; done
+[ -s "$PIDS_S" ] || fail "stop fixture: the body never started"
+read -r S_BASH_PID S_CHILD_PID <"$PIDS_S"
+api 200 POST "/api/script-runs/$RSTOP/stop" '{}'
+[ "$(jqb .id)" = "$RSTOP" ] || fail "stop: echoes the run record, got $BODY"
+wait_run "$RSTOP" stopped
+[ "$(jqb .exit_code)" = "null" ] || fail "a stopped run has no exit code: $BODY"
+[ "$(jqb .note)" != "null" ] || fail "a stopped run says why it has no exit code: $BODY"
+GONE=
+for _ in $(seq 1 30); do
+  if ! kill -0 "$S_BASH_PID" 2>/dev/null && ! kill -0 "$S_CHILD_PID" 2>/dev/null; then GONE=1; break; fi
+  sleep 0.1
+done
+[ -n "$GONE" ] || {
+  kill "$S_CHILD_PID" "$S_BASH_PID" 2>/dev/null
+  fail "stop: the script (bash $S_BASH_PID, child $S_CHILD_PID) outlived the stop"
+}
+ok "POST /api/script-runs/{id}/stop: kills bash AND its child, and the row lands stopped with no exit code"
+
+# 7. stop is idempotent: a run that is already over is 200, not an error
+api 200 POST "/api/script-runs/$RSTOP/stop" '{}'
+[ "$(jqb .status)" = "stopped" ] || fail "re-stop: the record is unchanged, got $BODY"
+api 200 POST "/api/script-runs/$RID/stop" '{}'
+[ "$(jqb .status)" = "finished" ] || fail "stopping a finished run must not resurrect it: $BODY"
+[ "$(jqb .exit_code)" = "0" ] || fail "stopping a finished run must not clear its exit code: $BODY"
+api 404 POST /api/script-runs/999999/stop '{}'
+[ "$(jqb .error.code)" = "not_found" ] || fail "stop unknown run: error.code"
+ok "POST /api/script-runs/{id}/stop: idempotent — stopping a run that is already over is 200 and changes nothing; an unknown run is 404"
+
+# 8. retention: 20 newest per script, and another script's runs are untouched
+api 201 POST /api/scripts '{"name":"api-detach-many","body":"true"}'
+AMANY=$(jqb .id)
+for _ in $(seq 1 21); do
+  api 201 POST "/api/scripts/$AMANY/run/detach" '{"values":{}}'
+done
+api 200 GET "/api/script-runs?script=$AMANY"
+[ "$(jqb length)" = "20" ] || fail "retention: expected 20 runs kept, got $(jqb length)"
+api 200 GET "/api/script-runs?script=$AECHO"
+[ "$(jqb length)" = "1" ] || fail "retention must be PER SCRIPT: the other script's run vanished ($BODY)"
+ok "detached runs are pruned to the newest 20 per script, and the prune never touches another script's runs"
+
+# 9. a server restart abandons the runs it was pumping — it never lies about
+#    them. The script's process group survives the server (it is its own
+#    group), so mesa says `failed` and says why rather than `running`.
+PIDS_R="$TMP/detach-restart-pids"
+api 201 POST /api/scripts "$(jq -nc --arg f "$PIDS_R" '{name:"api-detach-restart", body:("sleep 90 & echo \"$$ $!\" > \"" + $f + "\"; echo started; wait")}')"
+ARESTART=$(jqb .id)
+api 201 POST "/api/scripts/$ARESTART/run/detach" '{"values":{}}'
+RRESTART=$(jqb .id)
+for _ in $(seq 1 100); do [ -s "$PIDS_R" ] && break; sleep 0.1; done
+[ -s "$PIDS_R" ] || fail "restart fixture: the body never started"
+read -r R_BASH_PID R_CHILD_PID <"$PIDS_R"
+kill -9 "$SERVER_PID" 2>/dev/null || true
+wait "$SERVER_PID" 2>/dev/null || true
+"$MESA" serve --port "$PORT" >>"$TMP/serve.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "http://127.0.0.1:$PORT/api/projects" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "http://127.0.0.1:$PORT/api/projects" >/dev/null ||
+  fail "server did not restart (log: $(cat "$TMP/serve.log"))"
+api 200 GET "/api/script-runs/$RRESTART"
+[ "$(jqb .status)" = "failed" ] || fail "restart: an abandoned run must be failed, got $BODY"
+[ "$(jqb .note)" != "null" ] || fail "restart: the abandoned run must say why: $BODY"
+case "$(jqb .note)" in *restart*) ;; *) fail "restart: the note must name the restart, got $(jqb .note)";; esac
+[ "$(jqb .ended_at)" != "null" ] || fail "restart: an abandoned run is over, so it has an ended_at"
+api 200 GET /api/script-runs
+[ "$(jqb '[.[] | select(.status == "running")] | length')" = "0" ] ||
+  fail "restart: no run may still read as running after a restart: $BODY"
+# The stream of an abandoned run still ends with exactly one terminal event,
+# even though its log was never written.
+gstream "/api/script-runs/$RRESTART/stream"
+[ "$STATUS" = "200" ] || fail "restart: streaming an abandoned run, got $STATUS"
+[ "$(jq -sc '[.[] | select(.type == "exit" or .type == "error")] | length' <<<"$BODY")" = "1" ] ||
+  fail "restart: an abandoned run still owes its reader one terminal event: $BODY"
+kill -9 "$R_CHILD_PID" "$R_BASH_PID" 2>/dev/null || true
+ok "a server restart closes the runs it was pumping as failed, naming the restart — never leaving one reading as running"
+
 # ---- delete ----
 
 api 200 DELETE "/api/scripts/$AFAIL"
@@ -758,6 +964,39 @@ raw POST "/api/scripts/$AS/run/stream" -H "Host: 127.0.0.1:$PORT" -H 'Origin: ht
 raw POST "/api/scripts/$AS/run/stream"
 [ "$STATUS" = "415" ] || fail "default: stream with no Content-Type must be 415, got $STATUS"
 ok "default mode: show and run carry the same gate as list"
+
+# The five detached-run routes carry that identical gate — a run's stored
+# output is the output of a program mesa executed, so there is no read/write
+# split here either.
+raw GET /api/script-runs -H "Host: 127.0.0.1:$PORT"
+[ "$STATUS" = "200" ] || fail "default: GET /api/script-runs from a local Host must be 200, got $STATUS"
+raw GET /api/script-runs -H "Host: evil.example"
+[ "$STATUS" = "403" ] || fail "default: GET /api/script-runs with a foreign Host must be 403, got $STATUS"
+raw GET /api/script-runs -H "Host: 127.0.0.1:$PORT" -H 'Origin: https://evil.example'
+[ "$STATUS" = "403" ] || fail "default: GET /api/script-runs with a foreign Origin must be 403, got $STATUS"
+raw GET "/api/script-runs/$RID" -H "Host: evil.example"
+[ "$STATUS" = "403" ] || fail "default: GET /api/script-runs/{id} with a foreign Host must be 403"
+raw GET "/api/script-runs/$RID/stream" -H "Host: evil.example"
+[ "$STATUS" = "403" ] || fail "default: the detached stream with a foreign Host must be 403, got $STATUS"
+raw GET "/api/script-runs/$RID/stream" -H "Host: 127.0.0.1:$PORT" -H 'Origin: https://evil.example'
+[ "$STATUS" = "403" ] || fail "default: the detached stream with a foreign Origin must be 403, got $STATUS"
+raw POST "/api/scripts/$AS/run/detach" -H "Host: evil.example" \
+  -H 'Content-Type: application/json' -d '{"values":{"who":"x"}}'
+[ "$STATUS" = "403" ] || fail "default: detach with a foreign Host must be 403, got $STATUS"
+raw POST "/api/scripts/$AS/run/detach" -H "Host: 127.0.0.1:$PORT" -H 'Origin: https://evil.example' \
+  -H 'Content-Type: application/json' -d '{"values":{"who":"x"}}'
+[ "$STATUS" = "403" ] || fail "default: detach with a foreign Origin must be 403, got $STATUS"
+raw POST "/api/script-runs/$RID/stop" -H "Host: evil.example" -H 'Content-Type: application/json' -d '{}'
+[ "$STATUS" = "403" ] || fail "default: stop with a foreign Host must be 403, got $STATUS"
+# The Content-Type gate covers the two new mutating routes with no carve-out.
+raw POST "/api/scripts/$AS/run/detach"
+[ "$STATUS" = "415" ] || fail "default: detach with no Content-Type must be 415, got $STATUS"
+raw POST "/api/script-runs/$RID/stop"
+[ "$STATUS" = "415" ] || fail "default: stop with no Content-Type must be 415, got $STATUS"
+api 200 GET /api/script-runs
+[ "$(jqb '[.[] | select(.script_id == '"$AS"')] | length')" = "0" ] ||
+  fail "default: a refused detach must have started nothing"
+ok "default mode: all five detached-run routes carry the same gate, and neither mutation escapes the Content-Type check"
 
 raw POST /api/scripts -H "Host: evil.example" -H 'Content-Type: application/json' \
   -d '{"name":"gate-probe","body":"echo x"}'
@@ -853,6 +1092,38 @@ ok "--lan: reads follow require_agent_access — IP-literal Host on our port all
 [ "$(lan_req POST "/api/scripts/$AS/run/stream" "192.0.2.7:$LAN_PORT" 'https://evil.example' '{"values":{"who":"x"}}')" = "403" ] ||
   fail "--lan: the streamed run must reject a foreign Origin"
 ok "--lan: POST /api/scripts/{id}/run and /run/stream are reachable LAN-side (trigger allowed) but shut to rebinding and cross-site pages"
+
+# The detached run relaxes the same way and refuses the same way.
+[ "$(lan_req GET /api/script-runs "192.0.2.7:$LAN_PORT")" = "200" ] ||
+  fail "--lan: GET /api/script-runs must accept an IP-literal Host on our port"
+[ "$(lan_req GET /api/script-runs 'evil.example')" = "403" ] ||
+  fail "--lan: GET /api/script-runs must reject a DNS-name Host"
+[ "$(lan_req GET /api/script-runs "192.0.2.7:$LAN_PORT" 'https://evil.example')" = "403" ] ||
+  fail "--lan: GET /api/script-runs must reject a foreign Origin"
+[ "$(lan_req POST "/api/scripts/$AS/run/detach" "192.0.2.7:$LAN_PORT" '' '{"values":{"who":"lan"}}')" = "201" ] ||
+  fail "--lan: detach must be reachable from a LAN-shaped request"
+LAN_RID=$(jq -r .id < "$TMP/body")
+[ "$(lan_req GET "/api/script-runs/$LAN_RID" "192.0.2.7:$LAN_PORT")" = "200" ] ||
+  fail "--lan: GET /api/script-runs/{id} must be reachable from a LAN-shaped request"
+[ "$(lan_req GET "/api/script-runs/$LAN_RID/stream" "192.0.2.7:$LAN_PORT")" = "200" ] ||
+  fail "--lan: the detached stream must be reachable from a LAN-shaped request"
+[ "$(jq -sr '[.[] | select(.type == "exit" or .type == "error")] | length' <"$TMP/body")" = "1" ] ||
+  fail "--lan: the detached stream must end with exactly one terminal event"
+[ "$(lan_req POST "/api/script-runs/$LAN_RID/stop" "192.0.2.7:$LAN_PORT" '' '{}')" = "200" ] ||
+  fail "--lan: stop must be reachable from a LAN-shaped request"
+[ "$(lan_req POST "/api/scripts/$AS/run/detach" 'evil.example' '' '{"values":{"who":"x"}}')" = "403" ] ||
+  fail "--lan: detach must reject a DNS-name Host"
+[ "$(lan_req POST "/api/scripts/$AS/run/detach" "192.0.2.7:$LAN_PORT" 'https://evil.example' '{"values":{"who":"x"}}')" = "403" ] ||
+  fail "--lan: detach must reject a foreign Origin"
+[ "$(lan_req GET "/api/script-runs/$LAN_RID/stream" 'evil.example')" = "403" ] ||
+  fail "--lan: the detached stream must reject a DNS-name Host"
+[ "$(lan_req POST "/api/script-runs/$LAN_RID/stop" 'evil.example' '' '{}')" = "403" ] ||
+  fail "--lan: stop must reject a DNS-name Host"
+LAN_NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Host: 127.0.0.1:$LAN_PORT" \
+  "http://127.0.0.1:$LAN_PORT/api/script-runs/$LAN_RID/stop")
+[ "$LAN_NO_CT" = "415" ] ||
+  fail "--lan: stop with no Content-Type must still be 415, got $LAN_NO_CT"
+ok "--lan: the five detached-run routes relax to a LAN-shaped page and stay shut to rebinding, cross-site and form-encoded requests"
 
 # Authoring carries that identical gate as of mesa task 1022: a rebinding page
 # and a cross-site page are refused, a page this server handed out is not.

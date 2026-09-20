@@ -1696,6 +1696,85 @@ pub enum ScriptRunEvent {
     },
 }
 
+/// What became of one **detached** script run (mesa task 1224) — the run the
+/// Scripts page starts and can walk away from. Four values, deliberately the
+/// vocabulary the run pane already renders: a nonzero exit is `Finished` (a
+/// nonzero exit is *data* on this surface), `Stopped` is the explicit stop,
+/// and `Failed` is "no exit status could be collected" — the stream ended
+/// without one, or a server restart abandoned the run — with
+/// [`ScriptRunRecord::note`] saying which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum ScriptRunStatus {
+    Running,
+    Finished,
+    Stopped,
+    Failed,
+}
+
+impl ScriptRunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScriptRunStatus::Running => "running",
+            ScriptRunStatus::Finished => "finished",
+            ScriptRunStatus::Stopped => "stopped",
+            ScriptRunStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ScriptRunStatus> {
+        match s {
+            "running" => Some(ScriptRunStatus::Running),
+            "finished" => Some(ScriptRunStatus::Finished),
+            "stopped" => Some(ScriptRunStatus::Stopped),
+            "failed" => Some(ScriptRunStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One **persisted** script run — the record of a detached run, started by
+/// `POST /api/scripts/{id}/run/detach` and outliving the tab that started it
+/// (mesa task 1224). The two older run routes are unchanged and still persist
+/// nothing; this is the third shape, and the only one with a row.
+///
+/// It deliberately carries **no `events` field**. The log stays a wire-only
+/// concept — the same [`ScriptRunEvent`] NDJSON a live run emits, reached only
+/// through `GET /api/script-runs/{id}/stream`, which replays the stored bytes
+/// and then follows. That is what lets `list` and `show` return this one type:
+/// twenty runs × 64 KiB of log would be unusable in a list, and a second
+/// "summary" projection is exactly what this repo does not do.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ScriptRunRecord {
+    #[ts(type = "number")]
+    pub id: i64,
+    #[ts(type = "number")]
+    pub script_id: i64,
+    /// The values this run was given, keyed by declared arg name — what the
+    /// form is restored from when the run is reopened. Stored, not derived:
+    /// the script's declared args may have changed since.
+    #[ts(type = "Record<string, string>")]
+    pub values: std::collections::BTreeMap<String, String>,
+    pub status: ScriptRunStatus,
+    /// The process exit code, once there is one. Null while `running` and for
+    /// every run that ended without one (`stopped`, `failed`).
+    pub exit_code: Option<i32>,
+    /// Why there is no exit code — the stop, the collection failure, the
+    /// server restart. Null on a run that exited normally.
+    pub note: Option<String>,
+    /// True when either stream hit the 64 KiB cap, exactly as on a live run's
+    /// exit event.
+    pub truncated: bool,
+    /// The directory the run was started in, resolved server-side at start
+    /// time. Stored rather than re-derived: the project could be rebound, or
+    /// its `local_path` changed, between the run and the reopen.
+    pub cwd: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+}
+
 // ---- artifacts (agent-written pages, mesa task 974) --------------------
 //
 // NOTE: unrelated to `Task::artifact` (a bounded pointer string — a commit

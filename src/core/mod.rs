@@ -16,6 +16,7 @@ pub mod migrate;
 pub mod receipt;
 pub mod retro;
 
+pub mod script_runs;
 pub mod scripts;
 pub mod speech;
 pub mod stop_guard;
@@ -30,7 +31,8 @@ pub use store::{
     ArtifactPatch, DiagramPatch, EdgeNew, EdgePatch, Error, FrameNew, FramePatch,
     INBOX_ARCHIVE_REASON_MAX, ImportDoc, LIVE_AUDIO_MAX, LIVE_BOARD_BODY_MAX, LIVE_BOARD_KEEP,
     LIVE_TEXT_MAX, LIVE_TURNS_MAX, LibraryPatch, NextResult, ProjectPatch, ReceiptPatch, Result,
-    STALE_CLAIM_MINUTES, ScriptPatch, Store, TaskPatch, default_db_path,
+    SCRIPT_RUN_ABANDONED, SCRIPT_RUN_KEEP, STALE_CLAIM_MINUTES, ScriptPatch, Store, TaskPatch,
+    default_db_path,
 };
 pub use types::{
     ARTIFACT_CONTENT_TYPES, AgentSession, AgentSpawned, AnchorSide, Artifact, ArtifactSummary,
@@ -48,6 +50,6 @@ pub use types::{
     LiveTranscript, LiveTurn, LiveWindow, MesaVersion, ModelRates, Priority, Project,
     ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus, ProjectGitView,
     ProjectVersion, RetroFinding, RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind,
-    ScriptRun, ScriptRunEvent, ScriptStream, Status, SystemInfo, Task, TaskReceipt, TaskSummary,
-    Waypoint, is_valid_artifact_content_type, task_name,
+    ScriptRun, ScriptRunEvent, ScriptRunRecord, ScriptRunStatus, ScriptStream, Status, SystemInfo,
+    Task, TaskReceipt, TaskSummary, Waypoint, is_valid_artifact_content_type, task_name,
 };

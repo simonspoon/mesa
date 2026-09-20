@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { runScriptStream } from '../api'
+import { getScriptRun, startScriptRun, stopScriptRun, streamScriptRun } from '../api'
 import {
   draftFrom,
+  draftFromRun,
   isRunnable,
   valueError,
   valuesFor,
@@ -15,11 +16,16 @@ import {
   formatDuration,
   formatElapsed,
   isAtBottom,
+  logLinesFrom,
   logText,
+  runElapsedMs,
+  runStartedMs,
+  runState,
   type LogLine,
 } from '../scriptRun'
 import type { Script } from '../types/Script'
 import type { ScriptArg } from '../types/ScriptArg'
+import type { ScriptRunRecord } from '../types/ScriptRunRecord'
 
 /** One control per declared kind — the whole reason the kinds are a closed
  * set of four. `bool` is a checkbox over the literal strings `"true"`/`"false"`
@@ -91,34 +97,33 @@ function ArgField({
   )
 }
 
-/** How a run ended, for the summary line and the log header. */
-interface Finished {
-  at: number
-  code: number | null
-  durationMs: number
-  truncated: boolean
-  /** Why there is no exit code: the run was stopped, or failed mid-stream. */
-  note: string | null
-}
-
-type Phase = 'idle' | 'running' | 'finished'
-
 /**
  * The run pane for one script (mesa task 1196), in the page rather than a
- * modal: the generated argument form, RUN and the last run's summary on top;
- * a drag handle that resizes the split and can fold the form away; and one
- * log below that streams the run as it happens — stdout and stderr in arrival
- * order, each line timestamped, stderr tagged.
+ * modal: the generated argument form, RUN and the run's summary on top; a
+ * drag handle that resizes the split and can fold the form away; and one log
+ * below — stdout and stderr in arrival order, each line timestamped, stderr
+ * tagged.
+ *
+ * Since mesa task 1224 the pane **does not own the run**. `runId` names a row
+ * the server owns, and the pane attaches to it through
+ * `GET /api/script-runs/{id}/stream`, which replays what the run has already
+ * printed and then follows it. One code path therefore serves a run that
+ * started a second ago and one that finished yesterday, and reopening either
+ * restores the same screen: the form is seeded from the values *that run* was
+ * given (`draftFromRun`), the state word and the exit code come off the row
+ * rather than from local bookkeeping, and the elapsed clock counts from the
+ * server's `started_at`, so a run reopened ten minutes in does not read
+ * `00:00`.
  *
  * Two kinds of "failure" are deliberately kept apart. A run that *happened*
  * and exited nonzero is data — a red exit code in the summary and its own
  * stderr in the log; only a request that never produced a run (a validation
  * error, a missing `local_path`, bash failing to spawn) sets `error`.
  *
- * Stop aborts the fetch, and the server kills the script when the response
- * is dropped. Leaving the pane does **not** stop a run — closing the old
- * modal never did, and a navigation should not kill a release halfway — the
- * run finishes server-side with nobody reading it.
+ * Leaving the pane no longer merely *fails* to stop the run — it structurally
+ * cannot. Unmounting aborts the stream fetch and nothing else;
+ * `POST /api/script-runs/{id}/stop` is the only stop, which is the exact
+ * inverse of the older `/run/stream` route, where hanging up is the stop.
  *
  * All the logic worth testing lives in `scriptDraft.ts` and `scriptRun.ts`;
  * this file renders it (CLAUDE.md: logic does not stay inline in a `.tsx`).
@@ -126,21 +131,30 @@ type Phase = 'idle' | 'running' | 'finished'
 export function ScriptRunPane({
   script,
   cwd,
+  runId,
+  onRunStarted,
   onClose,
 }: {
   script: Script
-  /** Where the run happens, for display only — the server resolves it. */
+  /** Where a *new* run would happen, for display only — the server resolves
+   * it. A run that already happened reports its own, which is the one that
+   * was used and may since have changed. */
   cwd: string
+  /** The run on screen, or `null` for the form with no run open yet. */
+  runId: number | null
+  /** A run has started: the page makes `#/scripts/runs/{id}` the address,
+   * which comes back as `runId` and is what attaches the stream. */
+  onRunStarted: (id: number) => void
   onClose: () => void
 }) {
   const [draft, setDraft] = useState<ValueDraft>(() => draftFrom(script))
-  const [phase, setPhase] = useState<Phase>('idle')
+  const [run, setRun] = useState<ScriptRunRecord | null>(null)
   const [lines, setLines] = useState<LogLine[]>([])
-  const [startedAt, setStartedAt] = useState(0)
   const [command, setCommand] = useState('')
   const [now, setNow] = useState(() => Date.now())
-  const [finished, setFinished] = useState<Finished | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [starting, setStarting] = useState(false)
+  const [stopping, setStopping] = useState(false)
   const [follow, setFollow] = useState(true)
   const [wrap, setWrap] = useState(true)
   const [copied, setCopied] = useState(false)
@@ -148,11 +162,17 @@ export function ScriptRunPane({
   const [collapsed, setCollapsed] = useState(false)
   const [dragging, setDragging] = useState(false)
 
-  const abortRef = useRef<AbortController | null>(null)
-  const stoppedRef = useRef(false)
   const splitRef = useRef<HTMLDivElement>(null)
   const logRef = useRef<HTMLDivElement>(null)
   const mountedRef = useRef(true)
+  // The attach effect reads the script through a ref rather than depending on
+  // it: a refetched list hands down a new object for an unchanged script, and
+  // that must not tear down a live stream and blank the log (`useFetch`'s own
+  // `loadRef` idiom).
+  const scriptRef = useRef(script)
+  useEffect(() => {
+    scriptRef.current = script
+  })
 
   useEffect(() => {
     mountedRef.current = true
@@ -161,12 +181,72 @@ export function ScriptRunPane({
     }
   }, [])
 
+  // A different run is on screen: clear what belonged to the last one now,
+  // during render off the changed prop rather than in the effect below, so
+  // there is no frame showing the old log under the new run (`useFetch.ts`
+  // adjusts its own state the same way, and for the same reason).
+  const [shownRunId, setShownRunId] = useState(runId)
+  if (runId !== shownRunId) {
+    setShownRunId(runId)
+    setLines([])
+    setError(null)
+    setFollow(true)
+    setCopied(false)
+    // The row goes too, not just the log: the previous run's exit code beside
+    // the new run's empty log would be a lie for the one round trip it takes
+    // to read the new row. `idle` for that frame is merely uninformative.
+    setRun(null)
+    setCommand('')
+    // The press that started this run is what got us here, so it is over.
+    setStarting(false)
+  }
+
+  // Attach to the run on screen: read its row, then replay-and-follow its
+  // log. Identical whether it is still going or long over.
+  useEffect(() => {
+    if (runId === null) return
+    const controller = new AbortController()
+    let live = true
+    const attach = async () => {
+      const record = await getScriptRun(runId)
+      if (!live) return
+      setRun(record)
+      setDraft(draftFromRun(scriptRef.current, record.values))
+      setCommand(commandLine(scriptRef.current.name, record.values))
+      setNow(Date.now())
+      await streamScriptRun(
+        runId,
+        (event) => {
+          // `logLinesFrom` is the one place an event becomes a log line —
+          // the terminal ones are not lines and are dropped there, not here.
+          if (live) setLines((prev) => [...prev, ...logLinesFrom([event])])
+        },
+        controller.signal,
+      )
+      // The body ends when the run does, and the server writes the row before
+      // it closes the stream — so this read is the run's settled outcome, and
+      // the pane never has to infer a status from the events it saw.
+      if (live && record.status === 'running') {
+        const done = await getScriptRun(runId)
+        if (live) setRun(done)
+      }
+    }
+    attach().catch((err: unknown) => {
+      if (!live) return
+      setError(err instanceof Error ? err.message : String(err))
+    })
+    return () => {
+      live = false
+      controller.abort()
+    }
+  }, [runId])
+
   // The elapsed clock, only while a run is on.
   useEffect(() => {
-    if (phase !== 'running') return
+    if (run?.status !== 'running') return
     const timer = window.setInterval(() => setNow(Date.now()), 250)
     return () => window.clearInterval(timer)
-  }, [phase])
+  }, [run?.status])
 
   // Follow: every new line pins the log to its end, unless the reader
   // scrolled away (onScroll turns follow off) or switched it off.
@@ -177,101 +257,41 @@ export function ScriptRunPane({
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
-    if (phase === 'running') return
-    const values = valuesFor(script.args, draft)
-    const controller = new AbortController()
-    const began = Date.now()
-    abortRef.current = controller
-    stoppedRef.current = false
-    setPhase('running')
+    if (busy) return
+    setStarting(true)
     setError(null)
-    setLines([])
-    setStartedAt(began)
-    setNow(began)
-    setCommand(commandLine(script.name, values))
-    setFollow(true)
-    setCopied(false)
-
-    let ended: Finished | null = null
-    let sawLine = false
-    runScriptStream(
-      script.id,
-      values,
-      (event) => {
-        if (!mountedRef.current) return
-        if (event.type === 'line') {
-          const { stream, t, text } = event
-          sawLine = true
-          setLines((prev) => [...prev, { stream, t, text }])
-        } else if (event.type === 'exit') {
-          ended = {
-            at: began,
-            code: event.code,
-            durationMs: event.duration_ms,
-            truncated: event.truncated,
-            note: null,
-          }
-        } else {
-          ended = {
-            at: began,
-            code: null,
-            durationMs: Date.now() - began,
-            truncated: false,
-            note: event.message,
-          }
-        }
-      },
-      controller.signal,
-    ).then(
-      () => {
-        if (!mountedRef.current) return
-        setPhase('finished')
-        setFinished(
-          ended ?? {
-            at: began,
-            code: null,
-            durationMs: Date.now() - began,
-            truncated: false,
-            note: 'the stream ended without an exit status',
-          },
-        )
+    startScriptRun(script.id, valuesFor(script.args, draft)).then(
+      (record) => {
+        // The hash is what actually opens the run — the pane attaches to
+        // whatever `runId` comes back down, so there is one entry point into
+        // "a run is showing" and a reload lands on the same screen. `starting`
+        // is cleared by that arrival rather than here, so RUN stays disabled
+        // across the gap and a second press cannot start a second run.
+        onRunStarted(record.id)
       },
       (err: unknown) => {
         if (!mountedRef.current) return
-        if (stoppedRef.current) {
-          setPhase('finished')
-          setFinished({
-            at: began,
-            code: null,
-            durationMs: Date.now() - began,
-            truncated: false,
-            note: 'stopped',
-          })
-          return
-        }
-        const message = err instanceof Error ? err.message : String(err)
-        // Refused before it started: no run happened, so the last run's
-        // summary stays what it was.
-        if (ended === null && !sawLine) {
-          setPhase(finished === null ? 'idle' : 'finished')
-          setError(message)
-          return
-        }
-        setPhase('finished')
-        setFinished({
-          at: began,
-          code: null,
-          durationMs: Date.now() - began,
-          truncated: false,
-          note: message,
-        })
+        setStarting(false)
+        // Refused before it started: no run happened, so what the pane is
+        // showing stays exactly what it was.
+        setError(err instanceof Error ? err.message : String(err))
       },
     )
   }
 
   function stop() {
-    stoppedRef.current = true
-    abortRef.current?.abort()
+    if (runId === null) return
+    setStopping(true)
+    stopScriptRun(runId).then(
+      () => {
+        if (mountedRef.current) setStopping(false)
+      },
+      (err: unknown) => {
+        if (!mountedRef.current) return
+        setStopping(false)
+        setError(err instanceof Error ? err.message : String(err))
+      },
+    )
   }
 
   function onLogScroll() {
@@ -307,17 +327,19 @@ export function ScriptRunPane({
     setDragging(false)
   }
 
-  const running = phase === 'running'
-  const elapsed = running ? now - startedAt : (finished?.durationMs ?? 0)
-  const state = running
-    ? 'running'
-    : finished === null
-      ? 'idle'
-      : finished.note === 'stopped'
-        ? 'stopped'
-        : finished.code === null
-          ? 'failed'
-          : 'finished'
+  const state = runState(run)
+  const running = state === 'running'
+  // Everything time-related is measured off the server's own stamps, so a run
+  // reopened long after it started reads its real age rather than its age in
+  // this tab.
+  const startedAt = run === null ? 0 : (runStartedMs(run) ?? 0)
+  const elapsed = run === null ? 0 : (runElapsedMs(run, now) ?? 0)
+  // RUN is busy while a start is in flight and while a run is going; the form
+  // is only frozen by the latter, since a start that is refused leaves the
+  // values the person has to correct.
+  const busy = running || starting
+  // A run that already happened reports the directory it actually used.
+  const runCwd = run?.cwd ?? cwd
 
   return (
     <div className={`script-run-pane${dragging ? ' resizing' : ''}`} ref={splitRef}>
@@ -354,13 +376,13 @@ export function ScriptRunPane({
               {error !== null && <span className="error">{error}</span>}
             </div>
             <div className="script-run-side">
-              <LastRun finished={finished} cwd={cwd} />
+              <LastRun run={run} elapsed={elapsed} cwd={runCwd} />
               <button
                 type="submit"
                 className="script-run-button"
-                disabled={running || !isRunnable(script.args, draft)}
+                disabled={busy || !isRunnable(script.args, draft)}
               >
-                {running ? 'running…' : 'RUN ▶'}
+                {running ? 'running…' : starting ? 'starting…' : 'RUN ▶'}
               </button>
             </div>
           </form>
@@ -420,8 +442,8 @@ export function ScriptRunPane({
             <button type="button" onClick={copy} disabled={lines.length === 0}>
               {copied ? 'copied' : 'copy'}
             </button>
-            <button type="button" onClick={stop} disabled={!running}>
-              stop
+            <button type="button" onClick={stop} disabled={!running || stopping}>
+              {stopping ? 'stopping…' : 'stop'}
             </button>
           </span>
         </div>
@@ -432,7 +454,7 @@ export function ScriptRunPane({
         >
           {lines.length === 0 ? (
             <p className="muted">
-              {running ? 'waiting for output…' : phase === 'idle' ? 'No run yet.' : '(no output)'}
+              {running ? 'waiting for output…' : run === null ? 'No run yet.' : '(no output)'}
             </p>
           ) : (
             lines.map((l, i) => (
@@ -449,27 +471,41 @@ export function ScriptRunPane({
   )
 }
 
-/** The compact summary of the last run: when, how it ended, how long, where. */
-function LastRun({ finished, cwd }: { finished: Finished | null; cwd: string }) {
+/** The compact summary of the run on screen: when, how it ended, how long,
+ * where. Every field is the row's own — a reopened run says what it did, not
+ * what this tab watched it do. */
+function LastRun({
+  run,
+  elapsed,
+  cwd,
+}: {
+  run: ScriptRunRecord | null
+  elapsed: number
+  cwd: string
+}) {
+  const state = runState(run)
   return (
     <div className="script-run-summary muted">
-      {finished === null ? (
+      {run === null ? (
         <div>no run yet</div>
       ) : (
         <div>
-          last run <span className="script-run-at">{formatClock(finished.at)}</span>
+          {state === 'running' ? 'started' : 'last run'}{' '}
+          <span className="script-run-at">{formatClock(runStartedMs(run) ?? 0)}</span>
           {' · '}
-          {finished.code === null ? (
-            <span className="script-exit-fail">{finished.note}</span>
-          ) : (
-            <span className={finished.code === 0 ? 'script-exit-ok' : 'script-exit-fail'}>
-              exit {finished.code}
+          {state === 'running' ? (
+            <span>running</span>
+          ) : state === 'finished' ? (
+            <span className={run.exit_code === 0 ? 'script-exit-ok' : 'script-exit-fail'}>
+              exit {run.exit_code}
             </span>
+          ) : (
+            // Stopped, or ended with no exit status: the row's `note` says
+            // which — the stop, the collection failure, the server restart.
+            <span className="script-exit-fail">{run.note ?? state}</span>
           )}
-          {` · ${formatDuration(finished.durationMs)}`}
-          {finished.truncated && (
-            <span className="script-truncated"> · truncated at 64 KiB</span>
-          )}
+          {` · ${state === 'running' ? formatElapsed(elapsed) : formatDuration(elapsed)}`}
+          {run.truncated && <span className="script-truncated"> · truncated at 64 KiB</span>}
         </div>
       )}
       <div className="script-run-cwd">cwd {cwd}</div>

@@ -77,6 +77,7 @@ import type { Project } from './types/Project'
 import type { Script } from './types/Script'
 import type { ScriptArg } from './types/ScriptArg'
 import type { ScriptRunEvent } from './types/ScriptRunEvent'
+import type { ScriptRunRecord } from './types/ScriptRunRecord'
 import type { Status } from './types/Status'
 import type { SystemInfo } from './types/SystemInfo'
 import type { Task } from './types/Task'
@@ -1462,6 +1463,19 @@ export async function runScriptStream(
     signal,
   })
   if (!res.ok) throw await apiErrorFrom(res)
+  await readNdjson(res, onEvent)
+}
+
+/**
+ * Reads an `application/x-ndjson` body to its end, handing each line that
+ * parses to `onEvent`. Both script-run streams share it — the POST that owns
+ * its run and the GET that only watches one — so a replayed byte and a live
+ * one can never be cut or parsed differently.
+ */
+async function readNdjson(
+  res: Response,
+  onEvent: (event: ScriptRunEvent) => void,
+): Promise<void> {
   if (res.body === null) return
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
@@ -1480,6 +1494,73 @@ export async function runScriptStream(
     deliver(cut.lines)
   }
   deliver(finishNdjson(rest + decoder.decode()))
+}
+
+// ---- detached script runs (mesa task 1224) ----
+//
+// The third run shape, and the only one with a row behind it. The two above
+// are request-scoped — nothing is stored and hanging up is the stop; a
+// detached run belongs to the *server*, outlives the tab that started it, and
+// ends only at its own exit or an explicit stop. That is what lets the page
+// reopen a run by its id, live or long finished.
+
+/**
+ * Starts the script detached and resolves with its run row at once, before a
+ * line of output exists. `values` is the same declared-arguments map the
+ * other two run routes take (`scriptDraft.ts::valuesFor`), and the same
+ * failures reject before any row is written: 422 for bad values or an
+ * unusable cwd, 404 for an unknown script, 502 when bash will not start.
+ */
+export function startScriptRun(
+  id: number,
+  values: Record<string, string>,
+): Promise<ScriptRunRecord> {
+  return request(`/api/scripts/${id}/run/detach`, jsonInit('POST', { values }))
+}
+
+/** Stored runs, newest first: one script's, or every script's. */
+export function listScriptRuns(script?: number, limit?: number): Promise<ScriptRunRecord[]> {
+  const params = new URLSearchParams()
+  if (script !== undefined) params.set('script', String(script))
+  if (limit !== undefined) params.set('limit', String(limit))
+  const qs = params.toString()
+  return request(`/api/script-runs${qs ? `?${qs}` : ''}`)
+}
+
+/** One run's row — what the form, the clock and the state are restored from. */
+export function getScriptRun(runId: number): Promise<ScriptRunRecord> {
+  return request(`/api/script-runs/${runId}`)
+}
+
+/**
+ * Replays what the run has printed and then follows it, the same NDJSON
+ * `runScriptStream` reads. Resolves when the body ends, which for a live run
+ * is when the run itself ends and for a finished one is at once.
+ *
+ * Aborting `signal` is **not** a stop — unlike `runScriptStream`, dropping
+ * this connection leaves the run going. `stopScriptRun` is the only stop.
+ */
+export async function streamScriptRun(
+  runId: number,
+  onEvent: (event: ScriptRunEvent) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`/api/script-runs/${runId}/stream`, {
+    headers: { Accept: 'application/x-ndjson' },
+    signal,
+  })
+  if (!res.ok) throw await apiErrorFrom(res)
+  await readNdjson(res, onEvent)
+}
+
+/**
+ * Stops a detached run. Idempotent: stopping one that is already over is a
+ * 200 carrying the record, not an error. The record comes back as the row
+ * stands *now*, so a run stopped this instant still reads `running` — the
+ * terminal status arrives on the open stream or the next poll.
+ */
+export function stopScriptRun(runId: number): Promise<ScriptRunRecord> {
+  return request(`/api/script-runs/${runId}/stop`, jsonInit('POST', {}))
 }
 
 // ---- Artifacts (mesa task 974) ----

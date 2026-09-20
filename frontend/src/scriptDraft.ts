@@ -243,6 +243,29 @@ export function draftFrom(script: Script): ValueDraft {
 }
 
 /**
+ * The run form restored from a stored run (mesa task 1224): the script's own
+ * defaults, overlaid with the values that run was actually given.
+ *
+ * The rule that matters is what happens when **the script was edited since
+ * the run**, which it may well have been — a run row outlives an edit. Only
+ * the arguments the script declares *now* are walked, so a stored value for
+ * an argument since removed is ignored rather than resurrected as an
+ * undeclared key [`valuesFor`] would have to drop anyway, and an argument
+ * declared since the run gets its default, exactly as a fresh form would.
+ *
+ * A value the run did not supply is likewise the default — which is the
+ * truth about that run, since the default is what the shell actually saw.
+ */
+export function draftFromRun(script: Script, values: Record<string, string>): ValueDraft {
+  const draft = draftFrom(script)
+  for (const arg of script.args) {
+    const given = values[arg.name]
+    if (given !== undefined) draft[arg.name] = given
+  }
+  return draft
+}
+
+/**
  * True when this text is something Rust's `f64::from_str` accepts — the check
  * `validate_values` runs for a `number`. Spelled out rather than delegated to
  * `Number()`, which disagrees at both ends: it accepts `""` and `"0x10"` and

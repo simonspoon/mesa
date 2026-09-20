@@ -8374,6 +8374,32 @@ button:focus-visible,
   margin-top: 0.5rem;
 }
 
+/* A script's recent runs (mesa task 1224). Each is a link, not a button: a
+   run is an address, and the state colours are the run pane's own, so a row
+   and the pane it opens say the same word in the same colour. */
+.script-run-history {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.script-run-chip {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  text-decoration: none;
+}
+
+.script-run-chip:hover {
+  border-color: var(--cyan);
+}
+
 /* The editor opens inside the row it belongs to, so it needs a rule off the
    card above it — otherwise the form and the list item read as one block. */
 .script-form {

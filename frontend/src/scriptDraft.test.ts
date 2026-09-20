@@ -6,6 +6,7 @@ import {
   argNameError,
   argsError,
   draftFrom,
+  draftFromRun,
   emptyArg,
   isDirty,
   isRunnable,
@@ -308,5 +309,40 @@ describe('valuesFor', () => {
     // may quote, escape or otherwise rewrite it.
     const raw = "; rm -rf /tmp/pwned #"
     expect(valuesFor([arg('target', 'text')], { target: raw })).toEqual({ target: raw })
+  })
+})
+
+describe('draftFromRun', () => {
+  it('overlays the values the run was given onto the script defaults', () => {
+    const s = script({
+      args: [arg('target', 'text'), arg('dry', 'bool', { default: 'true' })],
+    })
+    expect(draftFromRun(s, { target: 'prod' })).toEqual({
+      // supplied by the run
+      target: 'prod',
+      // not supplied: the default is what the shell actually saw
+      dry: 'true',
+    })
+  })
+
+  it('ignores a stored value for an argument the script no longer declares', () => {
+    // The script was edited after the run: `legacy` is gone. Resurrecting it
+    // would put an undeclared key in the form, which `valuesFor` drops and the
+    // server would refuse anyway.
+    const s = script({ args: [arg('target', 'text')] })
+    expect(draftFromRun(s, { target: 'prod', legacy: 'x' })).toEqual({ target: 'prod' })
+  })
+
+  it('fills an argument declared since the run from its default', () => {
+    const s = script({
+      args: [arg('target', 'text'), arg('region', 'text', { default: 'eu' })],
+    })
+    expect(draftFromRun(s, { target: 'prod' })).toEqual({ target: 'prod', region: 'eu' })
+  })
+
+  it('keeps an empty string the run supplied distinct from an absent one', () => {
+    const s = script({ args: [arg('note', 'text', { default: 'hi' })] })
+    expect(draftFromRun(s, { note: '' })).toEqual({ note: '' })
+    expect(draftFromRun(s, {})).toEqual({ note: 'hi' })
   })
 })

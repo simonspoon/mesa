@@ -45,7 +45,10 @@ import { useVisualViewportHeightVar } from './visualViewport'
 // TerminalPage is a permanent sibling mount, not resolved into `page` — see
 // the render below), #/scripts (the global store of user-authored shell
 // scripts and their generated run forms — global like #/inbox, since a script
-// may bind a project but does not have to). The spoken conversation is no
+// may bind a project but does not have to), #/scripts/runs/:id (one stored
+// run, live or long finished — a run outlives the tab that started it since
+// mesa task 1224, so it needs an address a reload can land on). The spoken
+// conversation is no
 // route at all (mesa task 857): it lives in the header (`LiveHub`), which is
 // mounted for the life of the app, because a live turn may `navigate` this
 // browser somewhere else and the conversation has to survive the navigation
@@ -242,7 +245,10 @@ function App() {
   // Scripts: global too. A script may bind a project (whose `local_path` is
   // then the run's cwd), but it is not a project tab — an unbound one runs in
   // $HOME and belongs to no project at all.
-  const scriptsMatch = /^\/scripts$/.exec(path)
+  // `/runs/:id` is a sub-view of the same page, addressed rather than held in
+  // component state: a detached run survives the tab, so reopening one has to
+  // survive a reload too (mesa task 1224).
+  const scriptsMatch = /^\/scripts(?:\/runs\/(\d+))?$/.exec(path)
   // Library: global too, same reasoning as Scripts — a project-scoped item
   // binds a project, but the page itself is not a project tab.
   const libraryMatch = /^\/library$/.exec(path)
@@ -336,7 +342,7 @@ function App() {
   } else if (scriptsMatch) {
     // Stored shell scripts + their run forms: global, so no project frame and
     // no active project, exactly like the inbox below.
-    page = <ScriptsView />
+    page = <ScriptsView runId={scriptsMatch[1] ? Number(scriptsMatch[1]) : null} />
   } else if (libraryMatch) {
     // Agents/skills/hooks/commands/prompts/CLAUDE.md, synced against
     // .claude: global, same reasoning as Scripts above.

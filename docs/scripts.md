@@ -8,9 +8,12 @@ project binding is where a script *runs*, not what a script *is*, so deleting a
 project must un-bind the user's scripts rather than destroy work they authored
 by hand and cannot get back. `args` is stored as a JSON array and decoded inside
 `Store` — the column is an implementation detail, the `Script` struct exposes a
-typed `Vec<ScriptArg>`. Runs are **not** persisted: a `ScriptRun` is a
-request/response record, the `HookRun` twin, and a streamed run's
-`ScriptRunEvent`s exist only on the wire.
+typed `Vec<ScriptArg>`. **Whether a run is persisted is a fact about the
+route, not about scripts.** The two original run routes persist nothing — a
+`ScriptRun` is a request/response record, the `HookRun` twin, and a streamed
+run's `ScriptRunEvent`s exist only on the wire — while a **detached** run
+(mesa task 1196's successor, mesa task 1224, below) is a row in `script_runs`
+that outlives the connection that started it. Three shapes, one executor.
 
 - **Arguments are declared, never parsed out of the body.** Nothing reads the
   shell source looking for `$1` or `${FOO}` — that is a guessing game, and a
@@ -90,13 +93,83 @@ request/response record, the `HookRun` twin, and a streamed run's
   counted in bytes read: past it, that stream's further output is read and
   **dropped** (never blocking the script on a full pipe), a line the cap cuts
   is emitted up to the cap, and the exit event says `truncated: true`; there is
-  no `[truncated]` marker line. Nothing is stored — the full log is not kept
-  anywhere, deliberately, so a stream has exactly the captured run's bounds.
+  no `[truncated]` marker line. **This route stores nothing** — the full log is
+  not kept anywhere, deliberately, so a stream has exactly the captured run's
+  bounds. (A *detached* run is where a log is kept; that is a different route
+  with different ownership, below, and this one is unchanged by it.)
   **Stop is the client going away**: the loop kills the process group
   (`kill -KILL -- -<pgid>`, then reaps bash) as soon as the channel to the
   response body is closed, which it asks on every line *and* at least every
   100ms while the script is silent. A descendant that left the group
   (`setsid`) is out of reach, as it would be for a terminal's Ctrl-C.
+- **A detached run is owned by the server, not by a connection** (mesa task
+  1224). `POST /api/scripts/{id}/run/detach` runs the *same* executor —
+  `scripts::start` + `Streaming::stream`, unchanged; the new capability is a
+  second caller, not a second executor — but hands the two closures differently:
+  `emit` returns `true` unconditionally (no reader owns the run, so a reader
+  going away means nothing) and `cancelled` reads a stop flag instead of the
+  response channel. **That is the whole inversion.** On `/run/stream` hanging
+  up *is* the stop; here `POST /api/script-runs/{id}/stop` is the only stop, and
+  a run survives the tab, the navigation and the reload that started it.
+  - The row is `script_runs` (migration index 64): the `values` the run was
+    given, the server-resolved `cwd`, `status`
+    (`running | finished | stopped | failed`), `exit_code`, a `note` saying why
+    there is no exit code, `truncated`, the `owner_pid` of the `serve` that
+    owns it, and `events` — the run's log as the **byte-identical NDJSON that
+    went over the wire**, so replaying a finished run is "send this column",
+    never a reconstruction. Two columns of `stdout`/`stderr` could not preserve
+    arrival order or per-line `t`, and a reopened run would show a different
+    screen from the one that was launched. The 64 KiB-per-stream cap already
+    bounds it; nothing new enforces anything. The FK **cascades**, unlike
+    `scripts.project_id`'s `SET NULL`: a run is a record *of* a script and is
+    meaningless without it. `SCRIPT_RUN_KEEP = 20` newest per script, pruned in
+    `create_script_run`'s own transaction (the `live_boards` rule).
+  - `ScriptRunRecord` deliberately carries **no `events` field**. The log stays
+    a wire-only concept reached only through the stream route, which is what
+    lets `list` and `show` return one type: twenty runs × 64 KiB in a list
+    would be unusable, and a "summary" projection is the hand-written second
+    projection this repo does not write.
+  - The registry is `src/core/script_runs.rs` — not inside `scripts.rs`, whose
+    boundary is that execution is not storage, and the pump performs the two db
+    writes. It holds, per run, the replay buffer, the attached senders and the
+    stop flag, in `AppState` beside the other in-memory process bookkeeping.
+    **`finish_script_run` is written before the entry is removed**, so an
+    attach can never see "no entry *and* a row still saying `running`" — the
+    one state that would hang a page on a run that had already ended — and
+    `finish_script_run` is a no-op on a row that is not `running`, so a stop
+    landing at the same instant as a natural exit cannot double-write.
+  - **Attaching is snapshot-then-subscribe under one acquisition of the
+    entry's locks**, so nothing is missed at the seam and nothing arrives
+    twice; a run with no entry replays its stored NDJSON instead and, if that
+    log never got a terminal event of its own, one synthesized from the row.
+    **One client code path serves a live run and a long-finished one.**
+  - The registry is memory-only, so no `running` row can belong to a freshly
+    started process: `serve` calls `reconcile_script_runs` **before binding**
+    and flips a `running` row to `failed` with a note naming the restart —
+    but only when its `owner_pid` is dead or is our own (pid reuse, and we own
+    nothing yet), because two `serve`s on one db is a real configuration and a
+    blanket flip would have one declare the other's live runs dead. The honest
+    limit, which the note states: the script is in its own process group and
+    survives the server, mesa holds no handle across the restart and does not
+    pretend to. `failed` is true; `running` would not be.
+  - Five routes, all on `require_agent_access` like the rest of this surface:
+    `POST /api/scripts/{id}/run/detach` (201, the record, same 404/422/502
+    pre-flight as the other two and **writing no row** when it fails, since the
+    spawn happens before the row does), `GET /api/script-runs?script=&limit=`
+    (bare array, newest first), `GET /api/script-runs/{id}`,
+    `GET /api/script-runs/{id}/stream` (chunked `application/x-ndjson`;
+    **dropping it does not stop the run**) and
+    `POST /api/script-runs/{id}/stop` (200, idempotent — stopping a finished
+    run is a no-op returning the record, the `read_at` posture; only an unknown
+    run is 404). A top-level `/api/script-runs` collection rather than
+    `/api/scripts/runs`, which would silently reserve the script id `runs`.
+  - **No CLI surface, deliberately.** `--detach` is incoherent from the CLI —
+    a detached run is owned by a `serve` process, and `mesa script run` opens
+    its own `Store` and exits, so a row with nobody's `owner_pid` on it is
+    exactly the state lie the reconciliation exists to prevent — and a stop
+    cannot be delivered, the flag living in the owning server's registry, with
+    no second write path (the `mesa live` rule). An agent already has the right
+    shape in `mesa script run`: capture and return.
 - **The working directory is resolved from the script's own project binding,
   never from the caller.** A bound script runs in that project's `local_path`,
   via the standard ladder the terminal and agents use: no `local_path`, or a
@@ -194,36 +267,58 @@ request/response record, the `HookRun` twin, and a streamed run's
   `components/ScriptRunPane.tsx` — in the page, no modal, no dimming, `←
   scripts` to go back. Top: the name and description, the generated form (one
   control per declared arg: `text`→text input, `number`→number input,
-  `bool`→checkbox, `choice`→`<select>`), RUN, and the last run's summary (its
-  start time, exit code — or `stopped`/the failure — duration, and the cwd,
-  shown from the project binding but never sent). Under it a horizontal drag
-  handle resizes the split (`clampFormHeight`: the form keeps 96px, the log
-  120px) and a toggle on it folds the form away entirely. Below, one log reads
-  `POST …/run/stream` through `fetch` + a body reader (`EventSource` cannot
-  POST): every line timestamped with the run's start plus its `t`, stderr
+  `bool`→checkbox, `choice`→`<select>`), RUN, and the run's summary (its start
+  time, exit code — or `stopped`/the failure — duration, and the cwd). Under it
+  a horizontal drag handle resizes the split (`clampFormHeight`: the form keeps
+  96px, the log 120px) and a toggle on it folds the form away entirely. Below,
+  one log: every line timestamped with the run's start plus its `t`, stderr
   tagged and coloured, and a header with the state (running / finished /
   stopped / failed), the equivalent `--set` command line and the elapsed
   clock, plus **follow** (pins the log to its end; scrolling up turns it off,
   scrolling back to the bottom turns it on), **wrap**, **copy** (the log as
-  timestamped text) and **stop** (aborts the fetch, which is what kills the
-  script server-side). A run that exited nonzero is displayed as **data**, not
-  as an app error; only a request refused before it started shows `.error`.
-  **Leaving the pane does not stop a run** — closing the old modal never did,
-  and a navigation must not kill a release halfway — the run finishes
-  server-side with nobody reading it. The stream's pure logic (NDJSON line
-  cutting across chunks, the follow predicate, the split clamp, time and
-  command formatting, the copy text) is `scriptRun.ts`, unit-tested; the form
-  logic is `scriptDraft.ts`, mirroring the Rust validation rules so the two
-  cannot drift; every field is held as a **string** so a half-typed value
-  survives a keystroke. The pane has no key handling of its own: typing in its
-  fields is already outside every global shortcut
+  timestamped text) and **stop**. A run that exited nonzero is displayed as
+  **data**, not as an app error; only a request refused before it started shows
+  `.error`.
+  Since mesa task 1224 **the pane does not own the run**. RUN posts to
+  `…/run/detach`, and the run that comes back becomes the *address*
+  `#/scripts/runs/<id>` — a real hash route (`App.tsx`), which is what makes
+  reopening a run survive a reload rather than merely a navigation. The pane
+  then attaches to whatever `runId` the hash hands it, through
+  `GET /api/script-runs/{id}/stream`: **one entry point into "a run is
+  showing"**, and the starting tab reattaches through exactly the path a second
+  tab does, at the cost of one round trip. Reopening a run therefore restores
+  the *same* screen it was launched from — the form is re-seeded from the
+  values that run was given (`scriptDraft.ts::draftFromRun`, which walks only
+  the arguments the script declares **now**, so a script edited since the run
+  neither resurrects a removed argument nor leaves a new one blank), the state
+  word and exit code come off the row, and the elapsed clock is measured from
+  the server's `started_at` rather than from the mount, so a run reopened ten
+  minutes in does not read `00:00`. Stop is `POST …/stop`, a route call, so the
+  `AbortController`-and-infer-`stopped` machinery is gone; unmounting aborts
+  the **stream fetch only**, which makes "leaving the pane does not stop a run"
+  structurally true rather than true-but-unobservable. The list polls
+  `GET /api/script-runs` at 2s through the existing `useFetch` (which drops a
+  byte-identical poll, so an idle page never re-renders): each script row wears
+  a `● running` badge and the last five runs as links to their own addresses.
+  The pure logic (NDJSON line cutting across chunks, the follow predicate, the
+  split clamp, time and command formatting, the copy text, and now the run
+  state, the log lines, the timebase and the row label) is `scriptRun.ts`,
+  unit-tested; the form logic is `scriptDraft.ts`, mirroring the Rust
+  validation rules so the two cannot drift; every field is held as a **string**
+  so a half-typed value survives a keystroke. The pane has no key handling of
+  its own: typing in its fields is already outside every global shortcut
   (`keyboardScope.ts::shouldIgnoreShortcut`'s text-control rule).
 - Gate: `scripts/scripts-check.sh` — the CLI and API contracts, the error
   shapes and exit codes, the `--quiet` key set, run semantics (nonzero exit as
   data, streams separated, truncation), the streamed run (arrival-order
   interleaving with sleeps, timestamps, one exit event, the same 422s/404 and
   cwd/injection behaviour, and a client hanging up killing both bash and a
-  child it started), the cwd ladder, and the two assertions
+  child it started), the detached run (the same pre-flight writing no row, the
+  reattach — a killed reader leaving bash *and its child alive*, the exact
+  inverse of the hang-up assertion above, and a second attach seeing both the
+  line printed before it and the one after — the explicit stop, its
+  idempotence, the 20-per-script retention and the restart reconciliation), the
+  cwd ladder, and the two assertions
   this feature exists to keep true: a hostile value is echoed **literally**, and
   an unsupplied argument is **unset rather than empty**. It asserts the
   gate on every route, the stream included, in **both** default and `--lan` mode, the same pairing

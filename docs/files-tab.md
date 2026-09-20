@@ -1698,3 +1698,35 @@ The find bar is **not** offered over the table, the same exclusion markdown
 already carries and for the same reason: it matches offsets into `data.content`
 and reveals them by line, and a table shows no lines. In edit mode the file is
 source again and is findable like anything else.
+
+## Rendered HTML (mesa task 1249)
+
+A `.html`/`.htm` file gets the treatment `.md` already had: the **view** mode
+renders the page, **Edit** shows the raw source in the `CodeEditor` (the
+`editing` branch runs before every content branch, so this needed no change),
+and Save or Cancel comes back to the rendered view.
+
+The branch is keyed on the **path's final extension**
+(`frontend/src/fileHtml.ts`'s `isHtmlDocumentPath`), never on
+`data.language === 'html'`: `language_of` sends `.vue`, `.svelte` and `.astro`
+to `html` too, and those are component sources whose read view must stay
+highlighted code. `.htm` has no server language at all and still renders here —
+the predicate answers "is this a web page", not "which grammar colours it".
+
+The document is handed to an `<iframe srcDoc>` under an **empty `sandbox`** —
+no `allow-scripts`, no `allow-same-origin`, no `allow-top-navigation`. That is
+deliberately stricter than the artifact render route (`docs/artifacts.md`),
+which grants `allow-scripts` because an artifact is a mockup an agent wrote in
+order to be run; a repo file is opened to be read, and an empty sandbox also
+leaves the frame's origin opaque, so the page cannot reach mesa's DOM, storage
+or cookies. Relative asset paths (`img`, `link`) therefore do not resolve —
+the frame has no base URL and nothing rewrites them the way `markdownAssets.ts`
+rewrites a markdown image src.
+
+Truncation is markdown's handling exactly: the header's `truncated` badge is
+the whole statement and `editable` is already false there, so a capped document
+renders as far as its bytes got. The find bar is **not** offered over it in view
+mode — the same exclusion markdown and the CSV table carry, for the same reason
+(a rendered page has no offsets into `data.content`, and here it is inside a
+frame this page cannot even read); in edit mode it is source again and findable
+like anything else.

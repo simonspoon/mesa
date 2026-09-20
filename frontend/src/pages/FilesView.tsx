@@ -75,6 +75,7 @@ import { Markdown } from '../components/Markdown'
 import { SideBySideDiff } from '../components/SideBySideDiff'
 import { splitFrontmatter } from '../frontmatter'
 import { delimiterFor, parseDelimited, type DelimitedTable } from '../fileCsv'
+import { isHtmlDocumentPath } from '../fileHtml'
 import { isImagePath } from '../fileImage'
 import { resolveMarkdownImageSrc } from '../markdownAssets'
 import { newFilePath } from '../newFile'
@@ -533,8 +534,10 @@ function ContentPane({
   // revision's bytes, not these; and a markdown file in view mode is rendered
   // prose whose paragraphs no longer correspond to source offsets — there the
   // key is deliberately left to the browser's own find, which works on exactly
-  // what is painted. In edit mode a markdown file is source again, so it is
-  // findable like anything else.
+  // what is painted. An HTML document in view mode is the same case one step
+  // further (mesa task 1249): it is a rendered page, and inside a sandboxed
+  // frame at that, so there are no offsets here to point at. In edit mode
+  // either one is source again, so it is findable like anything else.
   // The delimiter this file's language tag calls for, or null when it is not
   // one of the tabular kinds — server-derived, never sniffed (`fileCsv.ts`).
   const csvDelimiter = delimiterFor(data?.language ?? null)
@@ -558,7 +561,10 @@ function ContentPane({
     !data.is_binary &&
     !isImagePath(data.path) &&
     ui.selectedCommit === null &&
-    (ui.editing || (data.language !== 'markdown' && csvTable === null))
+    (ui.editing ||
+      (data.language !== 'markdown' &&
+        !isHtmlDocumentPath(data.path) &&
+        csvTable === null))
   /**
    * A project-search result the user clicked, still waiting to be shown
    * (task 813): the pane is displaying the file, the reader is looking for the
@@ -1106,6 +1112,11 @@ function ContentPane({
       content={data.content}
       wrap={wrap}
     />
+  ) : isHtmlDocumentPath(data.path) ? (
+    // Keyed on the path rather than on `data.language` — see
+    // `isHtmlDocumentPath`, which is the whole reason that predicate exists:
+    // `.vue`/`.svelte`/`.astro` are tagged `html` too and keep the code view.
+    <HtmlBody content={data.content} />
   ) : csvTable !== null ? (
     // A table is the *read* view of a delimited file. Edit mode is the branch
     // above, so pressing Edit on a .csv still gives the raw text editor and
@@ -1575,6 +1586,37 @@ function MarkdownBody({
       )}
       <Markdown text={body} resolveImageSrc={resolveImageSrc} />
     </div>
+  )
+}
+
+/** An HTML file rendered as the page it is (mesa task 1249) — the read view for
+ * `.html`/`.htm`, the way `MarkdownBody` is the read view for `.md`. Edit mode
+ * is the branch above, so pressing Edit still gives the raw source and Save or
+ * Cancel comes straight back here.
+ *
+ * The document goes in through `srcDoc` under an **empty** `sandbox`: no
+ * `allow-scripts`, no `allow-same-origin`, no `allow-top-navigation`. That is
+ * deliberately stricter than the artifact render route, which grants
+ * `allow-scripts` because an artifact is a mockup an agent wrote in order to be
+ * run; this is an arbitrary file out of somebody's repo, opened to be read. An
+ * empty sandbox also leaves the frame's origin opaque, so the page cannot
+ * reach this one's DOM, storage or cookies.
+ *
+ * Truncation is the markdown treatment exactly: the header's `truncated` badge
+ * is the whole statement and `editable` is already false there — a capped
+ * document renders as far as its bytes got, as half a markdown file does.
+ *
+ * Relative `img`/`href` references do not resolve: the frame has no base URL of
+ * its own, and nothing rewrites them the way `MarkdownBody` rewrites image
+ * srcs. */
+function HtmlBody({ content }: { content: string }) {
+  return (
+    <iframe
+      className="files-content-html"
+      title="Rendered HTML"
+      sandbox=""
+      srcDoc={content}
+    />
   )
 }
 

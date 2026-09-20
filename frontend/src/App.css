@@ -6323,6 +6323,28 @@ body.live-sidebar-resizing {
   padding: 0.5rem 0;
 }
 
+/* The rendered-HTML read view (mesa task 1249). An <iframe> has no intrinsic
+   height at all, so it is given the pane's leftover height: .files-content is a
+   flex column at least as tall as the scrollport, `flex: 1` takes the free
+   space the header and status bar leave it, and `min-height: 0` lets it shrink
+   below the frame's own default box. This is the same pair
+   .files-content-csv-wrap uses but it needs no `is-table` bound, for the reason
+   that bound exists: there the table's own height grew the column past the
+   scrollport and left `flex: 1` nothing to clamp, and a frame's document never
+   grows its box — the document scrolls inside the frame.
+
+   White, not a theme token: the frame renders somebody's page under its own
+   styles, and an unstyled document is black text — on this app's dark surface
+   that is an invisible file. A border keeps the boundary between the app and
+   the page it is showing visible. */
+.files-content-html {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: 1px solid var(--border);
+  background: #fff;
+}
+
 .files-content-image {
   display: block;
   max-width: 100%;

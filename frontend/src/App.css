@@ -3079,6 +3079,60 @@ main {
   margin-top: 0.3rem;
 }
 
+/* Timeline by agent — the Gantt card on the session detail page. The SVG
+   carries no colours of its own: every fill is a theme variable or a
+   `modelColor()` value, so the card follows the app's one dark theme. */
+.cc-timeline {
+  width: 100%;
+  display: block;
+  font-size: 12px;
+}
+
+.cc-timeline-name {
+  fill: var(--text-h);
+  font-weight: 600;
+}
+
+.cc-timeline-sub {
+  fill: var(--muted);
+}
+
+.cc-timeline-note {
+  fill: var(--text);
+}
+
+/* A note with nowhere to sit beside its bar is drawn over it, where the bar's
+   own bright fill is the background — so the text goes dark, not lighter. */
+.cc-timeline-note-inside {
+  fill: var(--bg);
+  font-weight: 600;
+}
+
+.cc-timeline-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.4rem;
+}
+
+.cc-timeline-legend .swatch {
+  margin-right: 0.35rem;
+  vertical-align: -1px;
+}
+
+/* The legend's "waiting" swatch stands in for the SVG hatch: a `url(#…)` fill
+   is not reachable from CSS, so the stripe is redrawn as a gradient. */
+.cc-timeline-swatch-wait {
+  border: 1px solid var(--border-bright);
+  background: repeating-linear-gradient(
+    45deg,
+    var(--border-bright) 0 1.5px,
+    transparent 1.5px 4px
+  );
+}
+
 /* Diverging daily chart: a narrow scale column on each side of the bars.
    Left scales input/output (downward half), right scales cache (upward half);
    "0" sits on the centre baseline. */

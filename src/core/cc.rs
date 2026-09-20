@@ -60,11 +60,11 @@ use super::store::{
 use super::types::{
     CcAgentStat, CcChatAsk, CcChatOption, CcChatQuestion, CcChatTurn, CcChatTurnKind, CcDashboard,
     CcDayPoint, CcDenialKind, CcErrorCommandStat, CcErrorDenial, CcErrorMessageStat,
-    CcErrorToolStat, CcErrorTotals, CcErrors, CcGraphEdge, CcGraphNode, CcGraphNodeKind, CcLive,
-    CcLiveSession, CcLiveSubagent, CcModelStat, CcNodeText, CcNodeTextFormat, CcOverview,
-    CcProjectStat, CcRepeat, CcSessionBucket, CcSessionChat, CcSessionDetail, CcSessionGraph,
-    CcSessionModelStat, CcSessionRow, CcSessionSkillStat, CcSessionThreadStat, CcSessionToolStat,
-    CcSkillStat, CcTokens, CcToolStat, CcUsage,
+    CcErrorToolStat, CcErrorTotals, CcErrors, CcGraphEdge, CcGraphNode, CcGraphNodeKind,
+    CcInterval, CcLive, CcLiveSession, CcLiveSubagent, CcModelStat, CcNodeText, CcNodeTextFormat,
+    CcOverview, CcProjectStat, CcRepeat, CcSessionBucket, CcSessionChat, CcSessionDetail,
+    CcSessionGraph, CcSessionModelStat, CcSessionRow, CcSessionSkillStat, CcSessionThreadStat,
+    CcSessionToolStat, CcSkillStat, CcTokens, CcToolStat, CcUsage,
 };
 
 // ---- transcript line shape (only the fields we read) ----
@@ -2871,6 +2871,44 @@ pub fn session_graph(
 /// one, which is what lets the frontend draw it without a scale of its own.
 pub const ACTIVITY_BUCKETS: usize = 60;
 
+/// A gap this long or longer between two consecutive events of one thread is
+/// time that thread spent *waiting* rather than working — for the main thread,
+/// waiting on a subagent it spawned.
+///
+/// The split is derived from the thread's **own** timestamps rather than by
+/// subtracting the subagents' spans from main's, because those spans are not
+/// idle time: measured across real sessions, 47–77% of main-thread events fall
+/// strictly inside an open subagent span (main spawns a delegate and carries on
+/// working), so subtraction erases real work. Gaps past a minute, by contrast,
+/// carry nearly all the true idle time — a thread that is working leaves a
+/// trace far more often than that.
+pub const THREAD_IDLE_GAP_SECS: i64 = 60;
+
+/// The stretches of `ts` a thread was working: consecutive timestamps coalesced
+/// into one interval until a gap of at least [`THREAD_IDLE_GAP_SECS`] closes it.
+///
+/// `ts` need not be sorted (a thread's messages and tool calls arrive as two
+/// ordered streams). A thread with no events yields no intervals; a thread with
+/// one yields one zero-length interval, which is the honest answer — it was
+/// there for an instant.
+fn active_intervals(ts: &[i64]) -> Vec<CcInterval> {
+    let mut ts: Vec<i64> = ts.to_vec();
+    ts.sort_unstable();
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    for t in ts {
+        match out.last_mut() {
+            Some(last) if t - last.1 < THREAD_IDLE_GAP_SECS => last.1 = t,
+            _ => out.push((t, t)),
+        }
+    }
+    out.into_iter()
+        .map(|(start, end)| CcInterval {
+            start: fmt_ts(start),
+            end: fmt_ts(end),
+        })
+        .collect()
+}
+
 /// One session's exact aggregates. `Ok(None)` when the session was never
 /// ingested (mirrors [`session_graph`]).
 ///
@@ -2909,11 +2947,15 @@ pub fn session_detail(store: &Store, session_id: &str) -> Result<Option<CcSessio
         models: BTreeMap<String, i64>,
         first_ts: Option<i64>,
         last_ts: Option<i64>,
+        /// Every event of this thread, for the active/waiting split. Not
+        /// sorted — `active_intervals` sorts.
+        event_ts: Vec<i64>,
     }
     impl Thread {
         fn touch(&mut self, ts: i64) {
             self.first_ts = Some(self.first_ts.map_or(ts, |t| t.min(ts)));
             self.last_ts = Some(self.last_ts.map_or(ts, |t| t.max(ts)));
+            self.event_ts.push(ts);
         }
     }
     #[derive(Default)]
@@ -2995,6 +3037,9 @@ pub fn session_detail(store: &Store, session_id: &str) -> Result<Option<CcSessio
             est_cost_usd: round4(t.map_or(0.0, |t| t.cost)),
             start: t.and_then(|t| t.first_ts).map(fmt_ts),
             end: t.and_then(|t| t.last_ts).map(fmt_ts),
+            // Every thread, not just main: it is the same loop, and a
+            // special case for main would be more code, not less.
+            active: t.map_or_else(Vec::new, |t| active_intervals(&t.event_ts)),
         }
     };
 
@@ -6226,6 +6271,19 @@ mod tests {
         // bucket, not to a 61st one.
         assert!(d.activity.last().unwrap().tool_calls > 0);
 
+        // The active/waiting split. Both threads tick at least every 10s
+        // across the whole span, so neither ever waits THREAD_IDLE_GAP_SECS:
+        // one interval each, spanning exactly that thread's own start..end.
+        assert_eq!(d.main.active.len(), 1);
+        assert_eq!(d.main.active[0].start, d.main.start.clone().unwrap());
+        assert_eq!(d.main.active[0].end, d.main.end.clone().unwrap());
+        assert_eq!(d.agents[0].active.len(), 1);
+        assert_eq!(
+            d.agents[0].active[0].start,
+            d.agents[0].start.clone().unwrap()
+        );
+        assert_eq!(d.agents[0].active[0].end, d.agents[0].end.clone().unwrap());
+
         // A session that was never ingested is None, not an empty detail.
         assert!(session_detail(&store, "nope").unwrap().is_none());
     }
@@ -6283,6 +6341,87 @@ mod tests {
         assert!(d.tools.is_empty() && d.skills.is_empty() && d.agents.is_empty());
         assert_eq!(d.main.messages, 1);
         assert_eq!(d.models.len(), 1);
+        // One event is one instant-long active interval — the honest answer,
+        // not an empty vec that would read as "this thread never ran".
+        assert_eq!(d.main.active.len(), 1);
+        assert_eq!(d.main.active[0].start, d.main.active[0].end);
+        assert_eq!(d.main.active[0].start, d.main.start.clone().unwrap());
+    }
+
+    #[test]
+    fn session_detail_splits_a_thread_at_a_long_gap() {
+        // The main thread works, falls quiet past THREAD_IDLE_GAP_SECS while a
+        // subagent runs, then works again: two active stretches with the wait
+        // between them, rather than one bar covering the whole span.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        let msg = |uuid: &str, agent: Option<&str>, ts: i64| CcMessageRow {
+            uuid: uuid.into(),
+            message_id: None,
+            session_id: "gappy".into(),
+            agent_id: agent.map(str::to_string),
+            ts,
+            model: "claude-opus-4-8".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            skill: None,
+            agent: None,
+            preview: None,
+        };
+        store
+            .cc_ingest_file(
+                "/t/gappy.jsonl",
+                &CcFileCursor {
+                    mtime: 1,
+                    size: 1,
+                    byte_offset: 1,
+                },
+                &CcFileBatch {
+                    sessions: vec![CcSessionUpsert {
+                        session_id: "gappy".into(),
+                        cwd: None,
+                        git_branch: None,
+                        entrypoint: None,
+                        used_subagent: true,
+                        start_ts: Some(0),
+                        end_ts: Some(700),
+                    }],
+                    messages: vec![
+                        // Main: 0, 30 (a 30s gap — still working), then a 570s
+                        // wait, then 600 and 700 (a 100s gap — a second wait).
+                        msg("m1", None, 0),
+                        msg("m2", None, 30),
+                        msg("m3", None, 600),
+                        msg("m4", None, 700),
+                        // The subagent that ran through main's first wait.
+                        msg("m5", Some("a1"), 100),
+                        msg("m6", Some("a1"), 500),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let d = session_detail(&store, "gappy").unwrap().unwrap();
+        let spans: Vec<(String, String)> = d
+            .main
+            .active
+            .iter()
+            .map(|i| (i.start.clone(), i.end.clone()))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (fmt_ts(0), fmt_ts(30)),
+                (fmt_ts(600), fmt_ts(600)),
+                (fmt_ts(700), fmt_ts(700)),
+            ]
+        );
+        // The subagent's own two events are 400s apart, so it waits too — the
+        // split is per thread, never derived from anybody else's span.
+        assert_eq!(d.agents[0].active.len(), 2);
     }
 
     #[test]

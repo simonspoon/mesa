@@ -3,6 +3,9 @@ import { Donut, Sparkbars } from '../components/charts'
 import { DataTable, Kpi } from '../components/ccTable'
 import { shortModel } from '../sessionGraph'
 import {
+  TIMELINE,
+  type TimelineRect,
+  type TimelineSpan,
   bucketSeries,
   cacheHitRatio,
   fmtDuration,
@@ -10,9 +13,23 @@ import {
   fmtPct,
   fmtTok,
   fmtUsd,
+  largestWaitingGap,
+  modelColor,
+  timelineBar,
+  timelineGridBottom,
+  timelineHeight,
+  timelineHint,
+  timelineLegend,
+  timelineNotePlacement,
+  timelineRowY,
+  timelineSegments,
+  timelineSpanOf,
+  timelineThreads,
+  timelineTicks,
   tokenSlices,
   tokensPerMinute,
   topTools,
+  waitingLabelPlacement,
 } from '../sessionDetail'
 import type { CcSessionDetail } from '../types/CcSessionDetail'
 import type { CcSessionThreadStat } from '../types/CcSessionThreadStat'
@@ -169,6 +186,8 @@ function Body({ d }: { d: CcSessionDetail }) {
           </div>
         </section>
       </div>
+
+      <TimelineByAgent d={d} />
 
       <section className="cc-panel">
         <h2>Top tools</h2>
@@ -362,4 +381,187 @@ function Body({ d }: { d: CcSessionDetail }) {
 
 function subagentTokens(d: CcSessionDetail): number {
   return d.agents.reduce((s, a) => s + a.total_tokens, 0)
+}
+
+// The Gantt card: one row per thread on a shared axis, main first. Every
+// coordinate comes from `sessionDetail.ts` — this function only draws.
+//
+// The main row's two textures are the point of the card: the hatch is the
+// thread's whole span drawn as background, and its active stretches are painted
+// over it, so the gaps where it was waiting on a subagent show through.
+function TimelineByAgent({ d }: { d: CcSessionDetail }) {
+  const threads = timelineThreads(d)
+  const span = timelineSpanOf(threads)
+  const gridBottom = timelineGridBottom(threads.length)
+  const legend = timelineLegend(threads)
+  // Only when a gap is actually left un-painted: a session with no subagents
+  // draws one unbroken main bar, and a swatch for a texture nothing wears
+  // reads as a missing feature.
+  const hatched = span != null && largestWaitingGap(threads[0], span) != null
+
+  return (
+    <section className="cc-panel">
+      <h2>Timeline by agent</h2>
+      <p className="muted cc-hint">{timelineHint(threads, d.duration_minutes)}</p>
+      {span == null ? (
+        <p className="muted">No thread in this session carries a timestamp.</p>
+      ) : (
+        <>
+          <svg
+            className="cc-timeline"
+            viewBox={`0 0 ${TIMELINE.width} ${timelineHeight(threads.length)}`}
+            role="img"
+            aria-label="Timeline by agent"
+          >
+            <defs>
+              <pattern
+                id="cc-timeline-hatch"
+                width="6"
+                height="6"
+                patternUnits="userSpaceOnUse"
+                patternTransform="rotate(45)"
+              >
+                <line x1="0" y1="0" x2="0" y2="6" stroke="var(--border-bright)" strokeWidth="1.5" />
+              </pattern>
+            </defs>
+            {timelineTicks(span).map((t) => (
+              <g key={t.ms}>
+                <line
+                  x1={t.x}
+                  y1={TIMELINE.gridTop}
+                  x2={t.x}
+                  y2={gridBottom}
+                  stroke="var(--border)"
+                />
+                <text x={t.x} y={gridBottom + 18} textAnchor="middle" className="cc-timeline-sub">
+                  {t.label}
+                </text>
+              </g>
+            ))}
+            {threads.map((t, i) => (
+              <TimelineRow key={t.agent_id ?? 'main'} t={t} i={i} span={span} />
+            ))}
+          </svg>
+          <div className="cc-timeline-legend">
+            {legend.map((l) => (
+              <span key={l.label}>
+                <i className="swatch" style={{ background: l.color }} />
+                {l.label}
+              </span>
+            ))}
+            {hatched && (
+              <span>
+                <i className="swatch cc-timeline-swatch-wait" />
+                waiting
+              </span>
+            )}
+          </div>
+        </>
+      )}
+    </section>
+  )
+}
+
+function TimelineRow({
+  t,
+  i,
+  span,
+}: {
+  t: CcSessionThreadStat
+  i: number
+  span: TimelineSpan
+}) {
+  const y = timelineRowY(i)
+  const isMain = t.agent_id == null
+  const bar = timelineBar(t, span)
+  const color = modelColor(t.model)
+  // Untrusted transcript text, both of them: text children, never markup.
+  const name = isMain ? 'main' : (t.agent ?? 'subagent')
+  const tip = `${fmtTok(t.total_tokens)} tokens · ${fmtInt(t.tool_calls)} tool calls · ${fmtUsd(
+    t.est_cost_usd,
+  )}`
+
+  return (
+    <g>
+      <text x={TIMELINE.labelRight} y={y + 11} textAnchor="end" className="cc-timeline-name">
+        {name}
+      </text>
+      <text x={TIMELINE.labelRight} y={y + 25} textAnchor="end" className="cc-timeline-sub">
+        {`${shortModel(t.model) ?? 'no model'}, ${fmtUsd(t.est_cost_usd)}`}
+      </text>
+      {bar == null ? (
+        /* No start or no end: the row is still listed, with an em-dash where
+           the bar would be. */
+        <text x={TIMELINE.x0} y={y + 16} className="cc-timeline-sub">
+          —
+        </text>
+      ) : isMain ? (
+        <>
+          <rect
+            x={bar.x}
+            y={y}
+            width={bar.w}
+            height={TIMELINE.barH}
+            rx={4}
+            fill="url(#cc-timeline-hatch)"
+          >
+            <title>{tip}</title>
+          </rect>
+          {timelineSegments(t, span).map((s, k) => (
+            <rect
+              /* Index: two instants clamped to the same right edge would
+                 otherwise share a key. The list is derived and never reorders. */
+              key={k}
+              x={s.x}
+              y={y}
+              width={s.w}
+              height={TIMELINE.barH}
+              rx={3}
+              fill={color}
+            >
+              <title>{tip}</title>
+            </rect>
+          ))}
+          <WaitingLabel t={t} span={span} y={y} />
+        </>
+      ) : (
+        <>
+          <rect x={bar.x} y={y} width={bar.w} height={TIMELINE.barH} rx={4} fill={color}>
+            <title>{tip}</title>
+          </rect>
+          <Note t={t} bar={bar} y={y} />
+        </>
+      )}
+    </g>
+  )
+}
+
+/** The main row's waiting label, or nothing at all when it would not fit in
+    the widest gap — the hint above the chart carries the same total anyway. */
+function WaitingLabel({ t, span, y }: { t: CcSessionThreadStat; span: TimelineSpan; y: number }) {
+  const label = waitingLabelPlacement(t, span)
+  if (label == null) return null
+  return (
+    <text x={label.x} y={y + 16} textAnchor="middle" className="cc-timeline-note">
+      {label.text}
+    </text>
+  )
+}
+
+/** A subagent row's `<duration> · <description>`. Untrusted transcript text,
+    so a text child; the placement (and any truncation) is decided in
+    `sessionDetail.ts`, which is what keeps it out of the label gutter. */
+function Note({ t, bar, y }: { t: CcSessionThreadStat; bar: TimelineRect; y: number }) {
+  const note = timelineNotePlacement(t, bar)
+  if (note == null) return null
+  return (
+    <text
+      x={note.x}
+      y={y + 16}
+      textAnchor={note.anchor}
+      className={note.inside ? 'cc-timeline-note-inside' : 'cc-timeline-note'}
+    >
+      {note.text}
+    </text>
+  )
 }

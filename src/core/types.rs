@@ -2888,6 +2888,20 @@ pub struct CcSessionThreadStat {
     /// First/last event in this thread (ISO-8601 UTC), when known.
     pub start: Option<String>,
     pub end: Option<String>,
+    /// The stretches of `start..=end` this thread was working, coalesced from
+    /// its own event timestamps; the gaps between them are time it spent
+    /// waiting. See [`crate::core::cc::THREAD_IDLE_GAP_SECS`]. Empty for a
+    /// thread with no events at all.
+    pub active: Vec<CcInterval>,
+}
+
+/// One closed stretch of wall-clock time, both ends ISO-8601 UTC — the same
+/// form [`CcSessionThreadStat::start`]/`end` take.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct CcInterval {
+    pub start: String,
+    pub end: String,
 }
 
 /// One session's usage rolled up by model id.

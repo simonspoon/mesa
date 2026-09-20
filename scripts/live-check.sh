@@ -1707,17 +1707,20 @@ run 0 "$MESA" live say "We renamed the project."
 run 0 "$MESA" live stop
 [ -e "$STUB_DIR/last-argc" ] ||
   fail "live stop on a session with turns must spawn its summariser"
+# The argv the built-in `live-summary` template produces:
+#   claude --bg --name {name} -- {prompt}
+# No `--agent` since mesa task 1170: the summariser runs as a plain session.
+# That is five arguments, so the stub's six-line slice now also catches the
+# prompt — compare the flags alone, which is what this assertion is about.
 EXPECTED_SUMMARY_FLAGS="--bg
---agent
-swe
 --name
 mesa live $SUM4 summary
 --"
-[ "$(cat "$STUB_DIR/last-flags")" = "$EXPECTED_SUMMARY_FLAGS" ] ||
+[ "$(head -4 "$STUB_DIR/last-flags")" = "$EXPECTED_SUMMARY_FLAGS" ] ||
   fail "live-summary spawn argv: expected
 $EXPECTED_SUMMARY_FLAGS
 got
-$(cat "$STUB_DIR/last-flags")"
+$(head -4 "$STUB_DIR/last-flags")"
 grep -q 'Your only job is to write down what it was about' "$STUB_DIR/last-prompt" ||
   fail "live-summary spawn: the prompt argument must be core::live's summariser instructions"
 grep -q "summarising mesa live session $SUM4" "$STUB_DIR/last-prompt" ||
@@ -3013,17 +3016,17 @@ run 0 "$MESA" live memory dream
 [ "$(jqs .spawned)" = "true" ] || fail "dream with two entries: spawned must be true (got $STDOUT)"
 [ "$(jqs .receipt)" = "$(cat "$STUB_DIR/last-id")" ] || fail "dream must print the spawn receipt (got $STDOUT)"
 [ -e "$STUB_DIR/last-argc" ] || fail "dream must spawn its agent"
+# The built-in `live-dream` template's argv, the summariser's shape above:
+#   claude --bg --name {name} -- {prompt}
 EXPECTED_DREAM_FLAGS="--bg
---agent
-swe
 --name
 live memory dream
 --"
-[ "$(cat "$STUB_DIR/last-flags")" = "$EXPECTED_DREAM_FLAGS" ] ||
+[ "$(head -4 "$STUB_DIR/last-flags")" = "$EXPECTED_DREAM_FLAGS" ] ||
   fail "live-dream spawn argv: expected
 $EXPECTED_DREAM_FLAGS
 got
-$(cat "$STUB_DIR/last-flags")"
+$(head -4 "$STUB_DIR/last-flags")"
 grep -q "You are tidying mesa's notebook between conversations" "$STUB_DIR/last-prompt" ||
   fail "live-dream spawn: the prompt argument must be core::live's DREAM_PROMPT"
 grep -q "mesa live memory merge --ids" "$STUB_DIR/last-prompt" ||
@@ -3483,8 +3486,8 @@ DA3=$(jqs .agent_id)
 [ "$DA3" = "deadbeef-$(( $(cat "$STUB_DIR/spawns") - 1 ))" ] ||
   fail "dream handoff (b): agent_id is the successor's receipt, spawned before the dream (got $DA3)"
 [ "$DA3" != "$DREAM_ID" ] || fail "dream handoff (b): the dream's receipt must not be bound as the agent"
-[ "$(cat "$STUB_DIR/last-flags")" = "$EXPECTED_DREAM_FLAGS" ] ||
-  fail "the handoff's dream spawn must go through the live-dream template (got $(cat "$STUB_DIR/last-flags" | tr '\n' ' '))"
+[ "$(head -4 "$STUB_DIR/last-flags")" = "$EXPECTED_DREAM_FLAGS" ] ||
+  fail "the handoff's dream spawn must go through the live-dream template (got $(head -4 "$STUB_DIR/last-flags" | tr '\n' ' '))"
 grep -q "You are tidying mesa's notebook between conversations" "$STUB_DIR/last-prompt" ||
   fail "the handoff's dream spawn must carry DREAM_PROMPT"
 grep -q "DREAM-DUP-A" "$STUB_DIR/last-prompt" && grep -q "DREAM-DUP-B" "$STUB_DIR/last-prompt" ||
@@ -3526,8 +3529,8 @@ run 0 "$MESA" live stop
 [ "$(jqs .resting_since)" = "null" ] || fail "an ended session is never resting"
 [ "$(cat "$STUB_DIR/spawns")" = "$((SPAWNS_BEFORE + 2))" ] ||
   fail "live stop over threshold spawns the summariser AND the dream (got $(( $(cat "$STUB_DIR/spawns") - SPAWNS_BEFORE )) spawns)"
-[ "$(cat "$STUB_DIR/last-flags")" = "$EXPECTED_DREAM_FLAGS" ] ||
-  fail "live stop's dream spawn must go through the live-dream template (got $(cat "$STUB_DIR/last-flags" | tr '\n' ' '))"
+[ "$(head -4 "$STUB_DIR/last-flags")" = "$EXPECTED_DREAM_FLAGS" ] ||
+  fail "live stop's dream spawn must go through the live-dream template (got $(head -4 "$STUB_DIR/last-flags" | tr '\n' ' '))"
 [ "$(cat "$STUB_DIR/last-cwd")" = "$WORKDIR" ] ||
   fail "live stop's dream runs in the conversation's project folder (got $(cat "$STUB_DIR/last-cwd"))"
 run 0 "$MESA" live memory delete "$DD_A"
@@ -3538,8 +3541,8 @@ SPAWNS_BEFORE=$(cat "$STUB_DIR/spawns")
 run 0 "$MESA" live stop
 [ "$(cat "$STUB_DIR/spawns")" = "$((SPAWNS_BEFORE + 1))" ] ||
   fail "live stop under threshold spawns the summariser alone (got $(( $(cat "$STUB_DIR/spawns") - SPAWNS_BEFORE )) spawns)"
-[ "$(sed -n 5p "$STUB_DIR/last-flags")" = "Live gate project: live $(jqs .id) summary" ] ||
-  fail "live stop under threshold: the one spawn is the summariser (got $(sed -n 5p "$STUB_DIR/last-flags"))"
+[ "$(sed -n 3p "$STUB_DIR/last-flags")" = "Live gate project: live $(jqs .id) summary" ] ||
+  fail "live stop under threshold: the one spawn is the summariser (got $(sed -n 3p "$STUB_DIR/last-flags"))"
 ok "the automatic dream: live stop spawns the dream beside the summariser over threshold and only the summariser under it"
 
 kill "$SERVER_PID" 2>/dev/null || true

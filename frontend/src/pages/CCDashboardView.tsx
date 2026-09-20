@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { getCcDashboard, getCcLive, getCcUsage, getProjectCcDashboard } from '../api'
 import { Donut, DivergingBars, Sparkbars, type Slice } from '../components/charts'
 import { DataTable, Kpi } from '../components/ccTable'
+import { ccSessionHref, type CcOrigin } from '../ccOrigin'
 import { CC_TABS, ccTabHref, ccTabLabel, type CcTab } from '../ccTab'
 import { shortModel } from '../sessionGraph'
 // Formatters and the token palette live in the unit-tested module and are
@@ -154,10 +155,10 @@ export function CCDashboardView({ tab, projectId }: { tab: CcTab; projectId?: nu
 
       {!data && !error && <p className="muted">Loading…</p>}
       {data && tab === 'overview' && <Overview data={data} />}
-      {data && tab === 'overview' && scoped && <SessionsPanel data={data} />}
+      {data && tab === 'overview' && scoped && <SessionsPanel data={data} origin={projectId ?? null} />}
       {data && tab === 'skills-agents' && <SkillsAgents data={data} />}
       {data && tab === 'projects' && !scoped && <ProjectsPanel data={data} />}
-      {data && tab === 'sessions' && <SessionsPanel data={data} />}
+      {data && tab === 'sessions' && <SessionsPanel data={data} origin={projectId ?? null} />}
     </div>
   )
 }
@@ -533,8 +534,11 @@ function ProjectsPanel({ data }: { data: CcDashboard }) {
   )
 }
 
-// Sessions (#/cc/sessions): the capped most-recent session rows.
-function SessionsPanel({ data }: { data: CcDashboard }) {
+// Sessions (#/cc/sessions): the capped most-recent session rows. `origin` is
+// the project this table is scoped to, if any — carried into every row link so
+// the detail page's back link returns here rather than to the global Sessions
+// table (mesa task 1234).
+function SessionsPanel({ data, origin }: { data: CcDashboard; origin: CcOrigin }) {
   const o = data.overview
   return (
     <section className="cc-panel">
@@ -547,7 +551,7 @@ function SessionsPanel({ data }: { data: CcDashboard }) {
       <DataTable
         rows={data.sessions}
         rowKey={(s) => s.session_id}
-        rowHref={(s) => `#/cc/sessions/${encodeURIComponent(s.session_id)}`}
+        rowHref={(s) => ccSessionHref(s.session_id, origin)}
         initialKey="start"
         empty="No sessions in this window."
         cols={[

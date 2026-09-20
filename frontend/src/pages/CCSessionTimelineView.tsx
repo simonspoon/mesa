@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState } from 'react'
 import { getCcSessionGraph } from '../api'
+import { ccSessionHref, type CcOrigin } from '../ccOrigin'
 import { CcNodeTextModal } from '../components/CcNodeTextModal'
 import { PROMPT_COLOR, RESPONSE_COLOR, formatTokens, shortModel, toolColor } from '../sessionGraph'
 import { filterRows, nodeTextTarget, threadOptions, timelineRows } from '../sessionTimeline'
@@ -41,7 +42,13 @@ const ROW_LIMIT = 5000
 const ALL_THREADS = ''
 const MAIN_THREAD = 'main'
 
-export function CCSessionTimelineView({ sessionId }: { sessionId: string }) {
+export function CCSessionTimelineView({
+  sessionId,
+  origin,
+}: {
+  sessionId: string
+  origin: CcOrigin
+}) {
   const { data, error } = useFetch(
     () => getCcSessionGraph(sessionId, ROW_LIMIT),
     `cc-timeline:${sessionId}`,
@@ -90,7 +97,7 @@ export function CCSessionTimelineView({ sessionId }: { sessionId: string }) {
         {/* Back one step, to this session's detail page — the drill-down this
             timeline is reached from — not all the way out to the sessions
             table. */}
-        <a className="cc-graph-back" href={`#/cc/sessions/${encodeURIComponent(sessionId)}`}>
+        <a className="cc-graph-back" href={ccSessionHref(sessionId, origin)}>
           ← Session
         </a>
         <h1>Session {sessionId.split('-')[0]}</h1>

@@ -1,4 +1,5 @@
 import { getCcSessionDetail } from '../api'
+import { ccBackLink, ccTimelineHref, type CcOrigin } from '../ccOrigin'
 import { Donut, Sparkbars } from '../components/charts'
 import { DataTable, Kpi } from '../components/ccTable'
 import { shortModel } from '../sessionGraph'
@@ -56,7 +57,13 @@ const TOP_TOOLS = 12
 const stamp = (iso: string | null) => (iso ? iso.replace('T', ' ').slice(0, 16) : '—')
 const clock = (iso: string | null) => (iso ? iso.replace('T', ' ').slice(11, 16) : '')
 
-export function CCSessionDetailView({ sessionId }: { sessionId: string }) {
+export function CCSessionDetailView({
+  sessionId,
+  origin,
+}: {
+  sessionId: string
+  origin: CcOrigin
+}) {
   const { data, error } = useFetch(
     () => getCcSessionDetail(sessionId),
     `cc-detail:${sessionId}`,
@@ -73,11 +80,16 @@ export function CCSessionDetailView({ sessionId }: { sessionId: string }) {
     detail: null,
   })
 
+  const back = ccBackLink(origin, data?.project ?? null)
+
   return (
     <div className="cc-dashboard-page">
       <header className="cc-graph-head">
-        <a className="cc-graph-back" href="#/cc/sessions">
-          ← Sessions
+        {/* Back out to wherever this session was drilled into from (mesa task
+            1234): the project dashboard whose Sessions table linked here, or
+            the global one. The origin is in the route, so a reload keeps it. */}
+        <a className="cc-graph-back" href={back.href}>
+          {back.label}
         </a>
         <h1>Session {sessionId.split('-')[0]}</h1>
         {data && (
@@ -89,23 +101,19 @@ export function CCSessionDetailView({ sessionId }: { sessionId: string }) {
             </span>
           </div>
         )}
-        <a className="cc-graph-back cc-detail-graphlink" href={timelineHref(sessionId)}>
+        <a className="cc-graph-back cc-detail-graphlink" href={ccTimelineHref(sessionId, origin)}>
           Timeline →
         </a>
       </header>
 
       {error && <p className="error">{error}</p>}
       {!data && !error && <p className="muted">Loading…</p>}
-      {data && <Body d={data} />}
+      {data && <Body d={data} origin={origin} />}
     </div>
   )
 }
 
-function timelineHref(sessionId: string) {
-  return `#/cc/sessions/${encodeURIComponent(sessionId)}/timeline`
-}
-
-function Body({ d }: { d: CcSessionDetail }) {
+function Body({ d, origin }: { d: CcSessionDetail; origin: CcOrigin }) {
   const slices = tokenSlices(d.tokens)
   const perMin = tokensPerMinute(d.total_tokens, d.duration_minutes)
   const tools = topTools(d.tools, TOP_TOOLS)
@@ -370,7 +378,7 @@ function Body({ d }: { d: CcSessionDetail }) {
           <dd>{stamp(d.end)}</dd>
         </dl>
         <p className="muted cc-hint">
-          Costs are estimates from a static price table. <a href={timelineHref(d.session_id)}>
+          Costs are estimates from a static price table. <a href={ccTimelineHref(d.session_id, origin)}>
             Open the timeline →
           </a>
         </p>

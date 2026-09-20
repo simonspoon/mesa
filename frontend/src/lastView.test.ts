@@ -69,6 +69,12 @@ describe('ccTabFromPath', () => {
     expect(ccTabFromPath(`/cc/sessions/${id}/graph`)).toBe('sessions')
   })
 
+  it('still reads the tab off a drill-down carrying an origin', () => {
+    const id = 'e5d7a1c2-0000-4000-8000-abcdef123456'
+    expect(ccTabFromPath(`/cc/sessions/${id}?project=3`)).toBe('sessions')
+    expect(ccTabFromPath(`/cc/sessions/${id}/timeline?project=3`)).toBe('sessions')
+  })
+
   it('is null for anything that is not a cc route, root included', () => {
     for (const p of ['/', '/inbox', '/settings', '/terminal', '/projects/7']) {
       expect(ccTabFromPath(p)).toBeNull()

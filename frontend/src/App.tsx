@@ -6,6 +6,7 @@ import { CommandPalette } from './components/CommandPalette'
 import { PhoneTabBar } from './components/PhoneTabBar'
 import { PtyPool } from './components/PtyPool'
 import { Sidebar } from './components/Sidebar'
+import { ccOriginFromHash, splitHashQuery } from './ccOrigin'
 import { inboxFilterFor } from './inboxFilter'
 import { unreadCount } from './inboxRead'
 import { matchesShortcut, type Keymap } from './keymap'
@@ -149,7 +150,12 @@ function useCommandPaletteShortcut(onOpen: () => void, keymap: Keymap) {
 }
 
 function App() {
-  const path = useHashPath()
+  const hash = useHashPath()
+  // A CC session drill-down carries the dashboard it was reached from as a
+  // `?project=<id>` suffix (mesa task 1234). Split it off here, before any
+  // route pattern below runs: a `[^/]+` id segment would otherwise swallow it.
+  const { path } = splitHashQuery(hash)
+  const ccOrigin = ccOriginFromHash(hash)
   // Bumped after project create/rename/delete so the sidebar refetches.
   const [navVersion, setNavVersion] = useState(0)
   const [paletteOpen, setPaletteOpen] = useState(false)
@@ -354,9 +360,16 @@ function App() {
   } else if (ccTimelineMatch) {
     // Checked before `ccMatch` for readability only — every one of these
     // patterns is disjoint (`ccMatch` anchors the end right after `sessions`).
-    page = <CCSessionTimelineView sessionId={decodeURIComponent(ccTimelineMatch[1])} />
+    page = (
+      <CCSessionTimelineView
+        sessionId={decodeURIComponent(ccTimelineMatch[1])}
+        origin={ccOrigin}
+      />
+    )
   } else if (ccDetailMatch) {
-    page = <CCSessionDetailView sessionId={decodeURIComponent(ccDetailMatch[1])} />
+    page = (
+      <CCSessionDetailView sessionId={decodeURIComponent(ccDetailMatch[1])} origin={ccOrigin} />
+    )
   } else if (ccMatch) {
     // CC Dashboard: global telemetry view, also above projects. `ccTab` is
     // non-null whenever ccMatch is.

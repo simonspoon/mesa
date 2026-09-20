@@ -60,22 +60,62 @@ const BINARY_EXTENSIONS: &[&str] = &[
 fn language_of(ext: &str) -> Option<&'static str> {
     Some(match ext {
         "rs" => "rust",
-        "ts" | "tsx" => "typescript",
-        "js" | "jsx" => "javascript",
-        "py" => "python",
-        "json" => "json",
+        "ts" | "tsx" | "cts" | "mts" => "typescript",
+        "js" | "jsx" | "cjs" | "mjs" => "javascript",
+        "py" | "pyi" => "python",
+        "json" | "jsonc" | "json5" | "webmanifest" => "json",
         "md" => "markdown",
         "yml" | "yaml" => "yaml",
         "toml" => "toml",
-        "sh" | "bash" => "shell",
-        "html" => "html",
+        // .zsh and .fish are not bash, but bash's is the closest grammar the
+        // frontend registers — shell colouring beats none.
+        "sh" | "bash" | "zsh" | "fish" => "shell",
+        // A single-file component is an HTML document with <script> and
+        // <style> blocks in it, so markup colouring is the right fit.
+        "html" | "vue" | "svelte" | "astro" => "html",
         "svg" => "svg",
         "css" => "css",
+        "scss" => "scss",
+        "less" => "less",
         "go" => "go",
         "rb" => "ruby",
         "c" | "h" => "c",
-        "cpp" | "hpp" | "cc" => "cpp",
+        "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" => "cpp",
         "cs" => "csharp",
+        "swift" => "swift",
+        // .kts is Kotlin's script flavour, which is also what a
+        // build.gradle.kts carries — so Gradle's Kotlin DSL lands here rather
+        // than on the "gradle" arm below.
+        "kt" | "kts" => "kotlin",
+        "java" => "java",
+        // .m is Objective-C; .mm is its C++ flavour.
+        "m" | "mm" => "objectivec",
+        "php" => "php",
+        "dart" => "dart",
+        "scala" => "scala",
+        "lua" => "lua",
+        // Perl scripts and the modules they use.
+        "pl" | "pm" => "perl",
+        "r" => "r",
+        "hs" => "haskell",
+        // Elixir source and its script flavour.
+        "ex" | "exs" => "elixir",
+        // The common Dockerfile has no extension at all and is tagged by name
+        // (`language_of_name`); this arm is the `web.dockerfile` spelling.
+        "dockerfile" => "docker",
+        "mk" => "makefile",
+        // A unified diff, under either name the patch tools write.
+        "diff" | "patch" => "diff",
+        // Key/value config files. "env" is here for a `local.env`; the dotfile
+        // spelling (`.env`, `.env.production`) has no extension and is tagged
+        // by name instead.
+        "ini" | "cfg" | "conf" | "env" => "ini",
+        // PowerShell scripts and the modules they import.
+        "ps1" | "psm1" => "powershell",
+        "proto" => "protobuf",
+        "graphql" | "gql" => "graphql",
+        // Gradle's other DSL is Groovy, so .gradle rides with it.
+        "groovy" | "gradle" => "groovy",
         "sql" => "sql",
         // Tabular data files. Two tags rather than one, because the frontend's
         // table view derives its delimiter from the tag — see
@@ -87,10 +127,48 @@ fn language_of(ext: &str) -> Option<&'static str> {
         "kql" | "csl" => "kql",
         // .NET project and UI files are XML documents under a bespoke
         // extension — tagging them "xml" is what gets them markup colouring
-        // (task 823).
-        "xml" | "csproj" | "xaml" => "xml",
+        // (task 823). Apple's property lists and Interface Builder documents
+        // are the same story. An Xcode .pbxproj deliberately is NOT: it is a
+        // NeXT-style plist, not XML, so it stays untagged.
+        "xml" | "csproj" | "xaml" | "plist" | "storyboard" | "xib" | "xcworkspacedata" => "xml",
         _ => return None,
     })
+}
+
+/// File name -> frontend color-coding tag, for the files an extension cannot
+/// describe: those carrying none at all (`Dockerfile`, `Makefile`) and
+/// dotfiles, whose leading dot `Path::extension` reads as the start of the
+/// stem rather than as a separator (`.zshrc`, `.gitconfig`). Fed the
+/// lowercased whole file name, and consulted only when [`language_of`]
+/// answered nothing — see [`language_for_path`].
+fn language_of_name(name: &str) -> Option<&'static str> {
+    // The .env family is a prefix rather than a fixed set: `.env.production`
+    // and `.env.local` are one file per environment, and what looks like their
+    // extension is the environment's name rather than a format.
+    if name == ".env" || name.starts_with(".env.") {
+        return Some("ini");
+    }
+    Some(match name {
+        "dockerfile" => "docker",
+        // GNU make reads both spellings; its third, `*.mk`, has a real
+        // extension and lives in `language_of`.
+        "makefile" | "gnumakefile" => "makefile",
+        ".gitconfig" | ".editorconfig" => "ini",
+        ".zshrc" | ".zprofile" | ".bashrc" | ".bash_profile" | ".profile" => "shell",
+        _ => return None,
+    })
+}
+
+/// The colour tag for a whole path: its extension first, its file name only
+/// when the extension answered nothing. Extension-first leaves every tag that
+/// already existed exactly as it was, and nothing [`language_of_name`] knows
+/// has an extension that maps — `.env.local`'s "local" does not — so neither
+/// table can shadow the other.
+fn language_for_path(path: &Path) -> Option<&'static str> {
+    extension_of(path)
+        .as_deref()
+        .and_then(language_of)
+        .or_else(|| file_name_of(path).as_deref().and_then(language_of_name))
 }
 
 /// Extension allowlist for the inline image route
@@ -144,6 +222,14 @@ fn extension_of(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
+}
+
+/// Extracts a lowercased file name from a path, or `None` when there isn't
+/// one. `extension_of`'s sibling, for [`language_of_name`].
+fn file_name_of(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_ascii_lowercase())
 }
 
 /// Resolves `rel` (a request-supplied relative path, forward or back
@@ -372,15 +458,15 @@ pub fn create_dir(parent: &str, name: &str) -> Result<DirEntry, CreateDirError> 
 ///     `capped` char-boundary truncation as `git.rs`),
 ///     `Some(FileContentView{is_binary: false, content, truncated, language})`.
 ///
-/// `language` is derived from the extension in both branches — it describes
-/// the FILE, not the content, so it's set even for binaries.
+/// `language` is derived from the path in both branches — it describes the
+/// FILE, not the content, so it's set even for binaries.
 pub fn read_file(root: &str, rel: &str) -> Option<FileContentView> {
     let path = safe_path(root, rel)?;
     if path.is_dir() {
         return None;
     }
     let ext = extension_of(&path);
-    let language = ext.as_deref().and_then(language_of);
+    let language = language_for_path(&path);
     let ext_is_binary = ext
         .as_deref()
         .is_some_and(|e| BINARY_EXTENSIONS.contains(&e));
@@ -1129,10 +1215,7 @@ fn search_one_file(
     out.total_matches += matches.len() as u32;
     out.files.push(FileSearchFile {
         path: rel.to_string(),
-        language: extension_of(path)
-            .as_deref()
-            .and_then(language_of)
-            .map(str::to_string),
+        language: language_for_path(path).map(str::to_string),
         matches,
         truncated: file_truncated,
     });
@@ -1702,6 +1785,174 @@ mod tests {
 
         let v = read_file(root, "Rows.CSV").unwrap();
         assert_eq!(v.language.as_deref(), Some("csv"));
+    }
+
+    #[test]
+    fn language_of_tags_the_compiled_languages() {
+        for (ext, tag) in [
+            ("swift", "swift"),
+            ("kt", "kotlin"),
+            ("kts", "kotlin"),
+            ("java", "java"),
+            ("m", "objectivec"),
+            ("mm", "objectivec"),
+            ("dart", "dart"),
+            ("scala", "scala"),
+            ("hs", "haskell"),
+            ("ex", "elixir"),
+            ("exs", "elixir"),
+            ("groovy", "groovy"),
+            ("gradle", "groovy"),
+        ] {
+            assert_eq!(language_of(ext), Some(tag), "{ext}");
+        }
+    }
+
+    #[test]
+    fn language_of_tags_the_scripting_languages() {
+        for (ext, tag) in [
+            ("php", "php"),
+            ("lua", "lua"),
+            ("pl", "perl"),
+            ("pm", "perl"),
+            ("r", "r"),
+            ("ps1", "powershell"),
+            ("psm1", "powershell"),
+            ("zsh", "shell"),
+            ("fish", "shell"),
+        ] {
+            assert_eq!(language_of(ext), Some(tag), "{ext}");
+        }
+    }
+
+    #[test]
+    fn language_of_tags_the_build_and_config_extensions() {
+        for (ext, tag) in [
+            ("dockerfile", "docker"),
+            ("mk", "makefile"),
+            ("diff", "diff"),
+            ("patch", "diff"),
+            ("ini", "ini"),
+            ("cfg", "ini"),
+            ("conf", "ini"),
+            ("env", "ini"),
+            ("proto", "protobuf"),
+            ("graphql", "graphql"),
+            ("gql", "graphql"),
+        ] {
+            assert_eq!(language_of(ext), Some(tag), "{ext}");
+        }
+    }
+
+    #[test]
+    fn language_of_tags_the_new_aliases_onto_existing_grammars() {
+        for (ext, tag) in [
+            ("scss", "scss"),
+            ("less", "less"),
+            ("vue", "html"),
+            ("svelte", "html"),
+            ("astro", "html"),
+            ("cjs", "javascript"),
+            ("mjs", "javascript"),
+            ("cts", "typescript"),
+            ("mts", "typescript"),
+            ("pyi", "python"),
+            ("hh", "cpp"),
+            ("cxx", "cpp"),
+            ("hxx", "cpp"),
+            ("jsonc", "json"),
+            ("json5", "json"),
+            ("webmanifest", "json"),
+            ("plist", "xml"),
+            ("storyboard", "xml"),
+            ("xib", "xml"),
+            ("xcworkspacedata", "xml"),
+        ] {
+            assert_eq!(language_of(ext), Some(tag), "{ext}");
+        }
+    }
+
+    #[test]
+    fn language_of_leaves_an_xcode_project_file_untagged() {
+        // A .pbxproj is a NeXT-style property list, not XML — markup colouring
+        // would be wrong, so it renders plain.
+        assert_eq!(language_of("pbxproj"), None);
+    }
+
+    #[test]
+    fn language_of_name_tags_the_extensionless_build_files() {
+        for (name, tag) in [
+            ("dockerfile", "docker"),
+            ("makefile", "makefile"),
+            ("gnumakefile", "makefile"),
+        ] {
+            assert_eq!(language_of_name(name), Some(tag), "{name}");
+        }
+    }
+
+    #[test]
+    fn language_of_name_tags_the_dotfiles() {
+        for (name, tag) in [
+            (".gitconfig", "ini"),
+            (".editorconfig", "ini"),
+            (".zshrc", "shell"),
+            (".zprofile", "shell"),
+            (".bashrc", "shell"),
+            (".bash_profile", "shell"),
+            (".profile", "shell"),
+        ] {
+            assert_eq!(language_of_name(name), Some(tag), "{name}");
+        }
+    }
+
+    #[test]
+    fn language_of_name_tags_the_whole_env_family() {
+        // `.env.local`'s apparent extension is "local", which means nothing —
+        // the family is matched on its prefix instead.
+        for name in [".env", ".env.local", ".env.production", ".env.test.ci"] {
+            assert_eq!(language_of_name(name), Some("ini"), "{name}");
+        }
+        assert_eq!(language_of_name(".envrc"), None);
+    }
+
+    #[test]
+    fn language_for_path_reads_the_extension_first_then_the_name() {
+        // An extension wins where there is one...
+        assert_eq!(language_for_path(Path::new("a/b.swift")), Some("swift"));
+        // ...including a Gradle Kotlin DSL script, whose extension is `kts`
+        // and which therefore needs no rule of its own.
+        assert_eq!(
+            language_for_path(Path::new("build.gradle.kts")),
+            Some("kotlin")
+        );
+        // ...and the file name answers only where it does not.
+        assert_eq!(language_for_path(Path::new("a/Dockerfile")), Some("docker"));
+        assert_eq!(language_for_path(Path::new("a/Makefile")), Some("makefile"));
+        assert_eq!(
+            language_for_path(Path::new("a/GNUmakefile")),
+            Some("makefile")
+        );
+        assert_eq!(
+            language_for_path(Path::new("a/web.dockerfile")),
+            Some("docker")
+        );
+        assert_eq!(
+            language_for_path(Path::new("a/.env.production")),
+            Some("ini")
+        );
+        assert_eq!(language_for_path(Path::new("a/.zshrc")), Some("shell"));
+        assert_eq!(language_for_path(Path::new("a/App.pbxproj")), None);
+        assert_eq!(language_for_path(Path::new("a/notes")), None);
+    }
+
+    #[test]
+    fn read_file_tags_an_extensionless_dockerfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+
+        let v = read_file(root, "Dockerfile").unwrap();
+        assert_eq!(v.language.as_deref(), Some("docker"));
     }
 
     #[test]

@@ -133,18 +133,33 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   rs: 'rust',
   ts: 'typescript',
   tsx: 'typescript',
+  cts: 'typescript',
+  mts: 'typescript',
   js: 'javascript',
   jsx: 'javascript',
+  cjs: 'javascript',
+  mjs: 'javascript',
   py: 'python',
+  pyi: 'python',
   json: 'json',
+  jsonc: 'json',
+  json5: 'json',
+  webmanifest: 'json',
   md: 'markdown',
   yml: 'yaml',
   yaml: 'yaml',
   toml: 'toml',
   sh: 'shell',
   bash: 'shell',
+  zsh: 'shell',
+  fish: 'shell',
   html: 'html',
+  vue: 'html',
+  svelte: 'html',
+  astro: 'html',
   css: 'css',
+  scss: 'scss',
+  less: 'less',
   svg: 'svg',
   go: 'go',
   rb: 'ruby',
@@ -153,7 +168,41 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   cpp: 'cpp',
   hpp: 'cpp',
   cc: 'cpp',
+  hh: 'cpp',
+  cxx: 'cpp',
+  hxx: 'cpp',
   cs: 'csharp',
+  swift: 'swift',
+  kt: 'kotlin',
+  kts: 'kotlin',
+  java: 'java',
+  m: 'objectivec',
+  mm: 'objectivec',
+  php: 'php',
+  dart: 'dart',
+  scala: 'scala',
+  lua: 'lua',
+  pl: 'perl',
+  pm: 'perl',
+  r: 'r',
+  hs: 'haskell',
+  ex: 'elixir',
+  exs: 'elixir',
+  dockerfile: 'docker',
+  mk: 'makefile',
+  diff: 'diff',
+  patch: 'diff',
+  ini: 'ini',
+  cfg: 'ini',
+  conf: 'ini',
+  env: 'ini',
+  ps1: 'powershell',
+  psm1: 'powershell',
+  proto: 'protobuf',
+  graphql: 'graphql',
+  gql: 'graphql',
+  groovy: 'groovy',
+  gradle: 'groovy',
   sql: 'sql',
   csv: 'csv',
   tsv: 'tsv',
@@ -162,6 +211,29 @@ const EXTENSION_LANGUAGE: Record<string, string> = {
   xml: 'xml',
   csproj: 'xml',
   xaml: 'xml',
+  plist: 'xml',
+  storyboard: 'xml',
+  xib: 'xml',
+  xcworkspacedata: 'xml',
+}
+
+// Whole file name -> language tag, the client-side copy of
+// core::files::language_of_name: the files an extension cannot describe —
+// those carrying none at all (Dockerfile, Makefile) and dotfiles, whose
+// leading dot is the start of the stem rather than a separator. The .env
+// family is a prefix rather than a fixed set and is handled in
+// `languageOfName` itself.
+const NAME_LANGUAGE: Record<string, string> = {
+  dockerfile: 'docker',
+  makefile: 'makefile',
+  gnumakefile: 'makefile',
+  '.gitconfig': 'ini',
+  '.editorconfig': 'ini',
+  '.zshrc': 'shell',
+  '.zprofile': 'shell',
+  '.bashrc': 'shell',
+  '.bash_profile': 'shell',
+  '.profile': 'shell',
 }
 
 // Language tag -> one of the theme's five neon accent hues. The Tron palette
@@ -177,14 +249,32 @@ const LANGUAGE_ACCENT: Record<string, string> = {
   c: 'cyan',
   cpp: 'cyan',
   csharp: 'cyan',
+  swift: 'cyan',
+  kotlin: 'cyan',
+  java: 'cyan',
+  objectivec: 'cyan',
+  scala: 'cyan',
+  dart: 'cyan',
+  haskell: 'cyan',
   python: 'green',
   ruby: 'green',
   shell: 'green',
+  php: 'green',
+  lua: 'green',
+  perl: 'green',
+  r: 'green',
+  elixir: 'green',
+  groovy: 'green',
+  powershell: 'green',
+  docker: 'green',
+  makefile: 'green',
   javascript: 'magenta',
   typescript: 'magenta',
   html: 'magenta',
   xml: 'magenta',
   css: 'magenta',
+  scss: 'magenta',
+  less: 'magenta',
   json: 'amber',
   yaml: 'amber',
   toml: 'amber',
@@ -193,14 +283,27 @@ const LANGUAGE_ACCENT: Record<string, string> = {
   csv: 'amber',
   tsv: 'amber',
   kql: 'amber',
+  diff: 'amber',
+  ini: 'amber',
+  protobuf: 'amber',
+  graphql: 'amber',
 }
 
-/** Extension-derived language tag for a filename, or null when unrecognized
- * (no extension, a dotfile like ".gitignore", or an unlisted extension). */
+/** Language tag for a filename, or null when unrecognized (an unlisted
+ * extension, or a dotfile like ".gitignore" neither table knows). Its
+ * extension first, its whole name only when the extension answered nothing —
+ * the same order core::files::language_for_path takes, so the two tables can
+ * never shadow each other. */
 function languageOfName(name: string): string | null {
+  const lower = name.toLowerCase()
   const i = name.lastIndexOf('.')
-  if (i <= 0) return null
-  return EXTENSION_LANGUAGE[name.slice(i + 1).toLowerCase()] ?? null
+  const byExtension = i > 0 ? EXTENSION_LANGUAGE[lower.slice(i + 1)] : undefined
+  if (byExtension !== undefined) return byExtension
+  // The .env family is a prefix rather than a fixed set: `.env.production`
+  // and `.env.local` are one file per environment, and what looks like their
+  // extension is the environment's name rather than a format.
+  if (lower === '.env' || lower.startsWith('.env.')) return 'ini'
+  return NAME_LANGUAGE[lower] ?? null
 }
 
 /** CSS class for a language tag (or its absence) — shared by tree rows

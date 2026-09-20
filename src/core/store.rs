@@ -12766,15 +12766,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            64,
-            "a fresh db should report user_version 64"
+            65,
+            "a fresh db should report user_version 65"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 64);
+        assert_eq!(version, 65);
     }
 
     // ---- the session retrospective (mesa task 1158) ----

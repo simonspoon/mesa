@@ -185,6 +185,39 @@ already use.
     Age, process liveness and the daemon's `bg settled` sweep were all ruled
     out as the mechanism (mesa task 571). mesa now reports that pair as what
     upstream says it is — working — rather than inferring past it.
+  - a false `blocked` is the third measured instance of the same lesson
+    (mesa task 1289). Upstream persists its verdict to
+    `~/.claude/jobs/<id>/state.json`, and there it took `needs`/`detail`
+    verbatim from the tail of the agent's own closing sentence — a
+    `live-summary` run that had just summarised a conversation *about*
+    blocked agents ended "…waiting on the user, not that it is stuck", and
+    was classified as being one; a `done` sibling of the same template
+    carries synthesised prose ("session 115 summary saved: …") and a
+    populated `output.result` instead. It is sticky and terminal — still
+    `blocked` on a re-poll 12s later, that file 4.5 h stale — and the
+    summary itself had already been written 5s before the verdict was
+    stamped. mesa reports it as-is for the reason it reports sticky
+    `working` as-is, and here it could not do otherwise: across 188 rows of
+    `claude agents --json --all` `waitingFor` was absent on every one, the
+    blocked row was identical to the pid-carrying `done` rows in every key
+    but `state`, and the two transcript tails are structurally identical
+    (`end_turn`, no dangling `tool_use`, no permission request) — nothing
+    mesa reads separates a false `blocked` from a true one, and the fields
+    that do differ (`output`, `firstTerminalAt`) live in that private jobs
+    file, which mesa neither reads nor owns, and separate terminal from
+    live rather than false from genuine. The cost is display plus two
+    waits: the todo watcher's reaper (`reap_verdict` in `src/api.rs`) never
+    reads `state` at all — only `pid`, `status` and the two counts below —
+    so dispatch is not held up, but the session keeps the BLOCKED section
+    open and, under Auto Tile, a pane that never closes (the tile set is
+    `bucketOf(a) !== 'DONE'`, and a falsely-blocked session never reaches
+    DONE); `agents::job_running` counts any state outside
+    `done`/`failed`/`stopped` as running, so such a job holds a resting
+    `listen` waiting to its 10-minute cap (mesa task 1155); and
+    `agents::blocked_on`'s `unwrap_or("blocked")` fallback — deliberate,
+    and unchanged by this — lets it reach `GET /api/live`'s derived
+    `blocked` with no reason, which the page's watchdog can turn into a
+    spoken `notice: permission` turn (mesa task 1157).
 - **Two mesa-derived counts report what a session is doing**
   (mesa task 802): `liveShells` and `liveSubagents` on every `AgentSession`.
   Upstream's `state` reaches `done` the moment a turn ends, while the work

@@ -621,6 +621,24 @@ already use.
       says so rather than dropping the message: a writer handed out during
       `CONNECTING` would swallow what was typed, and an outside writer has no
       keyboard in front of it to notice.
+    - **A closed socket is recovered from the chat itself** (mesa task 1290).
+      The statement above stands — there is still no send API — but the *way
+      back* used to be unreachable: the only thing that reopens a socket is
+      `PtyTerminal`'s own reconnect button, and the chat is rendered over the
+      terminal view with `visibility: hidden; pointer-events: none`, so for as
+      long as a reader is chatting that button can be reached by neither mouse
+      nor Tab. So the terminal registers its reopen with
+      `ptyPool.setReconnector` exactly as it registers its writer, and
+      `ptyPool.reconnect(<pane id>)` offers it by leaf id — the composer's
+      failure line carries a `reconnect` press beside the message. Two
+      deliberate non-choices: the reconnector is **not** withdrawn when the
+      socket closes (unlike the writer — a closed socket is precisely when it
+      is the useful one, and a socket that never opened needs it too), and a
+      failed send is **never** retried or queued for the new socket. A
+      reconnect spawns a fresh `claude attach` whose TUI draws itself over the
+      following frames; replaying held keystrokes into a half-drawn input box
+      is how they land in the wrong place. Reopening the channel and sending
+      are two presses, on purpose.
     - A **multi-line** message is wrapped in bracketed paste
       (`ESC[200~` … `ESC[201~`) rather than sent as raw newlines: a raw `\n` is
       the submit key in the agent's TUI, so three lines would arrive as three
@@ -678,7 +696,10 @@ already use.
       terminal) and `Esc` to cancel.
     - It fails exactly as the composer does — `ptyPool.send` returning false
       says the socket is gone, and the card says so rather than pretending the
-      click landed.
+      click landed — and it recovers exactly as the composer does, the same
+      `reconnect` press beside the same message (mesa task 1290). A card whose
+      socket closed mid-call is the worst place to be stranded: the agent is
+      stopped, waiting, and the reader has nothing else to press.
   - **Untrusted text, rendered as markup — deliberately, and narrowly.** Every
     body here is model-authored transcript text, which the CC surfaces
     otherwise render only as a text child or a `title`. The chat view is the

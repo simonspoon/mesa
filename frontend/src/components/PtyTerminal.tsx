@@ -39,6 +39,7 @@ export function PtyTerminal({
   endpoint,
   closedMessage,
   registerSend,
+  registerReconnect,
 }: {
   // Path (no origin) to the websocket endpoint to attach to, e.g.
   // `/api/agents/${agentId}/attach` or `/api/terminal/attach`.
@@ -52,6 +53,11 @@ export function PtyTerminal({
   // has no channel of its own). Optional — a surface with nothing but the
   // terminal itself typing into the PTY simply omits it.
   registerSend?: (send: ((data: string) => boolean) | null) => void
+  // Hands the caller a way to reopen this socket, exactly as the "reconnect"
+  // button below does (mesa task 1290: that button lives in the terminal view,
+  // which is hidden behind the chat, so a chat whose socket has closed has no
+  // reachable way back). Optional, for the same reason `registerSend` is.
+  registerReconnect?: (reconnect: (() => void) | null) => void
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   // Held only so the tier effect below can retune an already-open terminal;
@@ -67,8 +73,10 @@ export function PtyTerminal({
   // prop is a fresh closure on every parent render, and re-running the effect
   // would tear down and reopen the socket each time.
   const registerRef = useRef(registerSend)
+  const reconnectRef = useRef(registerReconnect)
   useEffect(() => {
     registerRef.current = registerSend
+    reconnectRef.current = registerReconnect
   })
 
   useEffect(() => {
@@ -112,6 +120,11 @@ export function PtyTerminal({
       `${proto}://${window.location.host}${endpoint}${sep}cols=${term.cols}&rows=${term.rows}`,
     )
     ws.binaryType = 'arraybuffer'
+    // Unlike the writer, this is handed out immediately and never withdrawn on
+    // close: a closed socket is precisely when reopening it is the thing to
+    // offer, and a socket that never opened at all needs it just as much. Only
+    // this effect's cleanup takes it back.
+    reconnectRef.current?.(() => setEpoch((e) => e + 1))
     const encoder = new TextEncoder()
     ws.onmessage = (ev) => term.write(new Uint8Array(ev.data as ArrayBuffer))
     ws.onopen = () => {
@@ -157,6 +170,7 @@ export function PtyTerminal({
     return () => {
       disposed = true
       registerRef.current?.(null)
+      reconnectRef.current?.(null)
       observer.disconnect()
       dataSub.dispose()
       resizeSub.dispose()

@@ -107,6 +107,47 @@ export function AgentChat({
 }
 
 /**
+ * What a failed send says, and the one thing the reader can do about it (mesa
+ * task 1290). The send failed because this pane's attach socket has closed,
+ * and the only affordance that reopens it — `PtyTerminal`'s own reconnect
+ * button — is inside the terminal view, which the chat is rendered over with
+ * `visibility: hidden`: unreachable by mouse or by Tab for as long as the
+ * reader is chatting. So the pool hands that same reopen out by leaf id, and
+ * this offers it where the failure is read.
+ *
+ * Deliberately a press and not automatic: reconnecting spawns a fresh
+ * `claude attach` whose TUI draws itself over the next few frames, and
+ * replaying a queued message into a half-drawn input box is how keystrokes
+ * land in the wrong place. The send stays a deliberate act — this only
+ * reopens the channel, and the reader sends again.
+ */
+function SendError({
+  agentId,
+  message,
+  onReconnect,
+}: {
+  agentId: string
+  message: string
+  onReconnect: () => void
+}) {
+  return (
+    <p className="agent-chat-send-error">
+      {message}{' '}
+      <button
+        type="button"
+        className="agent-chat-send-reconnect"
+        onClick={() => {
+          ptyPool.reconnect(agentId)
+          onReconnect()
+        }}
+      >
+        reconnect
+      </button>
+    </p>
+  )
+}
+
+/**
  * The question a session is **waiting on** (task 866), as buttons.
  *
  * A chat pane is otherwise a read: the agent works, you watch. An
@@ -152,7 +193,7 @@ function QuestionCard({
 
   const type = (keys: string) => {
     if (!ptyPool.send(agentId, keys)) {
-      setError('not connected — reopen the terminal view to reconnect')
+      setError('not connected — the session\u2019s terminal socket has closed')
       return false
     }
     setError(null)
@@ -240,7 +281,7 @@ function QuestionCard({
       {/* The card outlives its own answer by one poll at most, and saying
           nothing in that window reads as a click that did nothing. */}
       {done && !needsSubmit && <p className="agent-chat-ask-sent">sent</p>}
-      {error && <p className="agent-chat-send-error">{error}</p>}
+      {error && <SendError agentId={agentId} message={error} onReconnect={() => setError(null)} />}
     </div>
   )
 }
@@ -298,7 +339,7 @@ function Composer({ agentId, onSent }: { agentId: string; onSent: () => void }) 
     const keys = chatSendKeys(text)
     if (keys === null) return
     if (!ptyPool.send(agentId, keys)) {
-      setError('not connected — reopen the terminal view to reconnect')
+      setError('not connected — the session\u2019s terminal socket has closed')
       return
     }
     setError(null)
@@ -320,7 +361,7 @@ function Composer({ agentId, onSent }: { agentId: string; onSent: () => void }) 
         submit()
       }}
     >
-      {error && <p className="agent-chat-send-error">{error}</p>}
+      {error && <SendError agentId={agentId} message={error} onReconnect={() => setError(null)} />}
       <div className="agent-chat-composer-row">
         <textarea
           ref={inputRef}

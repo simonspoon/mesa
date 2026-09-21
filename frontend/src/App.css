@@ -4690,6 +4690,19 @@ body.live-sidebar-resizing {
   font-size: 0.68rem;
 }
 
+/* Inline in the error line rather than a block of its own: the failure and
+   the one thing to do about it are one sentence (mesa task 1290). */
+.agent-chat-send-reconnect {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--amber);
+  font-family: inherit;
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 .agent-chat-tool {
   display: flex;
   gap: 0.4rem;

@@ -44,6 +44,14 @@ const pool = new Map<string, PoolEntry>()
 // `readyState` that tells them apart.
 const senders = new Map<string, (data: string) => boolean>()
 
+// How anything outside the terminal reopens a leaf's PTY socket (mesa task
+// 1290: the chat view's composer). Only the pooled `PtyTerminal` can reopen
+// its own socket, and the reconnect button that does it lives in the terminal
+// view — which is hidden behind the chat, so a reader whose socket has closed
+// mid-conversation has nothing to press. Registered alongside the writer and
+// withdrawn with it; an id with no entry simply cannot be reconnected.
+const reconnectors = new Map<string, () => void>()
+
 // A referentially-stable snapshot array, rebuilt only when the pool's own
 // membership actually changes (`ensure`/`remove` below) — never on every
 // `getIds()` call. `useSyncExternalStore` (in `PtyPool.tsx`) treats any new
@@ -102,6 +110,7 @@ export function remove(id: string): void {
   if (!pool.has(id)) return
   pool.delete(id)
   senders.delete(id)
+  reconnectors.delete(id)
   notify()
 }
 
@@ -127,6 +136,31 @@ export function send(id: string, data: string): boolean {
   const sender = senders.get(id)
   if (!sender) return false
   return sender(data)
+}
+
+/**
+ * Registers (or, with `null`, clears) the reconnector for one leaf's PTY.
+ * Registered by the same pooled `PtyTerminal` as the writer — nobody else can
+ * reopen its socket — but deliberately NOT on the writer's lifetime: the
+ * writer is withdrawn the moment the socket closes, which is the exact moment
+ * this becomes the useful one. It lives as long as the terminal does.
+ */
+export function setReconnector(id: string, reconnect: (() => void) | null): void {
+  if (reconnect === null) reconnectors.delete(id)
+  else reconnectors.set(id, reconnect)
+}
+
+/**
+ * Reopens a leaf's PTY socket, exactly as the terminal view's own reconnect
+ * button does. Returns false when there is nothing registered for `id` — a
+ * leaf whose terminal is gone entirely, which is not something a caller can
+ * fix by pressing again.
+ */
+export function reconnect(id: string): boolean {
+  const fn = reconnectors.get(id)
+  if (!fn) return false
+  fn()
+  return true
 }
 
 export function get(id: string): PoolEntry | undefined {

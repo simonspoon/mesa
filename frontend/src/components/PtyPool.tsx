@@ -32,6 +32,9 @@ export function PtyPool() {
             // is where the id-keyed writer `ptyPool.send` looks up is bound
             // (mesa task 844).
             registerSend={(send) => ptyPool.setSender(id, send)}
+            // Same reasoning for the way back out of a closed socket (mesa
+            // task 1290).
+            registerReconnect={(reconnect) => ptyPool.setReconnector(id, reconnect)}
           />,
           e.container,
         )

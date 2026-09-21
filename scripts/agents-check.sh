@@ -118,8 +118,13 @@ EOF
 chmod +x "$STUB_DIR/claude"
 
 mkdir -p "$TMP/home"
+# A throwaway transcript root, so the subagent-children plant below is the
+# only thing in it and the real ~/.claude/projects can never leak in.
+CC_DIR="$TMP/cc"
+mkdir -p "$CC_DIR"
 PORT=17771
-HOME="$TMP/home" MESA_CLAUDE_BIN="$STUB_DIR/claude" "$MESA" serve --port "$PORT" >/dev/null 2>&1 &
+HOME="$TMP/home" MESA_CLAUDE_BIN="$STUB_DIR/claude" MESA_CC_PROJECTS_DIR="$CC_DIR" \
+  "$MESA" serve --port "$PORT" >/dev/null 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 50); do
   curl -sf "http://127.0.0.1:$PORT/api/projects" >/dev/null 2>&1 && break
@@ -155,6 +160,15 @@ ok "GET /api/projects/{id}/agents lists sessions under local_path"
 [ "$(jqb '.agents[0].liveShells')" = "0" ] || fail "GET agents: liveShells must be present and 0"
 [ "$(jqb '.agents[0].liveSubagents')" = "0" ] || fail "GET agents: liveSubagents must be present and 0"
 ok "sessions carry mesa-derived liveShells/liveSubagents, failing open to 0"
+
+# `children` (mesa task 1277) is the detailed twin of those counts: always on
+# the wire as an array, empty while nothing is live. The plant further down
+# proves the populated shape.
+[ "$(jqb '.agents[0].children | type')" = "array" ] ||
+  fail "GET agents: children must be present and an array"
+[ "$(jqb '.agents[0].children | length')" = "0" ] ||
+  fail "GET agents: children must be empty when nothing is live"
+ok "sessions carry a children array, empty when no subagent or shell is live"
 
 # lastResponse/contextTokens are the other mesa-derived pair (mesa task 869),
 # read off the session's transcript. There is no transcript here, so both must
@@ -245,6 +259,49 @@ ok "claude CLI failure surfaces as 502 unavailable (list + spawn)"
 api 200 PATCH "/api/projects/$F" '{"local_path":null}'
 [ "$(jqb .local_path)" = "null" ] || fail "API PATCH: local_path cleared"
 ok "PATCH /api/projects/{id} clears local_path"
+
+# ---- children: planted subagent transcripts (mesa task 1277) -------------
+# Subagent cards are read off real files, so the gate plants them: two runs
+# under the stub session's id, one still working and one that has handed back
+# its report. Shell children cannot be faked from bash (they are `ps` rows of
+# a process whose ppid is the session's), so they stay pinned by the Rust
+# unit tests in src/core/agents.rs.
+SESSION="toplvl001-0000-0000-0000-000000000000"
+SUBAGENTS="$CC_DIR/-Users-x-proj/$SESSION/subagents"
+mkdir -p "$SUBAGENTS"
+{
+  printf '%s\n' '{"type":"user","timestamp":"2026-09-21T13:00:15.000Z","message":{"role":"user","content":"go"}}'
+  printf '%s\n' '{"type":"assistant","timestamp":"2026-09-21T13:00:20.000Z","message":{"stop_reason":"tool_use","usage":{"input_tokens":10,"cache_read_input_tokens":4000,"cache_creation_input_tokens":90},"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}'
+} > "$SUBAGENTS/agent-aaa1.jsonl"
+printf '%s\n' '{"agentType":"diff-reviewer","description":"review the diff","spawnDepth":1}' \
+  > "$SUBAGENTS/agent-aaa1.meta.json"
+{
+  printf '%s\n' '{"type":"user","timestamp":"2026-09-21T12:59:00.000Z","message":{"role":"user","content":"go"}}'
+  printf '%s\n' '{"type":"assistant","timestamp":"2026-09-21T12:59:30.000Z","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"done, here is the report"}]}}'
+} > "$SUBAGENTS/agent-bbb2.jsonl"
+printf '%s\n' '{"agentType":"implementer"}' > "$SUBAGENTS/agent-bbb2.meta.json"
+
+# The agents list is cached in memory for 2s; wait it out rather than
+# restarting the server, so this reads the same route everything above did.
+sleep 2.5
+api 200 GET "/api/projects/$P/agents"
+[ "$(jqb '.agents[0].children | length')" = "2" ] ||
+  fail "children: both planted subagents must be listed ($(jqb '.agents[0].children'))"
+RUNNING=$(jq -r '.agents[0].children[] | select(.name == "diff-reviewer")' <<<"$BODY")
+[ -n "$RUNNING" ] || fail "children: the sidecar's agentType must name the card"
+[ "$(jq -r .kind <<<"$RUNNING")" = "subagent" ] || fail "children: kind"
+[ "$(jq -r .state <<<"$RUNNING")" = "running" ] || fail "children: an unfinished run is running"
+[ "$(jq -r .detail <<<"$RUNNING")" = "Bash" ] ||
+  fail "children: the newest assistant line has no prose, so the tool it called is the detail"
+[ "$(jq -r .contextTokens <<<"$RUNNING")" = "4100" ] || fail "children: contextTokens"
+[ "$(jq -r .startedAt <<<"$RUNNING")" = "2026-09-21 13:00:15" ] ||
+  fail "children: startedAt is the first line's timestamp in mesa's own format"
+[ "$(jq -r '.agents[0].children[] | select(.name == "implementer") | .state' <<<"$BODY")" = "finished" ] ||
+  fail "children: a run whose last line is an end_turn reads finished"
+# The badge's count is unchanged by the cards: only the RUNNING one counts.
+[ "$(jqb '.agents[0].liveSubagents')" = "1" ] ||
+  fail "children: liveSubagents must still count only live runs (got $(jqb '.agents[0].liveSubagents'))"
+ok "children lists each fresh subagent with its agentType, state, detail, context and start"
 
 # ---- attach WebSocket handshake (Origin policy + id validation) ----
 # A real ws client is out of scope for bash; the HTTP status of the upgrade

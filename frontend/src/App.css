@@ -3422,6 +3422,119 @@ main {
   border-color: rgba(255, 180, 68, 0.5);
 }
 
+/* The child cards hanging off an agent row (mesa task 1277): one per live
+   subagent and per running shell. Indented, and tied to the card above by a
+   left rule, so they read as work belonging to that session rather than as
+   rows of their own. Nothing above is restyled — the count badge stays
+   exactly where it was. */
+.agent-children {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0.4rem 0 0 0.3rem;
+  padding: 0 0 0 0.5rem;
+  border-left: 1px solid var(--border-bright);
+}
+
+/* A `<button>`, because the card is clickable (the read-only pane it opens
+   is a sibling task) — so the browser's own keyboard and focus handling
+   apply rather than a click handler on a div. Every inherited button style
+   is stood down; the card draws itself. */
+.agent-child {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  text-align: left;
+  padding: 0.2rem 0.35rem;
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.agent-child:hover {
+  border-color: var(--border-bright);
+}
+
+/* A finished subagent is on its way out — it is listed only while its
+   transcript is still fresh — so it reads back rather than competing with
+   work that is still happening. */
+.agent-child-finished {
+  opacity: 0.6;
+}
+
+.agent-child-title {
+  display: flex;
+  align-items: baseline;
+  gap: 0.3rem;
+  min-width: 0;
+}
+
+/* Only the name may shrink: a shell's card is named by a whole command line,
+   which is long enough to eat the rail several times over. */
+.agent-child-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.78rem;
+  color: var(--text-h);
+}
+
+/* The last thing a subagent did. One line, unlike the parent row's two: a
+   child card is a summary of a summary. */
+.agent-child-detail {
+  margin-top: 0.15rem;
+  font-size: 0.74rem;
+  line-height: 1.3;
+  color: var(--muted);
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  line-clamp: 1;
+  -webkit-box-orient: vertical;
+}
+
+.agent-child-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  margin-top: 0.15rem;
+  font-size: 0.72rem;
+}
+
+/* Pinned right, like the parent row's own context figure. */
+.agent-child-context {
+  margin-left: auto;
+  flex: none;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--cyan);
+}
+
+/* Smaller than a row badge, and in the two colours this app already means by
+   them: violet is an agent (the live aperture's working state), amber is
+   work in flight (the count badge above). */
+.badge.agent-child-kind-subagent,
+.badge.agent-child-kind-shell {
+  flex: none;
+  font-size: 0.65rem;
+  margin-right: 0;
+}
+
+.badge.agent-child-kind-subagent {
+  color: var(--violet);
+  border-color: rgba(176, 107, 255, 0.5);
+}
+
+.badge.agent-child-kind-shell {
+  color: var(--amber);
+  border-color: rgba(255, 180, 68, 0.5);
+}
+
 .agent-terminal-panel {
   flex: 1;
   min-height: 0;

@@ -19,6 +19,7 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 import { listAllAgents, listProjects, spawnProjectAgent } from '../api'
 import { liveWorkLabel, projectForCwd } from '../agentProject'
+import { childElapsed, childLabel, orderedChildren } from '../agentChild'
 import { formatContextTokens, responsePreview } from '../agentRow'
 import {
   clampAgentSidebarWidth,
@@ -619,6 +620,71 @@ function AgentListContent({
                               </span>
                             )}
                           </div>
+                          {/* The work this session holds in flight, one small
+                              card per subagent and per running shell (mesa
+                              task 1277) — the detailed twin of the count
+                              badge above, which is deliberately unchanged.
+                              Order is `agentChild.ts`'s decision, not the
+                              server's. */}
+                          {a.children.length > 0 && (
+                            <ul className="agent-children">
+                              {orderedChildren(a.children).map((child, i) => {
+                                const label = childLabel(child)
+                                const did = responsePreview(child.detail)
+                                const elapsed = childElapsed(child.startedAt, Date.now())
+                                const childContext = formatContextTokens(child.contextTokens)
+                                return (
+                                  <li key={`${child.kind}-${label}-${i}`}>
+                                    <button
+                                      type="button"
+                                      className={`agent-child agent-child-${child.state}`}
+                                      // Opening a child in a read-only pane is
+                                      // the sibling task "Agents panel: open a
+                                      // subagent or shell child in a read-only
+                                      // pane"; until it lands the card is
+                                      // inert, and must not toggle the parent's
+                                      // attach pane underneath it.
+                                      onClick={(e) => e.stopPropagation()}
+                                    >
+                                      <div className="agent-child-title">
+                                        <span className={`badge agent-child-kind-${child.kind}`}>
+                                          {child.kind}
+                                        </span>
+                                        {/* Untrusted text from outside mesa (a
+                                            transcript sidecar, a command line):
+                                            a plain text node, never HTML or a
+                                            URL — and the same string in
+                                            `title`, so the clamped line is
+                                            readable in full. */}
+                                        <span className="agent-child-name" title={label}>
+                                          {label}
+                                        </span>
+                                      </div>
+                                      {did && (
+                                        <div className="agent-child-detail" title={did}>
+                                          {did}
+                                        </div>
+                                      )}
+                                      <div className="muted agent-child-meta">
+                                        {elapsed && (
+                                          <span title={`running for ${elapsed}`}>{elapsed}</span>
+                                        )}
+                                        {child.state === 'finished' && <span>finished</span>}
+                                        {childContext && (
+                                          <span
+                                            className="agent-child-context"
+                                            title={`${child.contextTokens} tokens in the context window`}
+                                          >
+                                            {childContext}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </button>
+                                  </li>
+                                )
+                              })}
+                            </ul>
+                          )}
                         </li>
                       )
                     })}

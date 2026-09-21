@@ -3915,6 +3915,114 @@ fn pulse_from_text(text: &str) -> SessionPulse {
     pulse
 }
 
+/// The head [`subagent_pulse`] reads to find a run's start: its first line.
+/// Generous only because that line is the prompt the subagent was given,
+/// which can itself be long — the loop stops at the first line that parses.
+const SUBAGENT_HEAD_BYTES: u64 = 64 * 1024;
+
+/// What one **subagent** run is doing — the sidechain twin of
+/// [`SessionPulse`] (mesa task 1277), read off a single
+/// `subagents/agent-*.jsonl` file rather than off a session's main
+/// transcript.
+///
+/// It is a separate reader rather than [`pulse_from_text`] with a flag
+/// because that one skips `is_sidechain` lines on purpose (a subagent's turns
+/// are not the session's), and every line in one of these files is a
+/// sidechain line — reusing it would read every subagent as silent.
+#[derive(Debug, Default, PartialEq)]
+pub struct SubagentPulse {
+    /// The newest assistant line's prose, else the tool that message called
+    /// (`Bash`, `Read`, …) — the last thing this subagent did. Sanitized and
+    /// capped by [`sanitize_capped`] like any other transcript-derived string.
+    pub detail: Option<String>,
+    /// The newest assistant message's occupied context window, the same
+    /// `input + cache_read + cache_creation` figure [`SessionPulse`] reports.
+    pub context_tokens: Option<i64>,
+    /// When the run started, as mesa's own stored timestamp text: the first
+    /// line's `timestamp`, else the file's birth time.
+    pub started_at: Option<String>,
+}
+
+/// One subagent transcript's pulse. **Fails open in every direction** — an
+/// unreadable, truncated or empty file answers an all-`None` pulse and never
+/// an error, for [`session_pulse`]'s reason: this hangs off the agents
+/// endpoints' poll and must not turn a missing file into a failed request.
+pub(crate) fn subagent_pulse(path: &Path) -> SubagentPulse {
+    let mut pulse = match read_tail(path, PULSE_TAIL_BYTES) {
+        Ok((text, _)) => subagent_from_text(&text),
+        Err(_) => SubagentPulse::default(),
+    };
+    pulse.started_at = subagent_started_at(path);
+    pulse
+}
+
+/// Pure half of [`subagent_pulse`]: fold a transcript window into what the
+/// run last did and the context it holds. Split out so the line rule is
+/// unit-testable against literal lines, like [`pulse_from_text`].
+///
+/// Unlike that one the two answers come from the **same** line where it has
+/// both, because "the last thing it did" is one event: the newest assistant
+/// message's prose if it said anything, otherwise the tool it called.
+fn subagent_from_text(text: &str) -> SubagentPulse {
+    let mut pulse = SubagentPulse::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<RawLine>(line) else {
+            continue;
+        };
+        // No `is_sidechain` filter, deliberately: every line here is one.
+        if raw.kind.as_deref() != Some("assistant") {
+            continue;
+        }
+        let Some(msg) = raw.message.as_ref() else {
+            continue;
+        };
+        let calls = msg.tool_uses();
+        if let Some(prose) = msg.assistant_text() {
+            pulse.detail = Some(prose);
+        } else if let Some(call) = calls.first() {
+            pulse.detail = sanitize_capped(&call.1);
+        }
+        if let Some(u) = msg.usage.as_ref() {
+            pulse.context_tokens =
+                Some(u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens);
+        }
+    }
+    pulse
+}
+
+/// When a subagent run started: the first line of its transcript that carries
+/// a `timestamp`, else the file's birth time, else nothing. Only the head is
+/// read — a run's first line is written when it begins, and the tail
+/// [`subagent_pulse`] already holds may not reach back that far.
+fn subagent_started_at(path: &Path) -> Option<String> {
+    let started = || -> Option<i64> {
+        let f = fs::File::open(path).ok()?;
+        let mut buf = Vec::new();
+        f.take(SUBAGENT_HEAD_BYTES).read_to_end(&mut buf).ok()?;
+        let text = String::from_utf8_lossy(&buf);
+        // A head cut mid-line simply fails to parse and is skipped, like any
+        // other malformed line.
+        text.lines()
+            .find_map(|line| serde_json::from_str::<RawLine>(line.trim()).ok()?.timestamp)
+            .as_deref()
+            .and_then(parse_ts)
+    };
+    let epoch = started().or_else(|| {
+        fs::metadata(path)
+            .ok()?
+            .created()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() as i64)
+    })?;
+    Some(fmt_store_ts(epoch))
+}
+
 /// The main-thread transcript of `session_id`: `<projects_dir>/*/<id>.jsonl`.
 ///
 /// The project slug is unknown here — it encodes the session's cwd, which the
@@ -7162,6 +7270,45 @@ mod tests {
             SessionPulse::default(),
             "neither an injected user line nor a subagent is this session \
              speaking"
+        );
+    }
+
+    /// The subagent reader (mesa task 1277) is [`pulse_from_text`]'s mirror
+    /// image on exactly one point: every line in a `subagents/agent-*.jsonl`
+    /// is a sidechain line, so the filter that makes the session pulse right
+    /// would make this one silent.
+    #[test]
+    fn subagent_pulse_reads_sidechain_lines_and_falls_back_to_the_tool_name() {
+        let pulse = subagent_from_text(PULSE_LINES);
+        assert_eq!(
+            pulse.detail.as_deref(),
+            Some("Bash"),
+            "the newest assistant line is a tool call with no prose, so what \
+             it last did is the tool it called"
+        );
+        assert_eq!(pulse.context_tokens, Some(1000 + 2000 + 3000));
+
+        // Prose on the newest line wins over its tool blocks.
+        let both = r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"reading the store"},{"type":"tool_use","id":"t1","name":"Read","input":{}}]}}"#;
+        assert_eq!(
+            subagent_from_text(both).detail.as_deref(),
+            Some("reading the store")
+        );
+        // A transcript with nothing but the prompt in it says nothing, rather
+        // than reporting an empty string or zero tokens.
+        let prompt = r#"{"type":"user","message":{"role":"user","content":"go"}}"#;
+        assert_eq!(subagent_from_text(prompt), SubagentPulse::default());
+        assert_eq!(subagent_from_text("not json\n"), SubagentPulse::default());
+    }
+
+    /// [`subagent_pulse`] fails open the way [`session_pulse`] does: a file
+    /// that is not there is an all-`None` pulse, never an error.
+    #[test]
+    fn subagent_pulse_on_a_missing_file_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            subagent_pulse(&dir.path().join("agent-nope.jsonl")),
+            SubagentPulse::default()
         );
     }
 

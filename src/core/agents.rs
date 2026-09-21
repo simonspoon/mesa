@@ -8,11 +8,11 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::cc;
 use crate::core::config;
-use crate::core::types::AgentSession;
+use crate::core::types::{AgentChild, AgentChildKind, AgentChildState, AgentSession};
 
 /// The `claude` binary to drive; `MESA_CLAUDE_BIN` overrides it for tests
 /// (pointing at a stub), mirroring `MESA_CC_*` in cc.rs/usage.rs. Public so
@@ -104,15 +104,36 @@ fn parse_sessions(bytes: &[u8]) -> Result<Vec<AgentSession>, String> {
 /// a Bash call in flight.
 const SHELL_COMMS: [&str; 4] = ["zsh", "bash", "sh", "dash"];
 
-/// One row of the process table: `(pid, ppid, comm)`.
-type ProcRow = (i64, i64, String);
+/// One row of the process table.
+struct ProcRow {
+    pid: i64,
+    ppid: i64,
+    /// `ps`'s `etime` column in seconds — how long the process has been
+    /// running. `None` for a row whose column did not parse; a child is still
+    /// listed then, simply without a start time.
+    elapsed_secs: Option<i64>,
+    /// The program, as `ps -o comm=` reports it. macOS truncates this column
+    /// to 16 characters once it is not the last one, which is why only its
+    /// basename is ever read (`/bin/zsh` survives that cut intact).
+    comm: String,
+    /// The full command line (`ps -o args=`) — what a shell child's card is
+    /// named by, since every Bash call runs the same `comm`.
+    args: String,
+}
 
-/// Fills in the two mesa-derived liveness counts on a parsed session list.
+/// Fills in the mesa-derived liveness fields on a parsed session list: the
+/// two counts, and the list of children behind them (mesa task 1277).
 ///
 /// **Fails open in every direction**: no `ps`, no projects dir, an unreadable
-/// folder or an unparseable row all leave the counts at `0`. This is a
-/// best-effort liveness probe hanging off the agents endpoints and the todo
-/// watcher — it must never turn either into an error or park a watcher.
+/// folder or an unparseable row all leave the counts at `0` and the list
+/// empty. This is a best-effort liveness probe hanging off the agents
+/// endpoints and the todo watcher — it must never turn either into an error
+/// or park a watcher.
+///
+/// The counts are derived from the same walk that builds the list, so the
+/// badge and the cards can never disagree — but they keep their exact
+/// meanings: `live_subagents` counts only the **running** ones, while the
+/// list also carries a finished subagent still inside the freshness window.
 fn enrich_liveness(sessions: &mut [AgentSession]) {
     if sessions.is_empty() {
         return;
@@ -121,14 +142,21 @@ fn enrich_liveness(sessions: &mut [AgentSession]) {
     let root = cc::projects_dir();
     let now = SystemTime::now();
     for session in sessions.iter_mut() {
-        session.live_shells = match session.pid {
-            Some(pid) => count_shell_children(pid, &table),
-            None => 0,
+        let mut children = match root.as_deref() {
+            Some(root) => subagent_children(root, &session.session_id, now),
+            None => Vec::new(),
         };
-        session.live_subagents = match root.as_deref() {
-            Some(root) => count_live_subagents(root, &session.session_id, now),
-            None => 0,
+        session.live_subagents = children
+            .iter()
+            .filter(|child| child.state == AgentChildState::Running)
+            .count() as u32;
+        let shells = match session.pid {
+            Some(pid) => shell_children(pid, &table, now),
+            None => Vec::new(),
         };
+        session.live_shells = shells.len() as u32;
+        children.extend(shells);
+        session.children = children;
     }
 }
 
@@ -158,7 +186,7 @@ fn enrich_pulse(sessions: &mut [AgentSession]) {
 /// therefore zero shells everywhere.
 fn read_proc_table() -> Vec<ProcRow> {
     let out = Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,comm="])
+        .args(["-A", "-o", "pid=,ppid=,etime=,comm=,args="])
         .stdin(Stdio::null())
         .output();
     match out {
@@ -167,38 +195,102 @@ fn read_proc_table() -> Vec<ProcRow> {
     }
 }
 
-/// Pure half of [`read_proc_table`]: `pid ppid comm` per line, unparseable
-/// lines skipped.
+/// Pure half of [`read_proc_table`]: `pid ppid etime comm args…` per line,
+/// unparseable lines skipped.
 ///
-/// Split on **runs** of whitespace, not single characters: `ps` right-aligns
-/// the numeric columns (`"  501     1 /sbin/launchd"`), so a per-character
-/// split reads the gap as an empty second field and silently drops every
-/// padded row — which is most of them, and would leave the probe reporting
-/// zero shells on a real machine while a single-spaced test fixture passed.
+/// Fields are taken off the **front** one at a time rather than by splitting
+/// the whole line, because `args` is the rest of it verbatim — spaces and
+/// all — and `ps` right-aligns the columns before it (`"  501     1 …"`), so
+/// every leading run of whitespace has to be stepped over rather than read as
+/// an empty field. Getting that wrong silently drops every padded row, which
+/// is most of them, and leaves the probe reporting zero shells on a real
+/// machine while a single-spaced test fixture passes.
+///
+/// `comm` is one token here (it was the whole remainder while it was the last
+/// column). A `comm` holding a space therefore loses its tail — but only a
+/// row whose basename is one of [`SHELL_COMMS`] is ever read, and no shell's
+/// path has a space in it.
 fn parse_proc_table(stdout: &str) -> Vec<ProcRow> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let pid = parts.next()?.parse().ok()?;
-            let ppid = parts.next()?.parse().ok()?;
-            // `comm` is whatever is left, so a path with a space in it stays
-            // one command rather than becoming a truncated prefix.
-            let comm = parts.collect::<Vec<_>>().join(" ");
-            (!comm.is_empty()).then_some((pid, ppid, comm))
+    stdout.lines().filter_map(parse_proc_row).collect()
+}
+
+fn parse_proc_row(line: &str) -> Option<ProcRow> {
+    let (pid, rest) = next_field(line)?;
+    let (ppid, rest) = next_field(rest)?;
+    let (etime, rest) = next_field(rest)?;
+    let (comm, rest) = next_field(rest)?;
+    let args = rest.trim();
+    Some(ProcRow {
+        pid: pid.parse().ok()?,
+        ppid: ppid.parse().ok()?,
+        elapsed_secs: parse_etime(etime),
+        comm: comm.to_string(),
+        // A kernel thread has no argv at all; then the program is all there
+        // is to say about it.
+        args: if args.is_empty() { comm } else { args }.to_string(),
+    })
+}
+
+/// The next whitespace-delimited token and the untouched remainder after it.
+fn next_field(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    (end > 0).then(|| s.split_at(end))
+}
+
+/// `ps`'s `etime` — `MM:SS`, `HH:MM:SS` or `DD-HH:MM:SS` — as seconds.
+/// `None` for anything else, including the `-` some systems print for a
+/// process whose start time they cannot report.
+fn parse_etime(etime: &str) -> Option<i64> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((days, clock)) => (days.parse::<i64>().ok()?, clock),
+        None => (0, etime),
+    };
+    let fields: Vec<&str> = clock.split(':').collect();
+    if fields.len() < 2 || fields.len() > 3 {
+        return None;
+    }
+    let mut secs = 0i64;
+    for field in fields {
+        secs = secs * 60 + field.parse::<i64>().ok()?;
+    }
+    Some(days * 86_400 + secs)
+}
+
+/// Direct children of `pid` whose command is one of [`SHELL_COMMS`], compared
+/// by **basename** (`ps` reports `/bin/zsh` on macOS, `zsh` on Linux) — one
+/// card each.
+///
+/// Every row here is `Running` by construction: Claude Code spawns one shell
+/// per Bash call and it leaves the process table the moment the call returns,
+/// so a finished one is simply not in `table`.
+fn shell_children(pid: i64, table: &[ProcRow], now: SystemTime) -> Vec<AgentChild> {
+    table
+        .iter()
+        .filter(|row| {
+            row.ppid == pid && row.pid != pid && SHELL_COMMS.contains(&basename(&row.comm))
+        })
+        .map(|row| AgentChild {
+            kind: AgentChildKind::Shell,
+            // Capped and stripped of control characters like every other
+            // string mesa lifts out of something it does not own: this is a
+            // command line someone wrote, rendered on a poll.
+            name: cc::sanitize_capped(&row.args).unwrap_or_else(|| row.comm.clone()),
+            // A Bash call in flight has returned nothing yet.
+            detail: None,
+            started_at: row.elapsed_secs.and_then(|secs| started_ago(now, secs)),
+            context_tokens: None,
+            state: AgentChildState::Running,
         })
         .collect()
 }
 
-/// Direct children of `pid` whose command is one of [`SHELL_COMMS`], compared
-/// by **basename** (`ps` reports `/bin/zsh` on macOS, `zsh` on Linux).
-fn count_shell_children(pid: i64, table: &[ProcRow]) -> u32 {
-    table
-        .iter()
-        .filter(|(child, ppid, comm)| {
-            *ppid == pid && *child != pid && SHELL_COMMS.contains(&basename(comm))
-        })
-        .count() as u32
+/// `now` minus `elapsed` seconds, as mesa's own stored timestamp text — so a
+/// start time derived from `ps` reads exactly like one lifted off a
+/// transcript, and the page parses both the same way.
+fn started_ago(now: SystemTime, elapsed: i64) -> Option<String> {
+    let epoch = now.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(cc::fmt_store_ts(epoch - elapsed))
 }
 
 fn basename(comm: &str) -> &str {
@@ -215,18 +307,19 @@ fn basename(comm: &str) -> &str {
 /// project slug is unknown
 /// here, so every slug directory is checked for the session — the same
 /// glob-by-session-id shape `cc.rs` uses.
-fn count_live_subagents(root: &Path, session_id: &str, now: SystemTime) -> u32 {
+fn subagent_children(root: &Path, session_id: &str, now: SystemTime) -> Vec<AgentChild> {
+    let mut out = Vec::new();
     let Ok(slugs) = std::fs::read_dir(root) else {
-        return 0;
+        return out;
     };
-    let mut live = 0u32;
     for slug in slugs.flatten() {
         let dir = slug.path().join(session_id).join("subagents");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            if entry.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
             let fresh = entry
@@ -238,12 +331,46 @@ fn count_live_subagents(root: &Path, session_id: &str, now: SystemTime) -> u32 {
                     // mtime in the future (clock skew) is as live as it gets.
                     Err(_) => true,
                 });
-            if fresh && !subagent_finished(&entry.path()) {
-                live += 1;
+            if !fresh {
+                continue;
             }
+            let pulse = cc::subagent_pulse(&path);
+            out.push(AgentChild {
+                kind: AgentChildKind::Subagent,
+                name: subagent_name(&path),
+                detail: pulse.detail,
+                started_at: pulse.started_at,
+                context_tokens: pulse.context_tokens,
+                state: if subagent_finished(&path) {
+                    AgentChildState::Finished
+                } else {
+                    AgentChildState::Running
+                },
+            });
         }
     }
-    live
+    out
+}
+
+/// What a subagent run calls itself: the `agentType` of the `.meta.json`
+/// sidecar Claude Code writes beside every `agent-<hash>.jsonl`. A missing,
+/// unreadable or unparseable sidecar falls back to the file stem, so a run is
+/// never listed nameless — the sidecar is another program's file and mesa
+/// must not need it to be there.
+fn subagent_name(path: &Path) -> String {
+    meta_agent_type(path).unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("subagent")
+            .to_string()
+    })
+}
+
+fn meta_agent_type(path: &Path) -> Option<String> {
+    // `agent-<hash>.jsonl` -> `agent-<hash>.meta.json`.
+    let text = std::fs::read_to_string(path.with_extension("meta.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&text).ok()?;
+    cc::sanitize_capped(meta.get("agentType")?.as_str()?)
 }
 
 /// True iff a subagent transcript's last non-empty line is an `assistant`
@@ -1291,51 +1418,109 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
 
     // ---- liveness enrichment (mesa task 802) ----------------------------
 
-    /// macOS-style `ps -A -o pid=,ppid=,comm=`: right-aligned pids and an
-    /// absolute `comm`. Linux prints a bare `zsh`; both must count.
+    /// macOS-style `ps -A -o pid=,ppid=,etime=,comm=,args=`: right-aligned
+    /// pids, an absolute `comm` (truncated to 16 chars once it is not the
+    /// last column) and the full command line after it. Linux prints a bare
+    /// `zsh`; both must count.
     const PS_OUTPUT: &str = "\
-  501     1 /sbin/launchd
-86593     1 /Applications/Claude.app/Contents/MacOS/claude
-86601 86593 /usr/bin/caffeinate
-86602 86593 /bin/zsh
-86603 86593 /bin/zsh
-86610 86593 node
-90001     1 bash
+  501     1 01-00:27:14 /sbin/launchd    /sbin/launchd
+86593     1    02:13:04 /Applications/Cl /Applications/Claude.app/Contents/MacOS/claude
+86601 86593       03:20 /usr/bin/caffein /usr/bin/caffeinate -i
+86602 86593       01:05 /bin/zsh         /bin/zsh -c ls -la /repo
+86603 86593       00:07 /bin/zsh         /bin/zsh -c cargo test
+86610 86593       04:00 node             node server.js
+90001     1    09:09:09 bash             bash
 ";
+
+    /// The count half of [`shell_children`], which is what `live_shells` is.
+    fn shell_count(pid: i64, table: &[ProcRow]) -> usize {
+        shell_children(pid, table, SystemTime::now()).len()
+    }
 
     #[test]
     fn counts_only_allowlisted_shell_children() {
         let table = parse_proc_table(PS_OUTPUT);
         // Two zsh children; caffeinate (every working session has one) and
         // node are not work, and an unrelated top-level bash is not a child.
-        assert_eq!(count_shell_children(86593, &table), 2);
+        assert_eq!(shell_count(86593, &table), 2);
         // A session with no children at all, and a pid nothing reports.
-        assert_eq!(count_shell_children(86610, &table), 0);
-        assert_eq!(count_shell_children(4242, &table), 0);
+        assert_eq!(shell_count(86610, &table), 0);
+        assert_eq!(shell_count(4242, &table), 0);
         // Every row survived the padded numeric columns `ps` actually emits —
         // a per-character split drops the padded ones and reports 0 shells on
         // a real machine while a single-spaced fixture passes (caught by
         // todo-watcher-check.sh, not by this test's shell rows).
         assert_eq!(table.len(), 7);
-        assert_eq!(count_shell_children(1, &table), 1); // the top-level bash
+        assert_eq!(shell_count(1, &table), 1); // the top-level bash
+    }
+
+    /// The card each shell child renders as (mesa task 1277): the **command
+    /// line**, not the program every Bash call shares, and a start time
+    /// counted back from `etime` against the caller's own `now`.
+    #[test]
+    fn a_shell_child_is_named_by_its_command_line_and_dated_by_etime() {
+        let table = parse_proc_table(PS_OUTPUT);
+        let now = SystemTime::now();
+        let children = shell_children(86593, &table, now);
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].name, "/bin/zsh -c ls -la /repo");
+        assert_eq!(children[1].name, "/bin/zsh -c cargo test");
+        assert!(children.iter().all(|c| c.kind == AgentChildKind::Shell));
+        assert!(children.iter().all(|c| c.state == AgentChildState::Running));
+        // A running Bash call has produced nothing to show, and holds no
+        // context window of its own.
+        assert!(children.iter().all(|c| c.detail.is_none()));
+        assert!(children.iter().all(|c| c.context_tokens.is_none()));
+        // 01:05 ago and 00:07 ago, on mesa's own stored-timestamp clock.
+        assert_eq!(children[0].started_at, started_ago(now, 65));
+        assert_eq!(children[1].started_at, started_ago(now, 7));
+        assert!(children[0].started_at < children[1].started_at);
+    }
+
+    #[test]
+    fn etime_parses_every_shape_ps_prints() {
+        assert_eq!(parse_etime("00:07"), Some(7));
+        assert_eq!(parse_etime("01:05"), Some(65));
+        assert_eq!(parse_etime("02:13:04"), Some(7_984));
+        assert_eq!(parse_etime("01-00:27:14"), Some(88_034));
+        // Anything else costs the row its start time, never the row itself.
+        assert_eq!(parse_etime("-"), None);
+        assert_eq!(parse_etime("7"), None);
+        assert_eq!(parse_etime("a:b"), None);
     }
 
     #[test]
     fn proc_table_parse_is_lenient_and_basename_matched() {
         // Garbage lines are skipped rather than failing the whole probe, and
         // a bare `bash` (Linux `comm`) counts the same as `/bin/bash`.
-        let table = parse_proc_table("nope\n\n123 456 /bin/bash\n789 456 bash\nx y zsh\n");
+        let table = parse_proc_table(
+            "nope\n\n123 456 00:01 /bin/bash /bin/bash -c x\n789 456 00:02 bash bash\nx y z zsh zsh\n",
+        );
         assert_eq!(table.len(), 2);
-        assert_eq!(count_shell_children(456, &table), 2);
-        assert_eq!(parse_proc_table(""), Vec::new());
+        assert_eq!(shell_count(456, &table), 2);
+        // A row with no argv column at all is named by its program rather
+        // than dropped.
+        assert_eq!(
+            shell_children(456, &table, SystemTime::now())[1].name,
+            "bash"
+        );
+        assert!(parse_proc_table("").is_empty());
     }
 
     #[test]
     fn a_process_is_not_its_own_shell_child() {
         // A self-parenting row (pid 1's ppid is itself on some systems) must
         // not make a session look busy.
-        let table = parse_proc_table("7 7 /bin/zsh\n");
-        assert_eq!(count_shell_children(7, &table), 0);
+        let table = parse_proc_table("7 7 00:01 /bin/zsh /bin/zsh -c true\n");
+        assert_eq!(shell_count(7, &table), 0);
+    }
+
+    /// What `live_subagents` counts: the **running** children only.
+    fn live_subagents(root: &Path, session_id: &str, now: SystemTime) -> u32 {
+        subagent_children(root, session_id, now)
+            .iter()
+            .filter(|child| child.state == AgentChildState::Running)
+            .count() as u32
     }
 
     #[test]
@@ -1357,14 +1542,17 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         std::fs::write(other.join("agent-9.jsonl"), "{}").unwrap();
 
         let now = SystemTime::now();
-        assert_eq!(count_live_subagents(root, session, now), 2);
+        assert_eq!(live_subagents(root, session, now), 2);
         // Same files, read from far enough in the future that every mtime is
         // older than the shared cc::ACTIVE_SECS window: nothing is live.
         let later = now + std::time::Duration::from_secs(cc::ACTIVE_SECS as u64 + 10);
-        assert_eq!(count_live_subagents(root, session, later), 0);
+        assert_eq!(live_subagents(root, session, later), 0);
+        // A stale one is not listed as a card either — the window is what
+        // makes a finished subagent eventually drop off.
+        assert!(subagent_children(root, session, later).is_empty());
         // Unknown session, and a projects dir that isn't there at all.
-        assert_eq!(count_live_subagents(root, "no-such-session", now), 0);
-        assert_eq!(count_live_subagents(&root.join("gone"), session, now), 0);
+        assert_eq!(live_subagents(root, "no-such-session", now), 0);
+        assert_eq!(live_subagents(&root.join("gone"), session, now), 0);
     }
 
     #[test]
@@ -1382,11 +1570,68 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         // The last line is the subagent's final report: finished, not live.
         let path = subagents.join("agent-1.jsonl");
         std::fs::write(&path, format!("{user}\n{done}\n\n")).unwrap();
-        assert_eq!(count_live_subagents(root, session, now), 0);
+        assert_eq!(live_subagents(root, session, now), 0);
+        // ...but it is still a card, marked finished, until its mtime falls
+        // out of the window (mesa task 1277).
+        let children = subagent_children(root, session, now);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].state, AgentChildState::Finished);
 
         // An end_turn earlier in the file, but a tool call last: still live.
         std::fs::write(&path, format!("{user}\n{done}\n{tool}\n")).unwrap();
-        assert_eq!(count_live_subagents(root, session, now), 1);
+        assert_eq!(live_subagents(root, session, now), 1);
+        assert_eq!(
+            subagent_children(root, session, now)[0].state,
+            AgentChildState::Running
+        );
+    }
+
+    /// A subagent's card (mesa task 1277): named by the `.meta.json`
+    /// sidecar's `agentType`, dated by the transcript's first timestamp, and
+    /// carrying the last thing it did plus the context it holds.
+    #[test]
+    fn a_subagent_child_reads_its_sidecar_and_its_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let session = "e34b8ed9-d391-4797-9d39-546d5b463357";
+        let subagents = root.join("-Users-x-proj").join(session).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let path = subagents.join("agent-9f3a.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","timestamp":"2026-09-21T13:00:15.500Z","message":{"role":"user","content":"go"}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-09-21T13:00:20.000Z","message":{"stop_reason":"tool_use","usage":{"input_tokens":10,"cache_read_input_tokens":4000,"cache_creation_input_tokens":90},"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            subagents.join("agent-9f3a.meta.json"),
+            r#"{"agentType":"diff-reviewer","description":"review","spawnDepth":1}"#,
+        )
+        .unwrap();
+
+        let now = SystemTime::now();
+        let children = subagent_children(root, session, now);
+        assert_eq!(children.len(), 1);
+        let child = &children[0];
+        assert_eq!(child.kind, AgentChildKind::Subagent);
+        assert_eq!(child.name, "diff-reviewer");
+        assert_eq!(child.state, AgentChildState::Running);
+        // No prose on that line, so the tool it called is what it last did.
+        assert_eq!(child.detail.as_deref(), Some("Bash"));
+        assert_eq!(child.context_tokens, Some(4100));
+        assert_eq!(child.started_at.as_deref(), Some("2026-09-21 13:00:15"));
+
+        // A missing sidecar costs the card its label, never the card: the
+        // file stem stands in.
+        std::fs::remove_file(subagents.join("agent-9f3a.meta.json")).unwrap();
+        assert_eq!(subagent_children(root, session, now)[0].name, "agent-9f3a");
+        // ...and so does an unparseable one.
+        std::fs::write(subagents.join("agent-9f3a.meta.json"), "{ not json").unwrap();
+        assert_eq!(subagent_children(root, session, now)[0].name, "agent-9f3a");
     }
 
     #[test]
@@ -1411,6 +1656,8 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         // Err — the todo watcher reads this list.
         assert!(sessions.iter().all(|s| s.last_response.is_none()));
         assert!(sessions.iter().all(|s| s.context_tokens.is_none()));
+        // Nothing to list either — an empty list, never a missing key.
+        assert!(sessions.iter().all(|s| s.children.is_empty()));
     }
 
     #[test]
@@ -1433,6 +1680,22 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         assert_eq!(json["liveSubagents"], 1);
         assert_eq!(json["lastResponse"], "on it");
         assert_eq!(json["contextTokens"], 6000);
+        // `children` is always on the wire, empty when nothing is live — the
+        // page renders a list, not an optional one (mesa task 1277).
+        assert_eq!(json["children"], serde_json::json!([]));
+        session.children = vec![AgentChild {
+            kind: AgentChildKind::Subagent,
+            name: "implementer".into(),
+            detail: Some("Edit".into()),
+            started_at: Some("2026-09-21 13:00:15".into()),
+            context_tokens: Some(4100),
+            state: AgentChildState::Finished,
+        }];
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["children"][0]["kind"], "subagent");
+        assert_eq!(json["children"][0]["state"], "finished");
+        assert_eq!(json["children"][0]["startedAt"], "2026-09-21 13:00:15");
+        assert_eq!(json["children"][0]["contextTokens"], 4100);
     }
 
     #[test]

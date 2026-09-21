@@ -188,6 +188,78 @@ pub struct AgentSession {
     #[ts(type = "number | null")]
     #[serde(default)]
     pub context_tokens: Option<i64>,
+    /// **mesa-derived, not from the CLI payload.** The work this session holds
+    /// in flight right now, one card per item (mesa task 1277): every subagent
+    /// transcript inside `cc::ACTIVE_SECS` and every live shell child. The
+    /// list is the detailed twin of `live_shells`/`live_subagents`, never a
+    /// replacement — the counts keep their exact meaning, and a **finished**
+    /// subagent still inside the freshness window is listed here while
+    /// counting toward neither.
+    ///
+    /// Always present, empty when there is nothing live. Subagents come first,
+    /// then shells; the page decides the order it renders (`agentChild.ts`).
+    #[serde(default)]
+    pub children: Vec<AgentChild>,
+}
+
+/// Which of the two kinds of work an [`AgentChild`] is. Exactly two: a
+/// subagent (a sidechain transcript, no process of its own) and a shell (one
+/// `/bin/zsh -c …` child, i.e. a Bash tool call in flight).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum AgentChildKind {
+    Subagent,
+    Shell,
+}
+
+/// Whether an [`AgentChild`] is still working. A shell is only ever
+/// `Running` — it disappears from `ps` the moment it returns — while a
+/// subagent that has handed back its report reads `Finished` and lingers
+/// until its transcript falls out of the `cc::ACTIVE_SECS` window, exactly as
+/// the live count already behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum AgentChildState {
+    Running,
+    Finished,
+}
+
+/// One piece of work hanging off a live session (mesa task 1277) — a subagent
+/// or a shell — as the Agents panel's child cards show it.
+///
+/// Every field but `kind`/`name`/`state` is optional because each is a
+/// best-effort read of something outside mesa (a transcript tail, a `ps`
+/// row): an unreadable file yields a child with what is known rather than no
+/// child at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+#[serde(rename_all = "camelCase")]
+pub struct AgentChild {
+    pub kind: AgentChildKind,
+    /// A subagent's `agentType` (from the transcript's `.meta.json` sidecar,
+    /// falling back to the file stem), or a shell's command line. Bounded by
+    /// `cc::sanitize_capped` like every other string mesa lifts out of an
+    /// external file — untrusted text on a poll.
+    pub name: String,
+    /// The last thing a subagent did: its newest assistant prose, else the
+    /// tool that message called. `None` for a shell — a Bash call in flight
+    /// has produced no output yet — and for a subagent that has said nothing.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// When this child started, as mesa's own stored timestamp text
+    /// (`YYYY-MM-DD HH:MM:SS`, UTC) so the page parses it exactly as it parses
+    /// a db timestamp. `None` when neither the transcript nor `ps` says.
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// A subagent's occupied context window, the same
+    /// `input + cache_read + cache_creation` figure a session's own
+    /// `context_tokens` is. Always `None` for a shell.
+    #[ts(type = "number | null")]
+    #[serde(default)]
+    pub context_tokens: Option<i64>,
+    pub state: AgentChildState,
 }
 
 /// The Agents view for one project: the folder sessions are matched under

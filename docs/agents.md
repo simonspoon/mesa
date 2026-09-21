@@ -199,7 +199,9 @@ already use.
   would wedge dispatch behind an idle session (`docs/todo-watcher.md`).
   - `liveShells` counts the session pid's **direct** children whose `comm`
     basename is in `{zsh, bash, sh, dash}`, from **one** `ps -A -o
-    pid=,ppid=,comm=` per list refresh — not one `ps` per session. Claude Code
+    pid=,ppid=,etime=,comm=,args=` per list refresh — not one `ps` per
+    session (`etime` and `args` are there for the child cards below; the
+    count reads neither). Claude Code
     spawns one `/bin/zsh -c 'source …/shell-snapshots/… && eval …'` child per
     Bash tool call (it is *not* a persistent shell), so a live shell child *is*
     a Bash call in flight right now. The allowlist is why it is not an
@@ -225,6 +227,40 @@ already use.
     `scripts/agents-check.sh` only pins that both fields are on the wire and
     `0` for the stub's nonexistent pids — faking a process tree from bash
     would test the fake.
+- **`children` is those counts in detail** (mesa task 1277): a `Vec<AgentChild>`
+  on every `AgentSession`, one entry per fresh subagent transcript and per live
+  shell child, so the sidebar can hang a small card off each agent row instead
+  of only showing the badge. It is **additive** — `liveShells` and
+  `liveSubagents` keep their exact meanings and values, and are derived from
+  the same walk that builds the list so badge and cards can never disagree.
+  - A child carries `kind` (`subagent` | `shell`), `name`, `detail`,
+    `startedAt`, `contextTokens` and `state` (`running` | `finished`). Always
+    present, empty when nothing is live; subagents come first, then shells, and
+    the page decides the order it renders (`frontend/src/agentChild.ts`:
+    running before finished, subagents before shells).
+  - A **subagent** is named by the `agentType` of the `.meta.json` sidecar
+    Claude Code writes beside each `agent-<hash>.jsonl` (missing or unparseable
+    → the file stem, never nameless); its `detail` is the newest assistant
+    line's prose, else the tool that message called; its `contextTokens` is
+    that line's `input + cache_read + cache_creation`; its `startedAt` is the
+    first line's `timestamp`, else the file's birth time. All of it comes from
+    `cc::subagent_pulse`, a **separate** reader from `cc::session_pulse`
+    because that one skips sidechain lines on purpose and every line in one of
+    these files is a sidechain line.
+  - A subagent that has handed back its report reads `finished` and is still
+    listed until its mtime leaves the `cc::ACTIVE_SECS` window — the same
+    lingering the live count already had, now visible. `liveSubagents` counts
+    only the `running` ones.
+  - A **shell** is named by its full command line (`ps -o args=`, capped by
+    `cc::sanitize_capped` like any other string mesa lifts out of a file it
+    does not own), dated by `etime` counted back from the same `now` the
+    counts use, and is always `running`: the process leaves the table the
+    instant its Bash call returns. It has no `detail` and no context window.
+  - Same fail-open rule as the counts: an unreadable transcript, a missing
+    sidecar or a `ps` row that does not parse costs a field or a row, never
+    the request. `scripts/agents-check.sh` plants two subagent transcripts
+    under a throwaway `MESA_CC_PROJECTS_DIR` and pins the populated shape;
+    shell children stay with the Rust unit tests, for the reason above.
 - **Two more mesa-derived fields report what a session is *saying*** (mesa task
   869): `lastResponse` and `contextTokens`, also on every `AgentSession`, also
   `#[serde(default)]` and camelCase, and filled in the same `list_sessions`

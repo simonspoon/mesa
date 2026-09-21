@@ -188,6 +188,13 @@ pub struct AgentSession {
     #[ts(type = "number | null")]
     #[serde(default)]
     pub context_tokens: Option<i64>,
+    /// **mesa-derived, not from the CLI payload.** The model this session is
+    /// running on now: the one named by the newest assistant message in its
+    /// transcript window that names any. One model, never a list — a session
+    /// that switched models mid-conversation reports the current one. `null`
+    /// when the transcript is missing or names none.
+    #[serde(default)]
+    pub model: Option<String>,
     /// **mesa-derived, not from the CLI payload.** The work this session holds
     /// in flight right now, one card per item (mesa task 1277): every subagent
     /// transcript inside `cc::ACTIVE_SECS` and every live shell child. The
@@ -270,6 +277,11 @@ pub struct AgentChild {
     #[ts(type = "number | null")]
     #[serde(default)]
     pub context_tokens: Option<i64>,
+    /// The model a subagent is running on now, the same "newest message that
+    /// names one" figure a session's own `model` is. Always `None` for a
+    /// shell: a `ps` row is all there is of one, and it names no model.
+    #[serde(default)]
+    pub model: Option<String>,
     pub state: AgentChildState,
 }
 

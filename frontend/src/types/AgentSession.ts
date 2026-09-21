@@ -70,6 +70,14 @@ lastResponse: string | null,
  */
 contextTokens: number | null, 
 /**
+ * **mesa-derived, not from the CLI payload.** The model this session is
+ * running on now: the one named by the newest assistant message in its
+ * transcript window that names any. One model, never a list — a session
+ * that switched models mid-conversation reports the current one. `null`
+ * when the transcript is missing or names none.
+ */
+model: string | null, 
+/**
  * **mesa-derived, not from the CLI payload.** The work this session holds
  * in flight right now, one card per item (mesa task 1277): every subagent
  * transcript inside `cc::ACTIVE_SECS` and every live shell child. The

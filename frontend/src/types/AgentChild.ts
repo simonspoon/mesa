@@ -48,4 +48,10 @@ startedAt: string | null,
  * `input + cache_read + cache_creation` figure a session's own
  * `context_tokens` is. Always `None` for a shell.
  */
-contextTokens: number | null, state: AgentChildState, };
+contextTokens: number | null, 
+/**
+ * The model a subagent is running on now, the same "newest message that
+ * names one" figure a session's own `model` is. Always `None` for a
+ * shell: a `ps` row is all there is of one, and it names no model.
+ */
+model: string | null, state: AgentChildState, };

@@ -3361,7 +3361,7 @@ main {
   margin-top: 0.3rem;
   font-size: 0.78rem;
   line-height: 1.35;
-  color: var(--muted);
+  color: var(--amber);
   overflow: hidden;
   overflow-wrap: anywhere;
   display: -webkit-box;
@@ -3437,6 +3437,17 @@ main {
 .badge.agent-state-failed {
   color: var(--red);
   border-color: rgba(255, 59, 92, 0.6);
+}
+
+/* The model a card is running on (mesa task 1291) — the first pill on a
+   session row and on a child card. `--text` rather than one of the status
+   colours because the model is what a card *is*, not what it is doing, and
+   both obvious neons already sit immediately after it: cyan is the
+   background-kind pill on a session row, violet the subagent pill on a child
+   card. */
+.badge.agent-model {
+  flex: none;
+  color: var(--text);
 }
 
 /* Work mesa observed running (shell children / subagent transcripts) on a
@@ -3515,7 +3526,7 @@ main {
   margin-top: 0.15rem;
   font-size: 0.74rem;
   line-height: 1.3;
-  color: var(--muted);
+  color: var(--amber);
   overflow: hidden;
   overflow-wrap: anywhere;
   display: -webkit-box;
@@ -3547,6 +3558,13 @@ main {
 .badge.agent-child-kind-subagent,
 .badge.agent-child-kind-shell {
   flex: none;
+  font-size: 0.65rem;
+  margin-right: 0;
+}
+
+/* Sized and spaced with the child card's own badges rather than the session
+   row's. */
+.agent-child-title .badge.agent-model {
   font-size: 0.65rem;
   margin-right: 0;
 }

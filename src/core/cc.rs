@@ -3934,6 +3934,10 @@ pub struct SessionPulse {
     pub last_response: Option<String>,
     /// The newest assistant message's occupied context window.
     pub context_tokens: Option<i64>,
+    /// The model the newest assistant message that names one ran on — the
+    /// model this session is running on **now**, not a list: a session may
+    /// switch models mid-conversation, and the card reports the current one.
+    pub model: Option<String>,
 }
 
 /// One session's pulse, read **live off its transcript** — the fourth read to
@@ -4006,6 +4010,9 @@ fn pulse_from_text(text: &str) -> SessionPulse {
             pulse.context_tokens =
                 Some(u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens);
         }
+        if let Some(model) = msg.model.as_ref() {
+            pulse.model = Some(model.clone());
+        }
     }
     pulse
 }
@@ -4036,6 +4043,9 @@ pub struct SubagentPulse {
     /// When the run started, as mesa's own stored timestamp text: the first
     /// line's `timestamp`, else the file's birth time.
     pub started_at: Option<String>,
+    /// The model the newest assistant message that names one ran on, the same
+    /// "what it is running on now" figure [`SessionPulse`] reports.
+    pub model: Option<String>,
 }
 
 /// One subagent transcript's pulse. **Fails open in every direction** — an
@@ -4084,6 +4094,9 @@ fn subagent_from_text(text: &str) -> SubagentPulse {
         if let Some(u) = msg.usage.as_ref() {
             pulse.context_tokens =
                 Some(u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens);
+        }
+        if let Some(model) = msg.model.as_ref() {
+            pulse.model = Some(model.clone());
         }
     }
     pulse
@@ -7387,6 +7400,38 @@ mod tests {
             Some(1000 + 2000 + 3000),
             "context is the newest message's input + cache_read + \
              cache_creation — never output, never a sum across messages"
+        );
+    }
+
+    /// The model a card shows is the one the session is running on **now**
+    /// (mesa task 1291) — the newest assistant message that names one, never
+    /// a list of every model the conversation has used.
+    #[test]
+    fn pulse_takes_the_model_from_the_newest_message_that_names_one() {
+        assert_eq!(
+            pulse_from_text(PULSE_LINES).model.as_deref(),
+            Some("claude-opus-5")
+        );
+        // A session that switched models mid-conversation reports the model
+        // it switched *to*, and a newer line naming none (an API error, a
+        // shape mesa has not seen) leaves the last known one standing rather
+        // than blanking the pill.
+        let switched = concat!(
+            r#"{"type":"assistant","message":{"model":"claude-opus-5","content":[{"type":"text","text":"before"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"after"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"no model named"}]}}"#,
+            "\n",
+        );
+        assert_eq!(
+            pulse_from_text(switched).model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+        // The subagent reader answers the same question off its own lines.
+        assert_eq!(
+            subagent_from_text(PULSE_LINES).model.as_deref(),
+            Some("claude-opus-5")
         );
     }
 

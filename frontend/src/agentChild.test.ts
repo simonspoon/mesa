@@ -21,6 +21,7 @@ function child(over: Partial<AgentChild> = {}): AgentChild {
     detail: null,
     startedAt: null,
     contextTokens: null,
+    model: null,
     state: 'running',
     ...over,
   }

@@ -178,6 +178,7 @@ fn enrich_pulse(sessions: &mut [AgentSession]) {
         let pulse = cc::session_pulse(&session.session_id);
         session.last_response = pulse.last_response;
         session.context_tokens = pulse.context_tokens;
+        session.model = pulse.model;
     }
 }
 
@@ -284,6 +285,8 @@ fn shell_children(pid: i64, table: &[ProcRow], now: SystemTime) -> Vec<AgentChil
             detail: None,
             started_at: row.elapsed_secs.and_then(|secs| started_ago(now, secs)),
             context_tokens: None,
+            // A shell has no transcript, so nothing names a model here.
+            model: None,
             state: AgentChildState::Running,
         })
         .collect()
@@ -352,6 +355,7 @@ fn subagent_children(root: &Path, session_id: &str, now: SystemTime) -> Vec<Agen
                 detail: pulse.detail,
                 started_at: pulse.started_at,
                 context_tokens: pulse.context_tokens,
+                model: pulse.model,
                 state: if subagent_finished(&path) {
                     AgentChildState::Finished
                 } else {
@@ -1705,6 +1709,7 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
             detail: Some("Edit".into()),
             started_at: Some("2026-09-21 13:00:15".into()),
             context_tokens: Some(4100),
+            model: Some("claude-sonnet-5".into()),
             state: AgentChildState::Finished,
         }];
         let json = serde_json::to_value(&session).unwrap();

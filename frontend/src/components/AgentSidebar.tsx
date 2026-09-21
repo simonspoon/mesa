@@ -35,6 +35,7 @@ import {
   DEFAULT_AGENT_SIDEBAR_WIDTH,
   MIN_MAIN_WIDTH,
 } from '../agentSidebarWidth'
+import { shortModel } from '../sessionGraph'
 import { AgentChat } from './AgentChat'
 import { ChildPane } from './ChildPane'
 import * as ptyPool from '../lib/ptyPool'
@@ -704,6 +705,9 @@ function AgentListContent({
                       // zero tokens — see `agentRow.ts`.
                       const preview = responsePreview(a.lastResponse)
                       const context = formatContextTokens(a.contextTokens)
+                      // Absent on a session with no transcript yet, and then
+                      // rendered as nothing at all rather than an empty pill.
+                      const model = shortModel(a.model)
                       return (
                         <li
                           key={a.sessionId}
@@ -742,6 +746,7 @@ function AgentListContent({
                             )}
                           </div>
                           <div className="agent-row-badges">
+                            {model && <span className="badge agent-model">{model}</span>}
                             <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
                             {a.status && <span className={`badge agent-status-${a.status}`}>{a.status}</span>}
                             {a.state && a.state !== a.status && (
@@ -804,6 +809,9 @@ function AgentListContent({
                                 const did = responsePreview(child.detail)
                                 const elapsed = childElapsed(child.startedAt, Date.now())
                                 const childContext = formatContextTokens(child.contextTokens)
+                                // Always absent for a shell, which has no
+                                // transcript to name a model.
+                                const childModel = shortModel(child.model)
                                 const paneId = a.id !== null ? childPaneId(a.id, child) : null
                                 return (
                                   <li key={`${child.kind}-${label}-${i}`}>
@@ -831,6 +839,9 @@ function AgentListContent({
                                       disabled={a.id === null}
                                     >
                                       <div className="agent-child-title">
+                                        {childModel && (
+                                          <span className="badge agent-model">{childModel}</span>
+                                        )}
                                         <span className={`badge agent-child-kind-${child.kind}`}>
                                           {child.kind}
                                         </span>

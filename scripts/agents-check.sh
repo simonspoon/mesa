@@ -301,7 +301,15 @@ RUNNING=$(jq -r '.agents[0].children[] | select(.name == "diff-reviewer")' <<<"$
 # The badge's count is unchanged by the cards: only the RUNNING one counts.
 [ "$(jqb '.agents[0].liveSubagents')" = "1" ] ||
   fail "children: liveSubagents must still count only live runs (got $(jqb '.agents[0].liveSubagents'))"
-ok "children lists each fresh subagent with its agentType, state, detail, context and start"
+# `id` is the transcript file stem (mesa task 1278) — the id the read-only
+# child pane reads the run back by. It is the FILE's name, never the
+# sidecar's `agentType`, which is what the card is *called*: two runs of one
+# agent type share a name and must not share a pane.
+[ "$(jq -r .id <<<"$RUNNING")" = "agent-aaa1" ] ||
+  fail "children: a subagent's id must be its transcript file stem (got $(jq -r .id <<<"$RUNNING"))"
+[ "$(jq -r '.agents[0].children[] | select(.name == "implementer") | .id' <<<"$BODY")" = "agent-bbb2" ] ||
+  fail "children: the second subagent's id must be its own file stem"
+ok "children lists each fresh subagent with its agentType, id, state, detail, context and start"
 
 # ---- attach WebSocket handshake (Origin policy + id validation) ----
 # A real ws client is out of scope for bash; the HTTP status of the upgrade

@@ -1152,6 +1152,24 @@ export function getCcSessionChat(sessionId: string, limit?: number): Promise<CcS
 }
 
 /**
+ * One **subagent** of that session, read the same way — the Agents panel's
+ * read-only child pane (mesa task 1278). Session-scoped: an `agentId`
+ * belonging to another session does not resolve. Same `CcSessionChat` shape
+ * as the session chat above, with `pending_question` always null — a subagent
+ * has no chooser and no PTY to answer one through.
+ */
+export function getCcSubagentChat(
+  sessionId: string,
+  agentId: string,
+  limit?: number,
+): Promise<CcSessionChat> {
+  const q = limit === undefined ? '' : `?limit=${limit}`
+  return request(
+    `/api/cc/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(agentId)}/chat${q}`,
+  )
+}
+
+/**
  * One session's aggregate detail — the default drill-down. Aggregated
  * server-side over every persisted row (the graph payload caps its nodes and
  * repeats one message's usage across siblings, so none of this is derivable

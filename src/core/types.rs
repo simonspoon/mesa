@@ -237,6 +237,17 @@ pub enum AgentChildState {
 #[ts(export, export_to = "../frontend/src/types/")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentChild {
+    /// This child's own identity, where it has one: a subagent's transcript
+    /// file stem (`agent-<name>-<hex>`), which is what
+    /// `GET /api/cc/sessions/{id}/subagents/{agent_id}/chat` takes to open it
+    /// in a read-only pane (mesa task 1278). A bounded pointer, so it belongs
+    /// on the record beside the rest of the card.
+    ///
+    /// `None` for a shell, and not an omission: a `ps` row carries nothing
+    /// transcript-derived, so a Bash call in flight has no identity beyond
+    /// the command line already in `name`.
+    #[serde(default)]
+    pub id: Option<String>,
     pub kind: AgentChildKind,
     /// A subagent's `agentType` (from the transcript's `.meta.json` sidecar,
     /// falling back to the file stem), or a shell's command line. Bounded by

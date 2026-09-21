@@ -271,6 +271,10 @@ fn shell_children(pid: i64, table: &[ProcRow], now: SystemTime) -> Vec<AgentChil
             row.ppid == pid && row.pid != pid && SHELL_COMMS.contains(&basename(&row.comm))
         })
         .map(|row| AgentChild {
+            // A `ps` row is all there is of a shell child, and it holds
+            // nothing that names a transcript — so there is nothing to open a
+            // pane on but the command line already in `name`.
+            id: None,
             kind: AgentChildKind::Shell,
             // Capped and stripped of control characters like every other
             // string mesa lifts out of something it does not own: this is a
@@ -336,6 +340,13 @@ fn subagent_children(root: &Path, session_id: &str, now: SystemTime) -> Vec<Agen
             }
             let pulse = cc::subagent_pulse(&path);
             out.push(AgentChild {
+                // The transcript's file stem — free here, since this walk
+                // already holds the path — and the id
+                // `cc::subagent_chat` reads the run back by (mesa task 1278).
+                id: path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| stem.to_string()),
                 kind: AgentChildKind::Subagent,
                 name: subagent_name(&path),
                 detail: pulse.detail,
@@ -1471,6 +1482,10 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         // context window of its own.
         assert!(children.iter().all(|c| c.detail.is_none()));
         assert!(children.iter().all(|c| c.context_tokens.is_none()));
+        // …and no id (mesa task 1278): a `ps` row carries nothing
+        // transcript-derived, so a shell's whole identity is the command
+        // line above. The pane a card opens keys itself off that.
+        assert!(children.iter().all(|c| c.id.is_none()));
         // 01:05 ago and 00:07 ago, on mesa's own stored-timestamp clock.
         assert_eq!(children[0].started_at, started_ago(now, 65));
         assert_eq!(children[1].started_at, started_ago(now, 7));
@@ -1684,6 +1699,7 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         // page renders a list, not an optional one (mesa task 1277).
         assert_eq!(json["children"], serde_json::json!([]));
         session.children = vec![AgentChild {
+            id: Some("agent-implementer-1a2b3c".into()),
             kind: AgentChildKind::Subagent,
             name: "implementer".into(),
             detail: Some("Edit".into()),
@@ -1696,6 +1712,9 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         assert_eq!(json["children"][0]["state"], "finished");
         assert_eq!(json["children"][0]["startedAt"], "2026-09-21 13:00:15");
         assert_eq!(json["children"][0]["contextTokens"], 4100);
+        // The pane id (mesa task 1278): the transcript stem for a subagent,
+        // and explicitly null — not absent — for a shell, which has none.
+        assert_eq!(json["children"][0]["id"], "agent-implementer-1a2b3c");
     }
 
     #[test]

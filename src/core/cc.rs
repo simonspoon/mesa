@@ -856,14 +856,23 @@ const NON_HUMAN_PREFIXES: &[&str] = &[
 /// same policy every other transcript-derived string mesa stores goes through:
 /// what lands in the db is a bounded preview, never the prompt body.
 fn human_prompt(line: &RawLine) -> Option<String> {
-    sanitize_capped(&human_prompt_raw(line)?)
+    sanitize_capped(&human_prompt_raw(line, true)?)
 }
 
 /// The same human turn, **uncapped and unsanitized** — the body
 /// [`node_text`] returns for a `prompt:` node. Split out rather than
 /// duplicated so the two can never disagree about which `user` lines count as
 /// a human turn at all; the only difference between them is the cap.
-fn human_prompt_raw(line: &RawLine) -> Option<String> {
+///
+/// `skip_sidechain` is [`chat_turns`]' own flag reaching the one other place
+/// that drops a sidechain line (mesa task 1278). It is `true` everywhere but
+/// the subagent reader, whose transcript's opening `user` line is the task
+/// its parent handed it — not a human's typing, but the only turn in that
+/// file saying what the run was *for*, and the one [`subagent_chat`]'s pane
+/// labels `<parent> → <subagent>`. Every other rule below still applies to
+/// it: an `isMeta` injection, a tool-result carrier and a non-human prefix
+/// are no more a turn in a subagent's file than in a session's.
+fn human_prompt_raw(line: &RawLine, skip_sidechain: bool) -> Option<String> {
     if line.kind.as_deref() != Some("user") {
         return None;
     }
@@ -871,8 +880,9 @@ fn human_prompt_raw(line: &RawLine) -> Option<String> {
         return None;
     }
     // A sidechain user line is a *subagent's task prompt*, already carried by
-    // the agent node's `description`. Main thread only.
-    if line.is_sidechain == Some(true) {
+    // the agent node's `description`. Main thread only — except for the
+    // reader of that subagent's own transcript, where it is the opening turn.
+    if skip_sidechain && line.is_sidechain == Some(true) {
         return None;
     }
     if line.tool_use_result.is_some() {
@@ -3527,7 +3537,7 @@ fn scan_for_body(bytes: &[u8], ident: &NodeIdent) -> Option<String> {
                 if raw.uuid.as_deref() != Some(uuid.as_str()) {
                     continue;
                 }
-                if let Some(t) = human_prompt_raw(&raw) {
+                if let Some(t) = human_prompt_raw(&raw, true) {
                     return Some(t);
                 }
             }
@@ -3623,7 +3633,7 @@ pub fn session_chat(session_id: &str, limit: usize) -> Result<CcSessionChat> {
     let path = transcript_path(&path.to_string_lossy())?;
     let (text, windowed) = read_tail(&path, CHAT_TAIL_BYTES)?;
 
-    let mut turns = chat_turns(&text);
+    let mut turns = chat_turns(&text, true);
     let pending_question = pending_ask(&text);
     let dropped = turns.len().saturating_sub(limit);
     if dropped > 0 {
@@ -3635,6 +3645,83 @@ pub fn session_chat(session_id: &str, limit: usize) -> Result<CcSessionChat> {
         truncated: windowed || dropped > 0,
         pending_question,
     })
+}
+
+/// One **subagent**'s conversation, read live off its own transcript — the
+/// read-only child pane the Agents panel opens when a subagent card is tapped
+/// (mesa task 1278). The sibling of [`session_chat`], and deliberately the
+/// same [`CcSessionChat`] shape: a child pane renders through the main chat's
+/// own renderer, so a second type would buy the page nothing and cost it a
+/// second code path.
+///
+/// Like [`session_chat`] it takes no [`Store`] and runs no [`sync`]: a
+/// subagent's newest turns are younger than any ingest, and this backs a poll.
+/// The route it serves echoes that gate exactly.
+///
+/// **The read is session-scoped.** `agent_id` is looked for only under
+/// `<slug>/<session_id>/subagents/`, so a subagent id belonging to a
+/// *different* session does not resolve here — the `resolve_node` posture,
+/// and the reason this is not a "read any transcript by name" route.
+///
+/// Both ids are caller input used to *build* a path, so both are validated to
+/// the id charset before any filesystem call ([`Error::Validation`]) and the
+/// result still goes through [`transcript_path`], the traversal chokepoint.
+///
+/// Unlike [`session_chat`] this passes `skip_sidechain: false` to
+/// [`chat_turns`]: **every** line of a subagent transcript is a sidechain
+/// line, so filtering them is what would empty the pane.
+///
+/// `pending_question` is always `None`: a subagent has no chooser a reader
+/// could answer and no PTY to answer it through — this pane is read-only.
+pub fn subagent_chat(session_id: &str, agent_id: &str, limit: usize) -> Result<CcSessionChat> {
+    for (what, id) in [("session id", session_id), ("subagent id", agent_id)] {
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(Error::Validation(format!("not a {what}: {id}")));
+        }
+    }
+    let path = find_subagent_transcript(session_id, agent_id).ok_or_else(|| {
+        Error::Unavailable(format!(
+            "no transcript on disk for subagent {agent_id} of session {session_id}"
+        ))
+    })?;
+    let path = transcript_path(&path.to_string_lossy())?;
+    let (text, windowed) = read_tail(&path, CHAT_TAIL_BYTES)?;
+
+    let mut turns = chat_turns(&text, false);
+    let dropped = turns.len().saturating_sub(limit);
+    if dropped > 0 {
+        turns.drain(..dropped);
+    }
+    Ok(CcSessionChat {
+        session_id: session_id.to_string(),
+        turns,
+        truncated: windowed || dropped > 0,
+        pending_question: None,
+    })
+}
+
+/// One subagent run's transcript:
+/// `<projects_dir>/*/<session_id>/subagents/<agent_id>.jsonl`.
+///
+/// The project slug is unknown here for [`find_transcript`]'s reason — it
+/// encodes the session's cwd, which the caller does not hold — so every slug
+/// directory is probed, the same shape `agents::subagent_children` walks. The
+/// session id is part of the probed path rather than something checked
+/// afterwards, which is what makes the read session-scoped.
+fn find_subagent_transcript(session_id: &str, agent_id: &str) -> Option<PathBuf> {
+    let root = projects_dir()?;
+    let file = format!("{agent_id}.jsonl");
+    for entry in fs::read_dir(&root).ok()?.flatten() {
+        let candidate = entry.path().join(session_id).join("subagents").join(&file);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// The `AskUserQuestion` call this window ends on **unanswered**, if any (task
@@ -3753,7 +3840,14 @@ fn chat_question(raw: &serde_json::Value) -> CcChatQuestion {
 /// [`session_chat`] so the whole line-classification policy — which lines are
 /// a human turn, which are the assistant's, which are neither — is unit
 /// testable against literal transcript lines rather than only through a file.
-fn chat_turns(text: &str) -> Vec<CcChatTurn> {
+///
+/// `skip_sidechain` is the one thing the two callers disagree on, and it is
+/// the whole difference between them (mesa task 1278): a **session**'s
+/// transcript may carry a sidechain line that belongs to a subagent's own
+/// file, while in a **subagent**'s transcript every line is one — so reading
+/// one of those with the filter on yields an empty conversation, not a short
+/// one. Same posture as [`subagent_from_text`] beside [`pulse_from_text`].
+fn chat_turns(text: &str, skip_sidechain: bool) -> Vec<CcChatTurn> {
     let mut turns: Vec<CcChatTurn> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
@@ -3766,13 +3860,14 @@ fn chat_turns(text: &str) -> Vec<CcChatTurn> {
         // A subagent's turns belong to its own transcript and its own reader;
         // the same main-thread-only rule `cc_prompts` keeps. (Sidechain lines
         // are not written to this file, so this is a guard, not a filter.)
-        if raw.is_sidechain == Some(true) {
+        // That reader is `subagent_chat`, and it passes `false`.
+        if skip_sidechain && raw.is_sidechain == Some(true) {
             continue;
         }
         let Some(uuid) = raw.uuid.clone() else {
             continue;
         };
-        if let Some(text) = human_prompt_raw(&raw) {
+        if let Some(text) = human_prompt_raw(&raw, skip_sidechain) {
             turns.push(CcChatTurn {
                 id: uuid,
                 kind: CcChatTurnKind::Prompt,
@@ -6963,7 +7058,7 @@ mod tests {
 
     #[test]
     fn chat_turns_classify_a_transcript() {
-        let turns = chat_turns(CHAT_LINES);
+        let turns = chat_turns(CHAT_LINES, true);
         let shape: Vec<(CcChatTurnKind, &str)> =
             turns.iter().map(|t| (t.kind, t.id.as_str())).collect();
         assert_eq!(
@@ -6996,13 +7091,50 @@ mod tests {
         assert_eq!(turns[3].text, "");
     }
 
+    /// A subagent's own transcript: every line carries `isSidechain`, and the
+    /// opening `user` line is the parent's task prompt rather than typing.
+    const SUBAGENT_LINES: &str = concat!(
+        r#"{"type":"user","uuid":"sp1","isSidechain":true,"sessionId":"s","agentId":"g1","timestamp":"2026-08-01T10:00:00.000Z","message":{"role":"user","content":"go and look"}}"#,
+        "\n",
+        r#"{"type":"assistant","uuid":"sa1","isSidechain":true,"sessionId":"s","agentId":"g1","timestamp":"2026-08-01T10:00:01.000Z","message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"looking"},{"type":"tool_use","id":"st1","name":"Read","input":{"file_path":"/x/y.rs"}}]}}"#,
+        "\n",
+        r#"{"type":"user","uuid":"sm1","isSidechain":true,"sessionId":"s","timestamp":"2026-08-01T10:00:02.000Z","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"an injected skill body"}]}}"#,
+        "\n",
+        r#"{"type":"user","uuid":"sr1","isSidechain":true,"sessionId":"s","timestamp":"2026-08-01T10:00:03.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"st1","content":"ok"}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_subagent_transcript_keeps_its_sidechain_lines() {
+        // The regression `subagent_chat` exists to avoid (mesa task 1278):
+        // every line of a subagent's own transcript is a sidechain line, so
+        // the session reader's filter renders one as a silent run.
+        let kept = chat_turns(SUBAGENT_LINES, false);
+        assert_eq!(
+            kept.iter()
+                .map(|t| (t.kind, t.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (CcChatTurnKind::Prompt, "sp1"),
+                (CcChatTurnKind::Response, "sa1"),
+                (CcChatTurnKind::Tool, "st1"),
+            ],
+            "with the filter off a subagent's whole transcript is a conversation \
+             — the opening PROMPT included, which is the task its parent handed \
+             it and the only line saying what the run was for"
+        );
+        assert_eq!(kept[0].text, "go and look");
+        // The session reader is unchanged: none of it is its conversation.
+        assert!(chat_turns(SUBAGENT_LINES, true).is_empty());
+    }
+
     #[test]
     fn chat_bodies_are_uncapped_but_a_tool_target_is_not() {
         let long = "x".repeat(TARGET_MAX_CHARS * 3);
         let line = format!(
             r#"{{"type":"assistant","uuid":"a1","sessionId":"s","timestamp":"2026-08-01T10:00:00.000Z","message":{{"model":"m","content":[{{"type":"text","text":"{long}"}},{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"{long}"}}}}]}}}}"#
         );
-        let turns = chat_turns(&line);
+        let turns = chat_turns(&line, true);
         assert_eq!(
             turns[0].text.chars().count(),
             TARGET_MAX_CHARS * 3,

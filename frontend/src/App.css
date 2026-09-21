@@ -3535,6 +3535,47 @@ main {
   border-color: rgba(255, 180, 68, 0.5);
 }
 
+/* The card whose read-only pane is open (mesa task 1278) — the same cyan the
+   session row above it wears when its own pane is, so "this is on screen"
+   reads identically at both levels. */
+.agent-child.selected {
+  border-color: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan-dim);
+}
+
+/* An interactive session has no pane to hang a child off, so its cards say
+   so by being unpressable rather than by disappearing. */
+.agent-child:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* A child pane (mesa task 1278): the chat pane's frame with a live meta line
+   where the composer is not. */
+.agent-child-pane-meta {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.72rem;
+  border-bottom: 1px solid var(--border);
+}
+
+/* The one thing a shell pane has to show. Wrapped rather than scrolled: a
+   command line is the whole content here, not a line of it. */
+.agent-child-pane-command {
+  margin: 0;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .agent-terminal-panel {
   flex: 1;
   min-height: 0;

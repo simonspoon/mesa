@@ -2238,6 +2238,12 @@ fn router(state: AppState) -> Router {
             "/api/cc/sessions/{session_id}/chat",
             get(get_cc_session_chat),
         )
+        // …and one subagent OF that session, read the same way — the Agents
+        // panel's read-only child pane (mesa task 1278).
+        .route(
+            "/api/cc/sessions/{session_id}/subagents/{agent_id}/chat",
+            get(get_cc_subagent_chat),
+        )
         // The one CC *write*: purge the stored telemetry and re-ingest from
         // the transcripts on disk. An explicit operator action (Settings →
         // Model pricing), never something a read can trigger — so it is a
@@ -8795,6 +8801,42 @@ async fn get_cc_session_chat(
         tokio::task::spawn_blocking(move || crate::core::cc::session_chat(&session_id, limit))
             .await
             .map_err(|e| Error::Unavailable(format!("reading the transcript failed: {e}")))??;
+    Ok(Json(chat).into_response())
+}
+
+/// Returns one **subagent**'s conversation (`CcSessionChat`) — the Agents
+/// panel's read-only child pane (mesa task 1278).
+///
+/// `get_cc_session_chat`'s sibling in every respect: no `Store`, no `sync`, on
+/// `spawn_blocking`, because a running subagent's newest turns are younger
+/// than any ingest and this is a 3-second poll behind an open pane.
+///
+/// **Gate:** the router-wide `guard` layer and nothing else, exactly like the
+/// chat, graph and node-text routes beside it — see `get_cc_session_chat`'s
+/// note on not gating one of them without the others. The bodies here are a
+/// strict subset of the same session's transcripts those routes already
+/// serve, so a stricter gate would be theatre.
+///
+/// The subagent is looked up **under this session** (`core::cc`), so an
+/// `agent_id` belonging to a different session does not resolve. Failure
+/// modes are typed `Error`s mapping through the shared `From<Error>`: an id
+/// that is not an id → 422 `validation`, no transcript on disk for it → 503
+/// `unavailable`.
+async fn get_cc_subagent_chat(
+    Path((session_id, agent_id)): Path<(String, String)>,
+    Query(q): Query<CcChatQuery>,
+) -> ApiResult<Response> {
+    // Clamped for `get_cc_session_chat`'s reason: `limit` is arbitrary caller
+    // input and the response is linear in the turns it serializes.
+    let limit = q
+        .limit
+        .unwrap_or(crate::core::cc::CHAT_TURN_LIMIT)
+        .min(2_000);
+    let chat = tokio::task::spawn_blocking(move || {
+        crate::core::cc::subagent_chat(&session_id, &agent_id, limit)
+    })
+    .await
+    .map_err(|e| Error::Unavailable(format!("reading the transcript failed: {e}")))??;
     Ok(Json(chat).into_response())
 }
 

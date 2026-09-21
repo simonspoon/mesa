@@ -756,7 +756,8 @@ cat > "$TMP/tree/-chat-project/cx.jsonl" <<'JSONL'
 {"type":"user","uuid":"cres","sessionId":"cx","timestamp":"2026-06-21T02:00:03.000Z","toolUseResult":{"stdout":"ok"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"ct_1","content":"ok"}]}}
 JSONL
 cat > "$TMP/tree/-chat-project/cx/subagents/a.jsonl" <<'JSONL'
-{"type":"assistant","uuid":"cs1","isSidechain":true,"sessionId":"cx","agentId":"cg1","timestamp":"2026-06-21T02:00:04.000Z","message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"SUBAGENT-PROSE"}]}}
+{"type":"user","uuid":"cs0","isSidechain":true,"sessionId":"cx","agentId":"cg1","timestamp":"2026-06-21T02:00:03.500Z","message":{"role":"user","content":"SUBAGENT-TASK-PROMPT"}}
+{"type":"assistant","uuid":"cs1","isSidechain":true,"sessionId":"cx","agentId":"cg1","timestamp":"2026-06-21T02:00:04.000Z","message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"SUBAGENT-PROSE"},{"type":"tool_use","id":"cs_t1","name":"Read","input":{"file_path":"/home/me/chat/src/lib.rs"}}]}}
 JSONL
 
 # Never ingested (no `cc sync` since the file was written) — and the answer is
@@ -1156,6 +1157,68 @@ d=json.load(open("'"$TMP"'/chat-http-503"))
 assert d["error"]["code"]=="unavailable", d
 ' || fail "api cc chat: missing transcript did not return error.code=unavailable"
 echo "api cc chat: 422 / 503 split ok"
+
+# ---- one subagent OF that session: the read-only child pane (task 1278) ----
+#
+# The route the Agents panel opens a child card in. No CLI verb, so this is
+# the only surface it has. There is deliberately no `cc chat`-style reader
+# comparison here: the payload is the same `CcSessionChat` shape, produced by
+# a reader whose one difference from `session_chat` is the assertion below.
+curl -sf "http://127.0.0.1:$PORT/api/cc/sessions/cx/subagents/a/chat" >"$TMP/sub-chat" \
+  || fail "GET /api/cc/sessions/{id}/subagents/{agent_id}/chat failed"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/sub-chat"))
+assert d["session_id"]=="cx" and d["truncated"] is False, d
+# THE regression this route exists around: every line of a subagent
+# transcript carries `isSidechain: true`, and the session reader skips
+# exactly those — reusing it unchanged would answer an empty conversation for
+# a subagent that is talking perfectly well.
+shape=[(t["kind"],t["id"]) for t in d["turns"]]
+assert shape==[("prompt","cs0"),("response","cs1"),("tool","cs_t1")], shape
+assert d["turns"][0]["text"]=="SUBAGENT-TASK-PROMPT", d["turns"][0]
+assert d["turns"][1]["text"]=="SUBAGENT-PROSE", d["turns"][1]
+assert d["turns"][2]["name"]=="Read", d["turns"][2]
+# A subagent has no chooser a reader could answer and no PTY to answer it
+# through: this pane is read-only.
+assert d["pending_question"] is None, d
+print("api cc subagent chat: sidechain lines are the conversation ok")
+' || fail "GET .../subagents/{agent_id}/chat did not return the subagent turns"
+
+# An agent id that is not an id never becomes a path — refused before any
+# filesystem access, `validation` not `unavailable`, exactly as the session
+# id is on the sibling route.
+STATUS=$(curl -s -o "$TMP/sub-chat-422" -w '%{http_code}' "http://127.0.0.1:$PORT/api/cc/sessions/cx/subagents/..%2F..%2Fetc%2Fpasswd/chat")
+[ "$STATUS" = "422" ] || fail "api cc subagent chat: traversal-shaped agent id expected 422, got $STATUS ($(cat "$TMP/sub-chat-422"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/sub-chat-422"))
+assert d["error"]["code"]=="validation", d
+' || fail "api cc subagent chat: traversal-shaped agent id did not return error.code=validation"
+
+# A well-formed id with no file on disk is `unavailable` — the sibling chat
+# route's own outcome for a transcript that is not there.
+STATUS=$(curl -s -o "$TMP/sub-chat-503" -w '%{http_code}' "http://127.0.0.1:$PORT/api/cc/sessions/cx/subagents/no-such-agent/chat")
+[ "$STATUS" = "503" ] || fail "api cc subagent chat: missing transcript expected 503, got $STATUS ($(cat "$TMP/sub-chat-503"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/sub-chat-503"))
+assert d["error"]["code"]=="unavailable", d
+' || fail "api cc subagent chat: missing transcript did not return error.code=unavailable"
+
+# **Session-scoped**: `a` is a real subagent id, and `tx` is a real session,
+# but `a` is not one of `tx`'s — so it does not resolve. The read probes
+# `<slug>/<session_id>/subagents/<agent_id>.jsonl`, so the session is part of
+# the path rather than something checked afterwards.
+STATUS=$(curl -s -o "$TMP/sub-chat-foreign" -w '%{http_code}' "http://127.0.0.1:$PORT/api/cc/sessions/tx/subagents/a/chat")
+[ "$STATUS" = "503" ] || fail "api cc subagent chat: a foreign session's agent id expected 503, got $STATUS ($(cat "$TMP/sub-chat-foreign"))"
+python3 -c '
+import json
+d=json.load(open("'"$TMP"'/sub-chat-foreign"))
+assert d["error"]["code"]=="unavailable", d
+assert "SUBAGENT-PROSE" not in json.dumps(d), "a subagent of another session is not readable here"
+' || fail "api cc subagent chat: an agent id of another session resolved"
+echo "api cc subagent chat: 422 / 503 / session-scoped ok"
 
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true

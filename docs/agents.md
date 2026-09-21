@@ -233,11 +233,19 @@ already use.
   of only showing the badge. It is **additive** — `liveShells` and
   `liveSubagents` keep their exact meanings and values, and are derived from
   the same walk that builds the list so badge and cards can never disagree.
-  - A child carries `kind` (`subagent` | `shell`), `name`, `detail`,
+  - A child carries `id`, `kind` (`subagent` | `shell`), `name`, `detail`,
     `startedAt`, `contextTokens` and `state` (`running` | `finished`). Always
     present, empty when nothing is live; subagents come first, then shells, and
     the page decides the order it renders (`frontend/src/agentChild.ts`:
     running before finished, subagents before shells).
+  - `id` is a **subagent's transcript file stem** (`agent-<name>-<hex>`, mesa
+    task 1278) — free, since the walk that builds the row already holds the
+    path, and a bounded pointer, so it belongs on the record. It is the file's
+    name and never the sidecar's `agentType`: two runs of one agent type share
+    a *name*, and the id is what the pane below reads the right one back by.
+    It is `null` for a shell, and that is not an omission — a `ps` row carries
+    nothing transcript-derived, so a Bash call in flight has no identity beyond
+    the command line already in `name`.
   - A **subagent** is named by the `agentType` of the `.meta.json` sidecar
     Claude Code writes beside each `agent-<hash>.jsonl` (missing or unparseable
     → the file stem, never nameless); its `detail` is the newest assistant
@@ -261,6 +269,71 @@ already use.
     the request. `scripts/agents-check.sh` plants two subagent transcripts
     under a throwaway `MESA_CC_PROJECTS_DIR` and pins the populated shape;
     shell children stay with the Rust unit tests, for the reason above.
+- **Tapping a child card opens it as a read-only pane beside its parent**
+  (mesa task 1278) — the same gesture that opens a session's chat pane, one
+  level down. The pane tree grows a second leaf kind, `child`, whose id names
+  its parent and which child it is (`frontend/src/agentChild.ts`:
+  `child:<parent job id>:sub:<transcript id>` for a subagent,
+  `child:<parent job id>:cmd:<command line>` for a shell). Neither key is an
+  index — cards reorder and drop out on every 3s poll, and a pane must not be
+  renamed underneath the reader — and a command line is a shell's whole
+  identity for the whole of its life, since the process leaves the table the
+  instant its Bash call returns. The card keeps its `stopPropagation`, so a tap
+  on it never toggles the parent's attach pane underneath. A child pane owns no
+  PTY, so every close path goes through `releasePane`, which asks `ptyPool`
+  about agent panes only; and because Auto Tile owns the layout while it is on,
+  its rebuild carries the open child panes through after the agents rather than
+  closing them on the next poll — a child is not a session, so the sessions
+  list can neither ask for one nor withdraw one.
+  - **Data: `GET /api/cc/sessions/{sessionId}/subagents/{agentId}/chat`**,
+    polled at 3s, `cc::subagent_chat`. `get_cc_session_chat`'s sibling in every
+    respect — no `Store`, no `sync`, on `spawn_blocking`, the same
+    `CcSessionChat` shape, the router-wide `guard` layer and no per-route gate
+    (the bodies are a strict subset of what the chat, graph and node-text
+    routes already serve for the same session; do not gate one of the four
+    without the others). The read is **session-scoped**: the file is probed at
+    `<slug>/<session_id>/subagents/<agent_id>.jsonl`, so an agent id belonging
+    to another session does not resolve, and both ids are validated to the id
+    charset before any filesystem call and still go through `transcript_path`.
+    Its one real difference from the session reader is that it passes
+    `skip_sidechain: false` to `chat_turns` — **every** line of a subagent
+    transcript carries `isSidechain: true`, which the session reader skips on
+    purpose, so reusing it unchanged would answer an empty conversation for a
+    subagent that is talking perfectly well (`subagent_pulse`'s own reason for
+    existing beside `session_pulse`). `pending_question` is always null.
+  - The conversation is the **same renderer** as the main chat —
+    `ChatTranscript` (mesa task 1278 split it out of `AgentChat`), so turn
+    grouping, the collapsed tool runs, follow-to-tail and the
+    `resolveImageSrc={() => null}` refusal of every image are one
+    implementation, not two that drift. What stayed in `AgentChat` is
+    everything that *writes*: the composer and the question card both type into
+    a PTY, and a subagent has none. There is no input box in a child pane and
+    no view toggle — there is no terminal to switch to. The transcript's first
+    user line is the task its parent handed it, so it is labelled
+    `<parent> → <subagent>` rather than `you`.
+  - **A shell pane shows the command, an elapsed clock and its state, and no
+    output** — deliberately, because mesa has none to show. A shell child is
+    built from a `ps` probe whose row holds only `pid, ppid, etime, comm, args`
+    and nothing transcript-derived, and whose `args` is Claude Code's own
+    `zsh -c 'source …shell-snapshot && eval …'` wrapper rather than the command
+    the agent ran — so matching it back to a transcript `tool_use` would be a
+    guess, and a wrong guess renders some other call's output under this one.
+    Claude Code does not stream a Bash call's output into the transcript while
+    it runs either, and the process leaves the table the instant the call
+    returns (so a shell child is `Running` by construction and never reaches
+    `finished`) — there is no later moment at which the pane could fill the gap
+    in. The pane says so rather than showing an empty box.
+  - The live figures — tokens, elapsed, state — come off the parent's row on
+    the sidebar's own session poll, so a child that has dropped out of its
+    parent's `children` (a subagent leaving the freshness window, a shell whose
+    call returned) leaves the pane showing fewer of them rather than closing
+    itself: a subagent's transcript is still on disk and still readable. A
+    parent that has left the session list takes the session id the transcript
+    is filed under with it, and the pane says that instead.
+  - Pure logic lives in `frontend/src/agentChild.ts` (vitest-covered per
+    CLAUDE.md's frontend-test rule): the pane id, its parse, the
+    `isChildPaneId` predicate every `ptyPool` call is guarded by, the lookup
+    back onto the live row, and the header/prompt labels.
 - **Two more mesa-derived fields report what a session is *saying*** (mesa task
   869): `lastResponse` and `contextTokens`, also on every `AgentSession`, also
   `#[serde(default)]` and camelCase, and filled in the same `list_sessions`

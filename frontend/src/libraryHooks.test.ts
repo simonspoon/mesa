@@ -334,6 +334,7 @@ function project(overrides: Partial<Project> = {}): Project {
     archived: false,
     sort_order: 3,
     parent_id: null,
+    previous_paths: [],
     ...overrides,
   }
 }

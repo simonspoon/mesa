@@ -1309,24 +1309,27 @@ pub fn collect_since(store: &Store, window: &str, since: i64) -> Result<CcDashbo
 }
 
 /// Project-scoped variant of [`collect`]: aggregation is restricted to
-/// sessions whose `cc_sessions.cwd` exactly equals `local_path` (no
-/// prefix/subdirectory matching — see `.scratch/arch.md`). `local_path: None`
-/// (the project has no `local_path` recorded) returns a zero-valued dashboard
-/// directly, without falling through to `collect_inner(store, window, None)`
-/// — that `None` means "unfiltered" there and would silently return the
-/// *global* dashboard instead.
-pub fn collect_for_project(
-    store: &Store,
-    window: &str,
-    local_path: Option<&str>,
-) -> Result<CcDashboard> {
+/// sessions whose `cc_sessions.cwd` **exactly equals** one of `paths`. The
+/// equality is per path and total — a session in a subdirectory of one of
+/// them does not match, because a cwd is a session's whole identity here and
+/// a prefix rule would sweep in every sibling project nested under a shared
+/// parent folder.
+///
+/// `paths` is the project's current `local_path` *and* its `previous_paths`
+/// (task 1262), so a project whose folder moved keeps the sessions it ran
+/// before the move. An **empty** slice (a project with no `local_path` and no
+/// history) returns a zero-valued dashboard directly, rather than falling
+/// through to `collect_inner(store, window, None)` — that `None` means
+/// "unfiltered" there and would silently return the *global* dashboard
+/// instead.
+pub fn collect_for_project(store: &Store, window: &str, paths: &[&str]) -> Result<CcDashboard> {
     // Same rule `collect_inner` enforces, applied before the zero-state
     // shortcut can hand back a 30-day cutoff wearing a `cc-5h` label.
     reject_usage_window(window)?;
-    let Some(local_path) = local_path else {
+    if paths.is_empty() {
         return Ok(empty_dashboard(window, None));
-    };
-    collect_inner(store, window, Some(local_path), None)
+    }
+    collect_inner(store, window, Some(paths), None)
 }
 
 /// [`collect_for_project`] with a caller-supplied cutoff, for the same reason
@@ -1335,12 +1338,12 @@ pub fn collect_for_project_since(
     store: &Store,
     window: &str,
     since: i64,
-    local_path: Option<&str>,
+    paths: &[&str],
 ) -> Result<CcDashboard> {
-    let Some(local_path) = local_path else {
+    if paths.is_empty() {
         return Ok(empty_dashboard(window, Some(since)));
-    };
-    collect_inner(store, window, Some(local_path), Some(since))
+    }
+    collect_inner(store, window, Some(paths), Some(since))
 }
 
 /// Zero-valued dashboard for `window`, built by running the same cutoff/now
@@ -1355,12 +1358,12 @@ fn empty_dashboard(window: &str, since: Option<i64>) -> CcDashboard {
 }
 
 /// Shared body of [`collect`] and [`collect_for_project`]. `cwd_filter: None`
-/// is unfiltered (the global dashboard); `Some(path)` restricts every
-/// aggregation loop to sessions whose `cwd` exactly equals `path`.
+/// is unfiltered (the global dashboard); `Some(paths)` restricts every
+/// aggregation loop to sessions whose `cwd` exactly equals one of `paths`.
 fn collect_inner(
     store: &Store,
     window: &str,
-    cwd_filter: Option<&str>,
+    cwd_filter: Option<&[&str]>,
     since: Option<i64>,
 ) -> Result<CcDashboard> {
     let prices = load_prices()?;
@@ -1384,7 +1387,9 @@ fn collect_inner(
     // `agg.sessions`, so the messages/tool_calls loops can key off its
     // presence there instead of maintaining a separate set.
     for rec in store.cc_read_sessions(cutoff)? {
-        if cwd_filter.is_some_and(|f| rec.cwd.as_deref() != Some(f)) {
+        if cwd_filter
+            .is_some_and(|paths| !rec.cwd.as_deref().is_some_and(|cwd| paths.contains(&cwd)))
+        {
             continue;
         }
         let s = agg.sessions.entry(rec.session_id).or_default();
@@ -4368,7 +4373,7 @@ mod tests {
         assert_eq!(global.overview.messages, 2);
 
         // Scoped to s1's cwd: only s1 contributes, across every rollup.
-        let scoped = collect_for_project(&store, "all", Some("/home/me/work/widget")).unwrap();
+        let scoped = collect_for_project(&store, "all", &["/home/me/work/widget"]).unwrap();
         assert_eq!(scoped.overview.sessions, 1);
         assert_eq!(scoped.overview.messages, 1);
         assert_eq!(scoped.overview.tokens.input, 100);
@@ -4392,7 +4397,7 @@ mod tests {
         assert_eq!(scoped.projects[0].path, "/home/me/work/widget");
 
         // Scoped to s2's cwd: symmetric check, only s2 contributes.
-        let scoped2 = collect_for_project(&store, "all", Some("/home/me/work/other")).unwrap();
+        let scoped2 = collect_for_project(&store, "all", &["/home/me/work/other"]).unwrap();
         assert_eq!(scoped2.overview.sessions, 1);
         assert_eq!(scoped2.sessions[0].session_id, "s2");
         assert_eq!(scoped2.tools.len(), 1);
@@ -4401,10 +4406,10 @@ mod tests {
         assert_eq!(scoped2.agents.len(), 1);
         assert_eq!(scoped2.agents[0].agent, "Explore");
 
-        // A project with no local_path (None) short-circuits to a zero-valued
+        // A project with no paths at all short-circuits to a zero-valued
         // dashboard — not the global one — with the same shape a real
         // dashboard would have for this window.
-        let unset = collect_for_project(&store, "all", None).unwrap();
+        let unset = collect_for_project(&store, "all", &[]).unwrap();
         assert_eq!(unset.overview.sessions, 0);
         assert_eq!(unset.overview.messages, 0);
         assert!(unset.sessions.is_empty());
@@ -4416,11 +4421,94 @@ mod tests {
         assert_eq!(unset.window, "all");
         assert!(unset.since.is_none());
 
-        // A local_path that matches no session's cwd is likewise a
-        // zero-valued dashboard, not an error.
-        let no_match = collect_for_project(&store, "all", Some("/nope")).unwrap();
+        // A path that matches no session's cwd is likewise a zero-valued
+        // dashboard, not an error.
+        let no_match = collect_for_project(&store, "all", &["/nope"]).unwrap();
         assert_eq!(no_match.overview.sessions, 0);
         assert!(no_match.sessions.is_empty());
+    }
+
+    #[test]
+    fn collect_for_project_counts_a_session_under_a_previous_path() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-moved-project");
+        fs::create_dir_all(&proj).unwrap();
+        // The same project before and after a move: `old` ran under the
+        // folder the project used to live in, `new` under the one it lives
+        // in now, `other` under somebody else's entirely.
+        write_jsonl(
+            &proj,
+            "sess.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"u1","sessionId":"old","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/home/me/old/widget","attributionSkill":"build","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu1","name":"Bash","caller":{"type":"direct"}}],"usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+                r#"{"type":"assistant","uuid":"u2","sessionId":"new","timestamp":"2026-06-16T01:00:00.000Z","cwd":"/home/me/work/widget","attributionSkill":"build","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"tu2","name":"Bash","caller":{"type":"direct"}}],"usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+                r#"{"type":"assistant","uuid":"u3","sessionId":"other","timestamp":"2026-06-17T01:00:00.000Z","cwd":"/home/me/work/other","attributionAgent":"Explore","message":{"model":"claude-haiku-4-5","content":[{"type":"tool_use","id":"tu3","name":"Read","caller":{"type":"direct"}}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            ],
+        );
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        sync(&mut store, false).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        // Current path alone: the pre-move session is invisible, which is the
+        // bug task 1262 fixes.
+        let current_only = collect_for_project(&store, "all", &["/home/me/work/widget"]).unwrap();
+        assert_eq!(current_only.overview.sessions, 1);
+        assert_eq!(current_only.sessions[0].session_id, "new");
+
+        // Current path plus the previous one: the pre-move session counts in
+        // every rollup exactly as the post-move one does, and the third
+        // project's session is still excluded.
+        let both = collect_for_project(
+            &store,
+            "all",
+            &["/home/me/old/widget", "/home/me/work/widget"],
+        )
+        .unwrap();
+        assert_eq!(both.overview.sessions, 2);
+        assert_eq!(both.overview.messages, 2);
+        assert_eq!(both.overview.tokens.input, 101);
+        assert_eq!(both.overview.tokens.output, 202);
+        let mut ids: Vec<&str> = both
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["new", "old"]);
+        // models/skills/tools roll the two up together; the other project's
+        // haiku, its `Explore` agent and its `Read` call must not leak in.
+        assert_eq!(both.models.len(), 1);
+        assert_eq!(both.models[0].model, "claude-opus-4-8");
+        assert_eq!(both.skills.len(), 1);
+        assert_eq!(both.skills[0].skill, "build");
+        assert_eq!(both.skills[0].sessions, 2);
+        assert!(both.agents.is_empty());
+        assert_eq!(both.tools.len(), 1);
+        assert_eq!(both.tools[0].name, "Bash");
+        assert_eq!(both.tools[0].calls, 2);
+        // daily series: one message on each of the two days.
+        assert_eq!(both.daily.len(), 2);
+        assert!(both.daily.iter().all(|d| d.messages == 1));
+        // project breakdown: both folders, and only those two.
+        let mut paths: Vec<&str> = both.projects.iter().map(|p| p.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["/home/me/old/widget", "/home/me/work/widget"]);
+
+        // A previous path alone still matches exactly — and matching is per
+        // path, never a prefix: the parent folder the two share matches
+        // nothing.
+        let old_only = collect_for_project(&store, "all", &["/home/me/old/widget"]).unwrap();
+        assert_eq!(old_only.overview.sessions, 1);
+        assert_eq!(old_only.sessions[0].session_id, "old");
+        let parent = collect_for_project(&store, "all", &["/home/me"]).unwrap();
+        assert_eq!(parent.overview.sessions, 0);
     }
 
     #[test]
@@ -5371,7 +5459,7 @@ mod tests {
         // Including the project-scoped zero-state shortcut, which returns
         // before `collect_inner` would have caught it.
         assert!(matches!(
-            collect_for_project(&store, "cc-7d", None),
+            collect_for_project(&store, "cc-7d", &[]),
             Err(Error::Validation(_))
         ));
     }

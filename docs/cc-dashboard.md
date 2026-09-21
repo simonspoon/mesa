@@ -1037,6 +1037,42 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   `truncated`, and both error codes. The HTTP half adds `?limit=` and the
   422/503 split.
 
+## Which sessions belong to a project
+
+A session's `cc_sessions.cwd` comes out of the transcript verbatim, and a
+project-scoped dashboard keeps a session iff that `cwd` is **exactly equal** to
+one of the project's paths. Equality, never a prefix: a session in a
+subdirectory does not match, because sibling projects nested under one parent
+folder would otherwise sweep each other in.
+
+The set of paths is the project's current `local_path` **plus its
+`previous_paths`** (mesa task 1262) — the folders it used to live in, oldest
+first, derived on every read from the `project_paths` table. Without them a
+moved or renamed folder silently loses its whole history: every session
+recorded before the move stops matching. Rewriting the stored `cwd` by hand
+does not fix it either, since `mesa cc reset` re-ingests the old cwd straight
+back out of the transcript files, which mesa does not own.
+
+`Store::update_project` is the one place this set is written automatically: a
+patch that actually moves `local_path` appends the folder it left (ignoring a
+duplicate) and removes the folder it arrived at, so the set holds previous
+paths only and never the current one — which is why `mesa project resolve`'s
+self-heal and `PATCH /api/projects/{id}` get it with no code of their own. The
+by-hand half is two CLI verbs, for a move mesa never saw:
+
+```bash
+mesa project path add <PROJECT> <PATH>     # record a folder it used to live in
+mesa project path remove <PROJECT> <PATH>  # forget one
+```
+
+Both take a project id or a name, print the full updated `Project` (`--quiet`
+keeps `previous_paths` — it is bounded, and it is what the call just wrote) and
+store the path verbatim, with no canonicalization: a previous folder is usually
+gone, so there is nothing left on disk to resolve it against. Adding the
+project's current `local_path` is `validation`; removing a path it does not
+hold is `not_found`. There is deliberately **no HTTP route** — the field is
+already visible on both surfaces, and nothing in the web UI edits it.
+
 ## Subscription usage (the one network read)
 
 `mesa cc usage` / `GET /api/cc/usage` shows live **plan-limit utilization** (the

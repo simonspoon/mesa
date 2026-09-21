@@ -393,6 +393,57 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
+    /// Edit the folders this project used to live in (`previous_paths`)
+    #[command(subcommand)]
+    Path(ProjectPathCmd),
+}
+
+/// `mesa project path …` — the by-hand half of `previous_paths` (task 1262).
+///
+/// Moving a project's `local_path` appends the old folder on its own, so
+/// these two exist for the paths mesa never saw the move of: a folder
+/// renamed before this was built, or a checkout that only ever existed
+/// somewhere else. CLI only, deliberately — the field is already visible on
+/// both surfaces, and nothing in the web UI edits it.
+#[derive(Subcommand)]
+enum ProjectPathCmd {
+    /// Record a folder this project used to live in; prints the full updated
+    /// project (`--quiet`: without its `description`)
+    ///
+    /// The path is stored exactly as given — a previous folder is usually
+    /// gone, so there is nothing to resolve it against. Adding the project's
+    /// current `local_path` is `validation`; adding a path it already holds
+    /// succeeds and changes nothing.
+    #[command(after_help = "\
+EXAMPLES
+  mesa project path add mesa /Users/me/old/mesa
+  mesa project path add 3 /Users/me/old/mesa --quiet")]
+    Add {
+        /// Project id or name
+        #[arg(value_name = "ID|NAME")]
+        project: String,
+        /// The folder, exactly as the Claude Code transcripts recorded it
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Print the project without its `description` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Forget a folder this project used to live in; prints the full updated
+    /// project (`--quiet`: without its `description`)
+    ///
+    /// A path the project does not hold is `not_found`.
+    Remove {
+        /// Project id or name
+        #[arg(value_name = "ID|NAME")]
+        project: String,
+        /// The folder to forget
+        #[arg(value_name = "PATH")]
+        path: String,
+        /// Print the project without its `description` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3915,6 +3966,29 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             let id = resolve_project(&store, &project)?;
             print_project(&store.unarchive_project(id)?, quiet);
         }
+        ProjectCmd::Path(cmd) => run_project_path(&mut store, cmd)?,
+    }
+    Ok(())
+}
+
+fn run_project_path(store: &mut Store, cmd: ProjectPathCmd) -> Result<()> {
+    match cmd {
+        ProjectPathCmd::Add {
+            project,
+            path,
+            quiet,
+        } => {
+            let id = resolve_project(store, &project)?;
+            print_project(&store.add_project_path(id, &path)?, quiet);
+        }
+        ProjectPathCmd::Remove {
+            project,
+            path,
+            quiet,
+        } => {
+            let id = resolve_project(store, &project)?;
+            print_project(&store.remove_project_path(id, &path)?, quiet);
+        }
     }
     Ok(())
 }
@@ -6406,6 +6480,7 @@ mod tests {
             archived: false,
             sort_order: 3.5,
             parent_id: Some(7),
+            previous_paths: vec!["/tmp/old-p".into()],
         }
     }
 
@@ -6688,6 +6763,11 @@ mod tests {
                 // pointer, and it is what makes a quiet project row placeable
                 // in the tree at all.
                 "parent_id",
+                // Task 1262. Kept for the same reason `artifact` is kept on a
+                // task: a bounded list of paths, and it is the field
+                // `project path add`/`remove` just wrote — echoing it back
+                // missing would read as "the write failed".
+                "previous_paths",
             ]),
             "Project gained/lost a field: decide whether it belongs in the \
              --quiet shape before updating this list",

@@ -109,6 +109,20 @@ pub struct Project {
     /// is** (`docs/archiving.md`).
     #[ts(type = "number | null")]
     pub parent_id: Option<i64>,
+    /// Folders this project's `local_path` used to be (task 1262), oldest
+    /// first. Derived on every read from the `project_paths` table, never a
+    /// column on `projects`: it is a set, and a project may have moved any
+    /// number of times.
+    ///
+    /// It exists because `cc_sessions.cwd` is transcript data matched against
+    /// `local_path` by exact string equality — move the folder and every
+    /// older session stops counting toward the project's CC dashboard. The
+    /// dashboard matches the current path *and* these, so the history
+    /// survives the move (and survives `mesa cc reset`, which re-ingests the
+    /// old cwd from the transcripts). Never contains the current
+    /// `local_path`: `Store::update_project` moves the outgoing value in and
+    /// takes the incoming one out.
+    pub previous_paths: Vec<String>,
 }
 
 /// One live Claude Code session as reported by `claude agents --json`.

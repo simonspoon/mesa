@@ -259,7 +259,13 @@ The code is the source of truth. These are the invariants you must not break:
   cleared with `project update --path ""`. `project resolve` self-heals it
   **only when unset or stale** (stored folder gone) — a still-present checkout is
   never overwritten, so worktrees sharing one `root_commit` don't thrash the
-  anchor. Anchors the Agents surface; the UI sidebar decorates each project with
+  anchor. A project also keeps its **previous** local_paths (task 1262) —
+  `previous_paths`, derived on every read from the `project_paths` table,
+  appended automatically whenever `update_project` moves `local_path` away from
+  a folder and edited by hand with `mesa project path add|remove` (CLI only) —
+  because the CC dashboard matches a session's `cwd` against the current path
+  *and* those by exact equality, so a moved folder keeps its history and `mesa
+  cc reset` cannot undo it. Anchors the Agents surface; the UI sidebar decorates each project with
   its git status (`GET /api/git-status`, 5s cache, omits projects with no live
   repo).
 - A project may name another project as its **`parent_id`** (task 668) — a

@@ -80,6 +80,45 @@ run 2 "$MESA" project update "$P2" --sort-order not-a-number
 run 0 "$MESA" project update "$P2" --sort-order "$(jq -n --argjson f "$P_ORDER" '$f + 1')"
 ok "project sort_order: listed order, one-row update, non-numeric is usage"
 
+# ---- previous_paths: the folders a project used to live in (task 1262) ----
+# The CC dashboard matches a session's cwd against the current local_path AND
+# these, so a moved folder does not silently drop its own history. Moving
+# local_path appends the old folder by itself; `project path add|remove` is
+# the by-hand half, CLI-only.
+mkdir -p "$TMP/old-home" "$TMP/new-home"
+run 0 "$MESA" project update "$P2" --path "$TMP/old-home"
+OLD_HOME=$(jqs .local_path)
+[ "$(jqs '.previous_paths | length')" = "0" ] ||
+  fail "project update --path: the first path is not a previous one"
+run 0 "$MESA" project update "$P2" --path "$TMP/new-home"
+NEW_HOME=$(jqs .local_path)
+[ "$(jqs '.previous_paths | join(",")')" = "$OLD_HOME" ] ||
+  fail "project update --path: moving must remember the folder it left"
+# Adding the current local_path is validation; adding a path it already holds
+# is a no-op; removing one it does not hold is not_found.
+run 1 "$MESA" project path add "$P2" "$NEW_HOME"
+[ "$(jqe .error.code)" = "validation" ] || fail "path add current local_path: error.code"
+run 1 "$MESA" project path remove "$P2" "$TMP/never-here"
+[ "$(jqe .error.code)" = "not_found" ] || fail "path remove unknown path: error.code"
+run 0 "$MESA" project path add "$P2" "$TMP/long-gone"
+[ "$(jqs '.previous_paths | join(",")')" = "$OLD_HOME,$TMP/long-gone" ] ||
+  fail "project path add: appends oldest-first, verbatim (no canonicalization)"
+run 0 "$MESA" project path add "$P2" "$TMP/long-gone"
+[ "$(jqs '.previous_paths | length')" = "2" ] || fail "project path add: must be idempotent"
+# --quiet keeps previous_paths (bounded, and the field this call just wrote)
+# and drops only the description.
+run 0 "$MESA" project path remove "$P2" "$TMP/long-gone" --quiet
+[ "$(jqs '.previous_paths | join(",")')" = "$OLD_HOME" ] ||
+  fail "project path remove --quiet: previous_paths must survive"
+[ "$(jqs 'has("description")')" = "false" ] || fail "project path remove --quiet: description"
+# Moving back takes the folder out of the set again.
+run 0 "$MESA" project update "$P2" --path "$TMP/old-home"
+[ "$(jqs '.previous_paths | join(",")')" = "$NEW_HOME" ] ||
+  fail "project update --path: moving back must drop that folder from the set"
+run 0 "$MESA" project path remove "$P2" "$NEW_HOME"
+run 0 "$MESA" project update "$P2" --path ""
+ok "project previous_paths: auto-append on move, add/remove by hand, error shapes"
+
 run 0 "$MESA" task create --project "$P" --description "Design layout" --priority high --tags design,web
 T1=$(jqs .id)
 [ "$(jqs .blocked)" = "false" ] || fail "task create: blocked must be present and false"
@@ -769,8 +808,8 @@ PJQ=$(jqs .id)
 # moves between the two calls (Project carries no timestamp at all).
 run 0 "$MESA" project show "$PJQ"
 printf '%s' "$STDOUT" >"$TMP/pfull.json"
-# non-quiet output is unchanged: the full 8-key project object
-[ "$(jqs 'keys | join(",")')" = "archived,description,id,local_path,name,parent_id,root_commit,sort_order" ] ||
+# non-quiet output is unchanged: the full 9-key project object
+[ "$(jqs 'keys | join(",")')" = "archived,description,id,local_path,name,parent_id,previous_paths,root_commit,sort_order" ] ||
   fail "project show (no --quiet): full key set must be unchanged"
 [ "$(jqs 'has("description")')" = "true" ] || fail "project show (no --quiet): description present"
 run 0 "$MESA" project show "$PJQ" --quiet
@@ -798,7 +837,11 @@ project_quiet_mutation_ok "project archive" "$MESA" project archive "$PJQ" --qui
 [ "$(jqs .archived)" = "true" ] || fail "project archive --quiet: archived must be true"
 project_quiet_mutation_ok "project unarchive" "$MESA" project unarchive "$PJQ" --quiet
 [ "$(jqs .archived)" = "false" ] || fail "project unarchive --quiet: archived must be false"
-ok "project update/archive/unarchive --quiet: shape and values intact"
+project_quiet_mutation_ok "project path add" "$MESA" project path add "$PJQ" /gone --quiet
+[ "$(jqs '.previous_paths | join(",")')" = "/gone" ] ||
+  fail "project path add --quiet: previous_paths must be kept"
+project_quiet_mutation_ok "project path remove" "$MESA" project path remove "$PJQ" /gone --quiet
+ok "project update/archive/unarchive/path --quiet: shape and values intact"
 
 run 0 "$MESA" project create "Quiet created" --no-git --description "$BODY" --quiet
 PJQ2=$(jqs .id)

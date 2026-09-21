@@ -979,6 +979,27 @@ const MIGRATIONS: &[&str] = &[
         ended_at    TEXT
     );
     CREATE INDEX script_runs_by_script ON script_runs (script_id, id DESC);",
+    // Task 1262: the folders a project's `local_path` used to be. A table
+    // rather than a column on `projects` because it is a *set* — a project
+    // may move any number of times — and because the rows are what the CC
+    // dashboard joins against.
+    //
+    // `cc_sessions.cwd` is transcript data matched against `local_path` by
+    // exact string equality, so moving the folder silently drops every older
+    // session out of the project's dashboard, and a one-off rewrite of the
+    // stored cwd does not survive `mesa cc reset` (which re-ingests the old
+    // cwd from the transcript files). Keeping the old paths beside the
+    // project is the durable fix: the dashboard matches any of them.
+    // `UNIQUE(project_id, path)` is what makes the append idempotent, so
+    // moving back and forth cannot duplicate a row.
+    "CREATE TABLE project_paths (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        path       TEXT    NOT NULL,
+        added_at   TEXT    NOT NULL,
+        UNIQUE(project_id, path)
+    );
+    CREATE INDEX project_paths_by_project ON project_paths (project_id, added_at, id);",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1078,6 +1099,10 @@ fn row_to_receipt(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskReceipt> {
 const PROJECT_COLUMNS: &str =
     "id, name, description, root_commit, local_path, archived, sort_order, parent_id";
 
+/// Maps a `projects` row; `previous_paths` is left empty and filled in
+/// afterwards by [`hydrate_previous_paths`], since it lives in a sibling
+/// table. Every read path that hands a `Project` out has to call that — the
+/// pair is why `PROJECT_COLUMNS` does not try to carry it.
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         id: row.get(0)?,
@@ -1088,7 +1113,35 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         archived: row.get(5)?,
         sort_order: row.get(6)?,
         parent_id: row.get(7)?,
+        previous_paths: Vec::new(),
     })
+}
+
+/// Fills `previous_paths` (task 1262) on projects just read, oldest first.
+///
+/// **One** query for the whole slice, never one per project: `list_projects`
+/// runs on every nav render, and a per-row query there is an N+1 on the
+/// hottest read mesa has. Takes a `&Connection` rather than `&self` so
+/// `delete_project` can hydrate its echo inside its own transaction, before
+/// the cascade takes the rows away.
+fn hydrate_previous_paths(conn: &Connection, projects: &mut [Project]) -> rusqlite::Result<()> {
+    if projects.is_empty() {
+        return Ok(());
+    }
+    let mut by_project: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut stmt = conn
+        .prepare("SELECT project_id, path FROM project_paths ORDER BY project_id, added_at, id")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (project_id, path) = row?;
+        by_project.entry(project_id).or_default().push(path);
+    }
+    for project in projects {
+        if let Some(paths) = by_project.remove(&project.id) {
+            project.previous_paths = paths;
+        }
+    }
+    Ok(())
 }
 
 /// The set of projects hidden from **unscoped** reads (task 668): a project is
@@ -2730,7 +2783,8 @@ impl Store {
     }
 
     pub fn get_project(&self, id: i64) -> Result<Project> {
-        self.conn
+        let mut project = self
+            .conn
             .query_row(
                 &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"),
                 [id],
@@ -2741,7 +2795,9 @@ impl Store {
                     Error::NotFound(format!("project {id} not found"))
                 }
                 e => Error::Db(e),
-            })
+            })?;
+        hydrate_previous_paths(&self.conn, std::slice::from_mut(&mut project))?;
+        Ok(project)
     }
 
     /// Every project visible to an unscoped read: neither archived nor
@@ -2769,12 +2825,15 @@ impl Store {
             "{cte}SELECT {PROJECT_COLUMNS} FROM projects p {clause} ORDER BY sort_order, id"
         ))?;
         let rows = stmt.query_map([], row_to_project)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut projects = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        hydrate_previous_paths(&self.conn, &mut projects)?;
+        Ok(projects)
     }
 
     /// Resolves the project bound to a repo's root commit hash, if any.
     pub fn find_project_by_root_commit(&self, root_commit: &str) -> Result<Project> {
-        self.conn
+        let mut project = self
+            .conn
             .query_row(
                 &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE root_commit = ?1"),
                 [root_commit],
@@ -2785,7 +2844,9 @@ impl Store {
                     Error::NotFound(format!("no project bound to root commit {root_commit}"))
                 }
                 e => Error::Db(e),
-            })
+            })?;
+        hydrate_previous_paths(&self.conn, std::slice::from_mut(&mut project))?;
+        Ok(project)
     }
 
     /// Resolves a project by its name (case-insensitive exact match). Project
@@ -2795,9 +2856,10 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {PROJECT_COLUMNS} FROM projects WHERE name = ?1 COLLATE NOCASE ORDER BY id"
         ))?;
-        let matches = stmt
+        let mut matches = stmt
             .query_map([name], row_to_project)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        hydrate_previous_paths(&self.conn, &mut matches)?;
         match matches.len() {
             0 => Err(Error::NotFound(format!(
                 "no project named {name:?}; pass a project id or an existing name \
@@ -2848,6 +2910,9 @@ impl Store {
 
     pub fn update_project(&mut self, id: i64, patch: &ProjectPatch) -> Result<Project> {
         let mut project = self.get_project(id)?;
+        // The folder this project is moving *away* from, kept before the
+        // patch overwrites it (task 1262).
+        let old_local_path = project.local_path.clone();
         if let Some(name) = &patch.name {
             project.name = name.clone();
         }
@@ -2890,7 +2955,75 @@ impl Store {
                 Some(hash) => Self::map_commit_conflict(e, hash),
                 None => Error::Db(e),
             })?;
-        Ok(project)
+        // The single write chokepoint for `previous_paths` (task 1262), so
+        // `mesa project resolve`'s self-heal and `PATCH /api/projects/{id}`
+        // inherit it without an edit of their own: a `local_path` that moved
+        // away from a real folder leaves that folder behind as a previous
+        // path, and the folder it moved *to* leaves the set, which only ever
+        // holds paths the project is no longer at. A patch that does not
+        // touch `local_path`, or sets it to what it already was, writes
+        // nothing.
+        if project.local_path != old_local_path {
+            if let Some(old) = old_local_path.as_deref().filter(|p| !p.is_empty()) {
+                // Ignore-on-conflict: moving back and forth between two
+                // folders must not duplicate either of them.
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO project_paths (project_id, path, added_at) \
+                     VALUES (?1, ?2, datetime('now'))",
+                    (id, old),
+                )?;
+            }
+            if let Some(new) = project.local_path.as_deref().filter(|p| !p.is_empty()) {
+                self.conn.execute(
+                    "DELETE FROM project_paths WHERE project_id = ?1 AND path = ?2",
+                    (id, new),
+                )?;
+            }
+        }
+        self.get_project(id)
+    }
+
+    /// Records a folder this project used to live in (task 1262), by hand —
+    /// for the paths that predate the automatic append, or a move mesa never
+    /// saw. Idempotent: adding a path already in the set is a no-op, not a
+    /// `conflict`.
+    ///
+    /// The path is stored verbatim, deliberately **not** canonicalized: a
+    /// previous folder is usually gone, and there is nothing on disk left to
+    /// resolve it against. Adding the project's *current* `local_path` is
+    /// `validation` — the set holds previous paths only.
+    pub fn add_project_path(&mut self, id: i64, path: &str) -> Result<Project> {
+        let project = self.get_project(id)?;
+        if path.is_empty() {
+            return Err(Error::Validation("path may not be empty".into()));
+        }
+        if project.local_path.as_deref() == Some(path) {
+            return Err(Error::Validation(format!(
+                "{path:?} is project {id}'s current local_path, not a previous one"
+            )));
+        }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO project_paths (project_id, path, added_at) \
+             VALUES (?1, ?2, datetime('now'))",
+            (id, path),
+        )?;
+        self.get_project(id)
+    }
+
+    /// Reverses [`add_project_path`]. Removing a path the project does not
+    /// hold is `not_found` — the caller named something that is not there.
+    pub fn remove_project_path(&mut self, id: i64, path: &str) -> Result<Project> {
+        self.get_project(id)?;
+        let removed = self.conn.execute(
+            "DELETE FROM project_paths WHERE project_id = ?1 AND path = ?2",
+            (id, path),
+        )?;
+        if removed == 0 {
+            return Err(Error::NotFound(format!(
+                "project {id} has no previous path {path:?}"
+            )));
+        }
+        self.get_project(id)
     }
 
     /// Hides the project from unscoped views. Idempotent: archiving an
@@ -2975,9 +3108,12 @@ impl Store {
             let mut stmt = tx.prepare(&format!(
                 "SELECT {PROJECT_COLUMNS} FROM projects p ORDER BY sort_order, id"
             ))?;
-            let all = stmt
+            let mut all = stmt
                 .query_map([], row_to_project)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            // Read before the cascade fires: the echo is the recovery
+            // transcript, so it has to carry the previous paths too.
+            hydrate_previous_paths(&tx, &mut all)?;
             let mut out = Vec::new();
             collect_subtree(&all, id, &mut HashSet::new(), &mut out);
             out
@@ -12766,15 +12902,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            65,
-            "a fresh db should report user_version 65"
+            66,
+            "a fresh db should report user_version 66"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 65);
+        assert_eq!(version, 66);
     }
 
     // ---- the session retrospective (mesa task 1158) ----
@@ -14863,6 +14999,210 @@ mod tests {
                 .create_script_run(s.id, &BTreeMap::new(), None, 1)
                 .is_ok()
         );
+    }
+
+    // ---- project paths (task 1262) ----
+
+    /// Pins `project_paths` at index 65, NOT `MIGRATIONS.len() - 1`, for the
+    /// reason `script_runs_arrive_at_migration_64` gives.
+    #[test]
+    fn project_paths_arrive_at_migration_65() {
+        const PROJECT_PATHS: usize = 65;
+        assert!(
+            MIGRATIONS[PROJECT_PATHS].contains("CREATE TABLE project_paths"),
+            "migration {PROJECT_PATHS} is no longer the project_paths table — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..PROJECT_PATHS] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", PROJECT_PATHS as i64)
+                .unwrap();
+        }
+        // A db from before the table upgrades into one that has it, and every
+        // project in it reads back with an empty history rather than failing.
+        let mut store = Store::open(&path).unwrap();
+        let v: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+        let p = store
+            .create_project("p", None, None, Some("/a"), None)
+            .unwrap();
+        assert!(p.previous_paths.is_empty());
+        assert_eq!(
+            store.add_project_path(p.id, "/old").unwrap().previous_paths,
+            vec!["/old".to_string()]
+        );
+    }
+
+    #[test]
+    fn moving_local_path_remembers_the_folder_it_left() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("p", None, None, Some("/a"), None)
+            .unwrap();
+        assert!(p.previous_paths.is_empty());
+
+        let moved = store
+            .update_project(
+                p.id,
+                &ProjectPatch {
+                    local_path: Some(Some("/b".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(moved.local_path.as_deref(), Some("/b"));
+        assert_eq!(moved.previous_paths, vec!["/a".to_string()]);
+
+        // Moving on again appends, oldest first.
+        let moved = store
+            .update_project(
+                p.id,
+                &ProjectPatch {
+                    local_path: Some(Some("/c".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            moved.previous_paths,
+            vec!["/a".to_string(), "/b".to_string()]
+        );
+
+        // Moving *back* takes that folder out again: the set holds previous
+        // paths only, never the current one — and the round trip must not
+        // duplicate /c either.
+        let back = store
+            .update_project(
+                p.id,
+                &ProjectPatch {
+                    local_path: Some(Some("/a".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(back.local_path.as_deref(), Some("/a"));
+        assert_eq!(
+            back.previous_paths,
+            vec!["/b".to_string(), "/c".to_string()]
+        );
+
+        // Clearing the path still remembers where it was. /a comes last
+        // because the order is when each folder became a *previous* path,
+        // and /a only became one again on this move (`added_at`, id as the
+        // tiebreak) — not when the project first lived there.
+        let cleared = store
+            .update_project(
+                p.id,
+                &ProjectPatch {
+                    local_path: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(cleared.local_path.is_none());
+        assert_eq!(
+            cleared.previous_paths,
+            vec!["/b".to_string(), "/c".to_string(), "/a".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_update_that_does_not_move_local_path_writes_no_previous_path() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("p", None, None, Some("/a"), None)
+            .unwrap();
+
+        // A patch that leaves `local_path` alone.
+        let renamed = store
+            .update_project(
+                p.id,
+                &ProjectPatch {
+                    name: Some("q".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(renamed.previous_paths.is_empty());
+
+        // A patch that sets it to the value it already has.
+        let same = store
+            .update_project(
+                p.id,
+                &ProjectPatch {
+                    local_path: Some(Some("/a".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(same.previous_paths.is_empty());
+    }
+
+    #[test]
+    fn project_paths_are_edited_by_hand_and_cascade_with_the_project() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("p", None, None, Some("/now"), None)
+            .unwrap();
+
+        let added = store.add_project_path(p.id, "/then").unwrap();
+        assert_eq!(added.previous_paths, vec!["/then".to_string()]);
+        // Idempotent: a path already held is a no-op, not a conflict.
+        assert_eq!(
+            store
+                .add_project_path(p.id, "/then")
+                .unwrap()
+                .previous_paths,
+            vec!["/then".to_string()]
+        );
+        // The current local_path is not a previous one.
+        assert!(matches!(
+            store.add_project_path(p.id, "/now"),
+            Err(Error::Validation(_))
+        ));
+        // Removing one that is not there names it rather than succeeding.
+        assert!(matches!(
+            store.remove_project_path(p.id, "/never"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(
+            store
+                .remove_project_path(p.id, "/then")
+                .unwrap()
+                .previous_paths
+                .is_empty()
+        );
+
+        // Every read path carries the history, and the delete echo carries it
+        // too — read before the cascade takes the rows.
+        store.add_project_path(p.id, "/then").unwrap();
+        assert_eq!(
+            store.get_project(p.id).unwrap().previous_paths,
+            vec!["/then".to_string()]
+        );
+        assert_eq!(
+            store.list_projects().unwrap()[0].previous_paths,
+            vec!["/then".to_string()]
+        );
+        assert_eq!(
+            store.find_project_by_name("p").unwrap().previous_paths,
+            vec!["/then".to_string()]
+        );
+        let (echo, _, _) = store.delete_project(p.id).unwrap();
+        assert_eq!(echo.previous_paths, vec!["/then".to_string()]);
+        let left: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM project_paths", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     // ---- library ----

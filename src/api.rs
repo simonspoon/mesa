@@ -8733,9 +8733,11 @@ async fn get_cc_session_detail(
 }
 
 /// Project-scoped CC Dashboard: same `CcDashboard` shape as `get_cc_dashboard`,
-/// filtered to sessions whose `cwd` matches this project's `local_path`
-/// (`cc::collect_for_project`). Mirrors `project_git_view`'s precedent of
-/// resolving the project first, so an unknown id surfaces `not_found` before
+/// filtered to sessions whose `cwd` matches this project's `local_path` or
+/// any of its `previous_paths` (`cc::collect_for_project`, task 1262 — a
+/// project whose folder moved keeps the sessions it ran before the move).
+/// Mirrors `project_git_view`'s precedent of resolving the project first,
+/// so an unknown id surfaces `not_found` before
 /// any sync/collect work — but only a 2-rung empty-state ladder is needed
 /// here (unlike the git tab's 3), since this never touches the filesystem:
 /// no `local_path`, or one that matches zero sessions, both fall out of
@@ -8748,10 +8750,14 @@ async fn get_project_cc_dashboard(
 ) -> ApiResult<Response> {
     let window = q.window.unwrap_or_else(|| "30d".to_string());
     let since = usage_window_since(&state, &window).await?;
-    let local_path = {
+    let paths = {
         let store = state.store.lock().unwrap();
-        store.get_project(id)?.local_path // unknown id -> not_found here
+        let project = store.get_project(id)?; // unknown id -> not_found here
+        let mut paths = project.previous_paths;
+        paths.extend(project.local_path);
+        paths
     };
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
     let stamp = {
         let mut store = state.store.lock().unwrap();
         crate::core::cc::sync(&mut store, false)?;
@@ -8769,13 +8775,8 @@ async fn get_project_cc_dashboard(
     let mut dash = {
         let store = state.store.lock().unwrap();
         match since {
-            Some(s) => crate::core::cc::collect_for_project_since(
-                &store,
-                &window,
-                s,
-                local_path.as_deref(),
-            )?,
-            None => crate::core::cc::collect_for_project(&store, &window, local_path.as_deref())?,
+            Some(s) => crate::core::cc::collect_for_project_since(&store, &window, s, &paths)?,
+            None => crate::core::cc::collect_for_project(&store, &window, &paths)?,
         }
     };
     dash.sessions.truncate(crate::core::cc::MAX_SESSION_ROWS);

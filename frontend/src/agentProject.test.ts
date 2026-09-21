@@ -13,6 +13,7 @@ function project(id: number, local_path: string | null): Project {
     archived: false,
     sort_order: id,
     parent_id: null,
+    previous_paths: [],
   }
 }
 

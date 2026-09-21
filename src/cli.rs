@@ -956,15 +956,21 @@ EXAMPLES
     /// Assign an item to a project: convert it into a backlog task there
     ///
     /// Routing an item to a project turns it into a BACKLOG task in that
-    /// project and removes it from the inbox. Backlog, not todo: an assigned
-    /// item lands in the review queue, not the actionable one. The task's
-    /// description is the item's body verbatim; its name — like every task's —
-    /// is that body's first line cut to 50 chars. Prints the created task.
-    /// Assigning to a project id that does not exist is a validation error; an
-    /// unknown project NAME is "not_found", from the shared name resolver.
+    /// project and ARCHIVES the item as `converted-to-task`, with
+    /// `converted_task_id` pointing at what it became — so the request stays as
+    /// the record of what was asked for, out of the live inbox. Backlog, not
+    /// todo: an assigned item lands in the review queue, not the actionable one.
+    /// The task's description is the item's body verbatim; its name — like every
+    /// task's — is that body's first line cut to 50 chars. Prints the created
+    /// task. Assigning to a project id that does not exist is a validation
+    /// error; an unknown project NAME is "not_found", from the shared name
+    /// resolver. Assigning an item that has already been converted is a
+    /// "conflict" naming the task it became; one that was merely archived may
+    /// still be assigned.
     #[command(after_help = "\
 EXAMPLES
-  mesa inbox assign 3 1        # convert item 3 into a backlog task in project 1")]
+  mesa inbox assign 3 1        # convert item 3 into a backlog task in project 1
+                               # (the item is archived as converted-to-task)")]
     Assign {
         /// Inbox item id
         id: i64,
@@ -4783,9 +4789,9 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
         InboxCmd::Show { id, quiet } => print_inbox_item(&store.get_inbox_item(id)?, quiet),
         InboxCmd::Assign { id, project, quiet } => {
             // Assigning converts the item into a BACKLOG task in the project
-            // and deletes it from the inbox; the created task is what we echo.
-            // That side effect is unchanged by --quiet, which touches stdout
-            // only.
+            // and archives the item as `converted-to-task`, pointing at it
+            // (mesa task 1269); the created task is what we echo. That side
+            // effect is unchanged by --quiet, which touches stdout only.
             let project = resolve_project(&store, &project)?;
             print_task(&store.assign_inbox_item(id, project)?, quiet);
         }
@@ -6596,6 +6602,7 @@ mod tests {
             archived_at: None,
             archive_reason: None,
             archive_outcome: None,
+            converted_task_id: None,
             kind: InboxKind::TaskSummary,
             task_id: Some(3),
             task_name: Some("the task this report is about".into()),
@@ -6928,6 +6935,11 @@ mod tests {
                 // what `inbox archive --outcome` exists to write, the same
                 // reasoning that keeps `archive_reason`.
                 "archive_outcome",
+                // Task 1269: the task this item became — an id, so bounded,
+                // and a *pointer*, which is exactly the `artifact` precedent:
+                // it is what assign now writes on the item, and a quiet echo
+                // that dropped it could not say what the request turned into.
+                "converted_task_id",
                 // Task 846: one of two fixed words, so bounded — and it is
                 // what decides who reads the item, which a quiet echo that
                 // dropped it could not show.

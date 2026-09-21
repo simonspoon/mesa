@@ -13,6 +13,8 @@ import { Markdown } from '../components/Markdown'
 import { filterInbox, INBOX_SUBNAV, type InboxFilter } from '../inboxFilter'
 import { inboxKindClass, inboxKindLabel } from '../inboxKind'
 import { nextInQueue, readAllQueue } from '../inboxQueue'
+import { inboxArchiveLine } from '../inboxArchive'
+import type { InboxItem } from '../types/InboxItem'
 import { inboxOriginLabel } from '../inboxOrigin'
 import { useLiveContext } from '../liveContext'
 import { needsMarkRead, READ_DWELL_MS } from '../inboxRead'
@@ -43,6 +45,36 @@ function TransportIcon({ children }: { children: React.ReactNode }) {
     >
       {children}
     </svg>
+  )
+}
+
+/**
+ * Why an item was set aside (mesa task 1168), how it was disposed of (mesa task
+ * 1248) and — for a converted one — the task it became (mesa task 1269): the
+ * archiver's verdict, one muted line under the meta line, only where there is
+ * one. The Archived view is where a reader asks "why is this here", and a
+ * converted item is now archived rather than deleted, so that answer is a link
+ * to the work it turned into. Which pieces there are is `inboxArchive.ts`; the
+ * outcome's four words are already readable, so they render verbatim, and the
+ * link is `#/tasks/<id>`, the route that resolves a task by id alone.
+ */
+function ArchiveMeta({ item }: { item: InboxItem }) {
+  const line = inboxArchiveLine(item)
+  if (line === null) return null
+  return (
+    <div className="muted diagram-meta">
+      archived: {line.outcome}
+      {line.outcome !== null && line.reason !== null && ' · '}
+      {line.reason}
+      {line.convertedTaskId !== null && (
+        <>
+          {(line.outcome !== null || line.reason !== null) && ' · '}
+          <a href={`#/tasks/${line.convertedTaskId}`}>
+            task {line.convertedTaskId}
+          </a>
+        </>
+      )}
+    </div>
   )
 }
 
@@ -498,9 +530,13 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
 
   // The item being read can be assigned or deleted underneath us — by this
   // person on another device, or by an agent. Playback follows the list: an
-  // item that is no longer there has no button left to stop it with, so the
+  // item that is no longer on it has no button left to stop it with, so the
   // audio must not outlive its row. A row that vanishes mid-run is treated as
-  // an item that ended, so the run moves on rather than wedging on it.
+  // an item that ended, so the run moves on rather than wedging on it. Since
+  // mesa task 1269 an assign archives the item rather than deleting it, so on
+  // New and Read the row leaves this filtered list the same way — unless it is
+  // the one being heard, which `held` keeps here until it is done, and which
+  // then ends and advances the run on its own.
   const listed =
     speakingId === null || !items || items.some((it) => it.id === speakingId)
   useEffect(() => {
@@ -557,7 +593,8 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
   }
 
   // Assigning converts the item into a backlog task in the chosen project and
-  // removes it from the inbox, so we just refetch (the item drops off the list).
+  // archives the item as converted (mesa task 1269), so we just refetch: the
+  // row leaves New and Read for Archived, where the line above links the task.
   function assign(id: number, value: string) {
     if (value === '') return
     assignInboxItem(id, Number(value)).then(refetch)
@@ -708,22 +745,7 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
                       <span className="inbox-unread"> · unread</span>
                     )}
                   </div>
-                  {/* Why it was set aside (mesa task 1168) and how it was
-                      disposed of (mesa task 1248) — the archiver's verdict,
-                      one muted line under the meta line, only where there is
-                      one: the Archived view is where a reader asks "why is
-                      this here". Either half may be absent; the outcome's four
-                      words are already readable, so they render verbatim. */}
-                  {(item.archive_reason !== null ||
-                    item.archive_outcome !== null) && (
-                    <div className="muted diagram-meta">
-                      archived: {item.archive_outcome}
-                      {item.archive_outcome !== null &&
-                        item.archive_reason !== null &&
-                        ' · '}
-                      {item.archive_reason}
-                    </div>
-                  )}
+                  <ArchiveMeta item={item} />
                   {speakError?.id === item.id && (
                     <span className="error">{speakError.message}</span>
                   )}

@@ -23,6 +23,9 @@
 #   5a3. POST /api/inbox/{id}/archive (task 845) — the archive toggle: stamped
 #      once, cleared by the other direction, independent of the read mark, and
 #      inside the Content-Type gate;
+#   5a4. PATCH /api/inbox/{id} (task 1269) — assign: the created task back, the
+#      item left ARCHIVED as `converted-to-task` with `converted_task_id`
+#      naming it rather than deleted, and a second PATCH a 409 `conflict`;
 #   5b. GET /api/inbox/{id}/speak (task 815) — the audio contract, the patched
 #      streaming WAV sizes, the audio arriving *while* it is still being
 #      rendered (task 816), the hostile body arriving as stdin data, the
@@ -863,6 +866,47 @@ raw POST "/api/inbox/$ARCH_ID/archive" -d 'archived=true'
 [ "$STATUS" = "415" ] ||
   fail "inbox archive: a form-shaped POST must be refused, got $STATUS ($BODY)"
 ok "POST /api/inbox/{id}/archive: 404 on an unknown id, and inside the Content-Type gate"
+
+# =====================================================================
+# 5a4. PATCH /api/inbox/{id} — assign (mesa task 1269)
+# =====================================================================
+#
+# Assigning converts the item into a backlog task and answers with that task,
+# not the item. Until mesa task 1269 it also DELETED the item, which made
+# `ArchiveOutcome::ConvertedToTask` a value nothing could write and destroyed the
+# request the moment it was triaged; it now archives the item with that outcome
+# and a `converted_task_id` pointer, and the claim on that pointer is what makes
+# a second assign a `conflict` rather than a second task.
+
+api 201 POST "/api/inbox" "{\"body\":\"please tint the rows\",\"kind\":\"change-request\",\"task_id\":$INBOX_TASK}"
+CONV_ID=$(jqb .id)
+api 200 PATCH "/api/inbox/$CONV_ID" "{\"project_id\":$PROJ}"
+CONV_TASK=$(jqb .id)
+[ "$(jqb .status)" = "backlog" ] || fail "inbox assign: the created task must land in the backlog"
+[ "$(jqb .project_id)" = "$PROJ" ] || fail "inbox assign: the created task's project"
+[ "$(jqb .description)" = "please tint the rows" ] ||
+  fail "inbox assign: the task's description must be the item's body verbatim"
+
+api 200 GET "/api/inbox/$CONV_ID"
+[ "$(jqb .archived_at)" != "null" ] || fail "inbox assign: the item must be archived, not deleted"
+[ "$(jqb .archive_outcome)" = "converted-to-task" ] ||
+  fail "inbox assign: archive_outcome must be converted-to-task"
+[ "$(jqb .converted_task_id)" = "$CONV_TASK" ] ||
+  fail "inbox assign: converted_task_id must name the created task"
+# Assign has no prose verdict of its own, and reading is a fact about the past.
+[ "$(jqb .archive_reason)" = "null" ] || fail "inbox assign: must write no archive_reason"
+ok "PATCH /api/inbox/{id}: returns the created task, archives the item as converted-to-task"
+
+# The claim is `converted_task_id IS NULL`, so a second assign can never make a
+# second task: 409 `conflict`, naming the task the item already became.
+api 409 PATCH "/api/inbox/$CONV_ID" "{\"project_id\":$PROJ}"
+[ "$(jqb .error.code)" = "conflict" ] || fail "inbox assign: a second PATCH must be conflict"
+jqb .error.message | grep -q "$CONV_TASK" ||
+  fail "inbox assign: the conflict must name the task it already became"
+api 200 GET "/api/inbox/$CONV_ID"
+[ "$(jqb .converted_task_id)" = "$CONV_TASK" ] ||
+  fail "inbox assign: the refused second PATCH must write nothing"
+ok "PATCH /api/inbox/{id}: a second assign is 409 conflict naming the task, writing nothing"
 
 # =====================================================================
 # 5b. GET /api/inbox/{id}/speak — reading an item aloud (mesa task 815)

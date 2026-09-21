@@ -942,12 +942,13 @@ run 0 "$MESA" inbox add --task "$TIQ" --author agent-q "$BODY"
 IQ=$(jqs .id)
 run 0 "$MESA" inbox show "$IQ"
 printf '%s' "$STDOUT" >"$TMP/ifull.json"
-# non-quiet output is unchanged: the full 14-key inbox item (task 831 added
+# non-quiet output is unchanged: the full 15-key inbox item (task 831 added
 # `read_at`, task 845 `archived_at`, task 846 `kind`, task 847 the origin
 # trio `task_id` + the derived `task_name`/`project_name`, task 1168
-# `archive_reason` and task 1248 `archive_outcome` — all bounded and
-# therefore staying in the quiet shape too)
-[ "$(jqs 'keys | join(",")')" = "archive_outcome,archive_reason,archived_at,author,body,created_at,id,kind,project_id,project_name,read_at,task_id,task_name,updated_at" ] ||
+# `archive_reason`, task 1248 `archive_outcome` and task 1269
+# `converted_task_id` — all bounded and therefore staying in the quiet shape
+# too)
+[ "$(jqs 'keys | join(",")')" = "archive_outcome,archive_reason,archived_at,author,body,converted_task_id,created_at,id,kind,project_id,project_name,read_at,task_id,task_name,updated_at" ] ||
   fail "inbox show (no --quiet): full key set must be unchanged"
 [ "$(jqs 'has("body")')" = "true" ] || fail "inbox show (no --quiet): body present"
 run 0 "$MESA" inbox show "$IQ" --quiet
@@ -978,7 +979,7 @@ inbox_quiet_parity "$TMP/ifull.json" "$TMP/iquiet.json" ||
 ok "inbox add --quiet: item minus body, values intact"
 
 # assign returns the created TASK, so its quiet shape is the compact task —
-# not an inbox projection. The side effect (item converted and removed) is
+# not an inbox projection. The side effect (item converted and archived) is
 # unchanged by the flag.
 run 0 "$MESA" inbox assign "$IQ2" "$PIQ" --quiet
 printf '%s' "$STDOUT" >"$TMP/iquiet.json"
@@ -991,9 +992,48 @@ run 0 "$MESA" task show "$IQT"
 printf '%s' "$STDOUT" >"$TMP/ifull.json"
 quiet_is_full_minus_bodies "$TMP/ifull.json" "$TMP/iquiet.json" ||
   fail "inbox assign --quiet: must be the compact task (full minus the three dropped keys)"
-run 1 "$MESA" inbox show "$IQ2"
-[ "$(jqe .error.code)" = "not_found" ] || fail "inbox assign --quiet: item must still be consumed"
-ok "inbox assign --quiet: compact task, item still converted and removed"
+ok "inbox assign --quiet: compact task, item still converted"
+
+# mesa task 1269: assign ARCHIVES the item as converted rather than deleting
+# it, so the request survives its own triage with a pointer to the task it
+# became. Until 1269 this block asserted the item was gone (`not_found`), which
+# made `converted-to-task` an `archive_outcome` nothing could ever write.
+run 0 "$MESA" inbox show "$IQ2"
+printf '%s' "$STDOUT" >"$TMP/iconv.json"
+[ "$(jqs .archived_at)" != "null" ] || fail "inbox assign: the item must be archived, not deleted"
+[ "$(jqs .archive_outcome)" = "converted-to-task" ] ||
+  fail "inbox assign: archive_outcome must be converted-to-task"
+[ "$(jqs .converted_task_id)" = "$IQT" ] ||
+  fail "inbox assign: converted_task_id must name the created task"
+# Assign writes no prose verdict, and reading is untouched.
+[ "$(jqs .archive_reason)" = "null" ] || fail "inbox assign: must write no archive_reason"
+# The item is still LISTED — `inbox list` is unscoped (the web page filters by
+# `archived_at`, and there is no archived scoping on either surface) — but it is
+# archived, which is what takes it out of the New view and the unread badge.
+run 0 "$MESA" inbox list
+[ "$(jqs "map(select(.id == $IQ2)) | length")" = "1" ] ||
+  fail "inbox assign: the archived item must still be listed"
+[ "$(jqs "map(select(.id == $IQ2))[0].archived_at")" != "null" ] ||
+  fail "inbox assign: the listed item must read as archived"
+# The pointer is bounded, so `--quiet` keeps it (the `artifact` precedent).
+run 0 "$MESA" inbox show "$IQ2" --quiet
+printf '%s' "$STDOUT" >"$TMP/iquiet.json"
+[ "$(jqs .converted_task_id)" = "$IQT" ] ||
+  fail "inbox show --quiet: converted_task_id must be kept"
+inbox_quiet_parity "$TMP/iconv.json" "$TMP/iquiet.json" ||
+  fail "inbox show --quiet: a converted item is still the full item minus body"
+ok "inbox assign: item archived as converted-to-task, pointer kept under --quiet"
+
+# The claim is `converted_task_id IS NULL`, so a second assign can never make a
+# second task: it is `conflict`, naming the task the item already became.
+run 1 "$MESA" inbox assign "$IQ2" "$PIQ"
+[ "$(jqe .error.code)" = "conflict" ] || fail "inbox assign: a second assign must be conflict"
+jqe .error.message | grep -q "$IQT" ||
+  fail "inbox assign: the conflict must name the task it already became"
+run 0 "$MESA" inbox show "$IQ2"
+[ "$(jqs .converted_task_id)" = "$IQT" ] ||
+  fail "inbox assign: the refused second assign must write nothing"
+ok "inbox assign: a second assign is conflict naming the task, writing nothing"
 
 # archive --reason (mesa task 1168): the verdict rides with the stamp — stored
 # on the archive, kept in the quiet shape (bounded, and the field the flag

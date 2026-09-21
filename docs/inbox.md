@@ -48,19 +48,44 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
   scannable without opening any of them. All three are bounded, so all three
   stay in the `--quiet` projection.
 - **Assigning an inbox item to a project converts it into a backlog task** in
-  that project and **deletes the item** — it "moves" out of the inbox onto the
-  board. **Backlog, not todo** (`Status::Backlog` in `assign_inbox_item`): an
+  that project and **archives the item as converted** (mesa task 1269,
+  migration index 70) — it "moves" out of the *live* inbox onto the board while
+  the request itself stays as the record of what was asked for. **Backlog, not
+  todo** (`Status::Backlog` in `assign_inbox_item`): an
   assigned item lands in the review queue for a person to promote, not
   straight into the actionable one.
+  The archived row carries `archived_at`, `archive_outcome:
+  converted-to-task` — until 1269 that enum value (shipped in task 1248) was
+  one nothing could write, because assign **deleted** the item — and
+  **`converted_task_id`**, a nullable pointer to the task it became. That is a
+  *separate* field from `task_id` below, which is the **origin** task the item
+  reports on: an item is about one piece of work and may become another, and
+  one column could not hold both. The FK is `ON DELETE SET NULL`, not cascade:
+  deleting the created task loses the pointer, never the archived record of the
+  request. `archive_reason` is left alone (assign has no prose verdict —
+  `inbox archive --reason` is the surface for that) and so is `read_at`.
+  It is **bounded, so it stays in the `--quiet` projection**: a pointer is
+  exactly what a quiet echo has to keep, the reasoning that keeps a task's
+  `artifact`.
+  The claim on the row is `converted_task_id IS NULL`, so assigning an item
+  that has **already been converted** is a `conflict` (exit 1 / 409) naming the
+  task it became, and can never produce a second task. An item that was merely
+  **archived and not converted** — somebody set it aside `not-actionable` and
+  then changed their mind — may still be assigned: the outcome is overwritten
+  to `converted-to-task` and the stamp refreshed.
   The new task's description is the item's body **verbatim** — every
   character it arrived with — priority **medium**, status **backlog**. Since
   task 660 a task has no title to derive: its display `name` is that body's
   first line cut to 50 chars, computed on read. (Deliberately not the same
   width as the inbox watcher's own 60-char session name, which has a different
   fallback and its own pinned test — do not merge the two.)
-  The task insert (+ its creation event) and the inbox delete are **one
-  transaction** (`assign_inbox_item` in `Store`, returns the created `Task`), so a
-  triaged item never disappears without a task to show for it. An agent never
+  The claim, the task insert (+ its creation event) and the pointer back are
+  **one transaction** (`assign_inbox_item` in `Store`, returns the created
+  `Task`), so a triaged item never loses its archive without a task to show for
+  it. The claim is **claim-then-fill**: the task id only exists after the
+  insert, so the archive is written first, guarded by `converted_task_id IS
+  NULL`, and the pointer filled in below — a second, concurrent assign blocks
+  on that write until the transaction commits and then affects 0 rows. An agent never
   auto-assigns; a person triages. Assigning to an unknown project is `validation`
   and leaves the item untouched. The item's `author` is not carried onto the task
   (tasks have no author field).
@@ -154,7 +179,9 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
   write, so it stays in the `--quiet` projection, and the Archived view shows
   it on that same muted line beside the reason.
 - No event/history table: an item *is* the record. The safety floor is the
-  delete echo + `mesa backup`; once converted, the created task is the record.
+  delete echo + `mesa backup`; once converted, the archived item and the task
+  it points at are each other's record (mesa task 1269 — before it, assigning
+  destroyed the request and only the task remained).
 - `list` returns items newest first; the `--project N`/`?project=` filter still
   exists but, since items are never assigned, only the unfiltered whole-inbox
   listing is meaningful.
@@ -165,9 +192,11 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
   says what the item is for (all three go before the text; an unknown kind is a
   usage error, exit 2, and a missing `--task` likewise). `assign
   <id> <project>` (project required) converts the item into a backlog task in that
-  project and **prints the created task**; assigning to a project id that does
-  not exist is `validation` (an unknown project *name* is `not_found`, from the
-  shared resolver). `read <id>` marks the item read (idempotent — a second
+  project, **archives the item** as `converted-to-task` with `converted_task_id`
+  pointing at it, and **prints the created task**; assigning to a project id that
+  does not exist is `validation` (an unknown project *name* is `not_found`, from
+  the shared resolver), and assigning an item that has already been converted is
+  `conflict` naming the task it became. `read <id>` marks the item read (idempotent — a second
   call echoes the item unchanged). `archive <id> [--reason <why>] [--outcome <outcome>]` sets the
   item aside and `archive <id> --undo` puts it back, clearing both the reason
   and the outcome (idempotent both ways; `--reason` or `--outcome` with
@@ -177,17 +206,20 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
   kind}`; `body` and `task_id` required, the rest optional),
   `/api/inbox/{id}` (GET show, PATCH assign, DELETE),
   `/api/inbox/{id}/read` (POST, mark read — its own route rather than a key on
-  the PATCH, which *assigns*: that one answers with the created task and leaves
-  no item behind, so the two could never share a body),
+  the PATCH, which *assigns*: that one answers with the created task rather than
+  the item, so the two could never share a body),
   `/api/inbox/{id}/archive` (POST, body `{archived: <bool>, reason?: <text>,
   outcome?: <outcome>}` — its own route for the same reason, and the direction
   rides in the body because this one toggles; both `reason` and `outcome` are
   optional, stored as `archive_reason`/`archive_outcome` on the way in and
   ignored on the way back). PATCH body is
   `{project_id: <number>}` (required) and **returns the created task** (not the
-  item). Web UI: the **Inbox** lives above Projects in the sidebar (with an
+  item); the item is left archived as `converted-to-task`, and a second PATCH of
+  the same item is a 409 `conflict` (mesa task 1269). Web UI: the **Inbox** lives above Projects in the sidebar (with an
   unread-count badge); `#/inbox` lists items, each with an "Assign to"
-  project dropdown that converts the item to a backlog task on selection, an
+  project dropdown that converts the item to a backlog task on selection (and
+  archives the item as converted, which moves it to the Archived view, where its
+  muted line links the task it became), an
   archive/put-back button beside it. The page **triages; it does not author**
   (mesa task 847): there is no compose form, because an item names the task it
   came from and a person typing into the inbox has no such task to name. Items
@@ -274,7 +306,10 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
     switches, and a run left going on Read or Archived would read on with the
     button that stops it gone. An item deleted or assigned out from under the run is
     treated as one that ended, so the run moves on rather than wedging on a
-    row that is gone.
+    row that is gone — an assign now archives the item rather than deleting it
+    (mesa task 1269), so on New the row leaves the filtered list the same way,
+    unless it is the one being heard, which stays until it is done and then ends
+    and advances the run itself.
   - There is **one `<audio>` element for the page**, mounted for its whole life
     and never re-keyed; a press sets its `src` and calls `play()` **itself**
     (mesa task 829). Both halves matter. Starting playback from inside the

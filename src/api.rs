@@ -449,10 +449,11 @@ fn inbox_session_name(item: &InboxItem) -> String {
 ///
 /// The dedup set (`AppState::inbox_dispatched`) stands in for the
 /// todo-watcher's `in_progress` claim, which has no inbox equivalent — an
-/// item has no status column. Two of the triage agent's three outcomes remove
+/// item has no status column. Two of the triage agent's three outcomes archive
 /// the item (a real request is converted into a backlog task by
-/// `assign_inbox_item`; a stale, duplicate or non-actionable one is archived
-/// with a reason), but the third leaves it **untouched** — no confident
+/// `assign_inbox_item`, which archives it as `converted-to-task`; a stale,
+/// duplicate or non-actionable one is archived with a reason), but the third
+/// leaves it **untouched** — no confident
 /// project match. Without the set, that third
 /// outcome would re-dispatch an agent for the same item every single tick,
 /// forever. Ids are claimed *before* the spawn (closing the window where a
@@ -3455,8 +3456,9 @@ async fn show_inbox(State(state): State<AppState>, Path(id): Path<i64>) -> ApiRe
     Ok(Json(store.get_inbox_item(id)?).into_response())
 }
 
-/// Assigns an item to a project by converting it into a todo task there and
-/// removing it from the inbox; returns the created task.
+/// Assigns an item to a project by converting it into a backlog task there and
+/// archiving the item as `converted-to-task`, pointing at what it became (mesa
+/// task 1269); returns the created task.
 async fn assign_inbox(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -12898,6 +12900,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             archived_at: None,
             archive_reason: None,
             archive_outcome: None,
+            converted_task_id: None,
             kind: InboxKind::ChangeRequest,
             task_id: Some(42),
             task_name: Some("make the watcher name sessions".into()),

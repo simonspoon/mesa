@@ -1586,6 +1586,17 @@ pub struct InboxItem {
     /// written only by an archive and cleared by the un-archive, so it is null
     /// exactly when `archived_at` is.
     pub archive_outcome: Option<ArchiveOutcome>,
+    /// The task this item **became** (mesa task 1269), or null for an item that
+    /// was never assigned. Assigning an item converts it into a backlog task
+    /// and archives the item with `archive_outcome: converted-to-task`; this is
+    /// the pointer to that task, so the archived request and the work it turned
+    /// into are reachable from each other. Deliberately **not** `task_id`
+    /// below, which is the *origin* task the item reports on: an item is about
+    /// one piece of work and may become another. Null again if the created task
+    /// is later deleted (the FK is `ON DELETE SET NULL`, so a deleted task
+    /// loses the pointer rather than the archived record of the request).
+    #[ts(type = "number | null")]
+    pub converted_task_id: Option<i64>,
     /// The task this item is **about** (mesa task 847) — required at creation,
     /// because every item arrives from an agent working a task and an item with
     /// no origin cannot say where it came from. Null only on a row that

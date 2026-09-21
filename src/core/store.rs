@@ -919,8 +919,10 @@ const MIGRATIONS: &[&str] = &[
     // `evidence` instead of filing a second inbox item. It lives in the db,
     // not in server memory like `inbox_dispatched`, because a retrospective's
     // memory has to survive a restart and span runs days apart.
-    // `inbox_item_id` is `ON DELETE SET NULL`: triage deletes the item it
-    // assigns, and the finding must remember it was filed regardless.
+    // `inbox_item_id` is `ON DELETE SET NULL`: the item a finding was filed as
+    // may be deleted outright, and the finding must remember it was filed
+    // regardless. (Since mesa task 1269 assigning one archives it rather than
+    // deleting it, so the pointer survives triage.)
     "CREATE TABLE retro_runs (
         id INTEGER PRIMARY KEY,
         started_at TEXT NOT NULL,
@@ -1051,6 +1053,19 @@ const MIGRATIONS: &[&str] = &[
     // every client may speak.
     "ALTER TABLE live_sessions ADD COLUMN speaker TEXT;
     ALTER TABLE live_sessions ADD COLUMN speaker_seen_at TEXT;",
+    // Task 1269: which task an inbox item became. Assigning used to DELETE the
+    // item, which made `ArchiveOutcome::ConvertedToTask` (index 66) a value
+    // nothing could ever write and lost the record of the request the moment
+    // it was triaged. Assign now archives the item with that outcome instead,
+    // and this column is the pointer to the task it became — so the archived
+    // request and the work it turned into are reachable from each other.
+    //
+    // A **separate** field from `inbox.task_id`, which is the item's *origin*
+    // task (what the item is about): an item reports on one piece of work and
+    // may become another, and overloading one column would conflate them.
+    // `ON DELETE SET NULL`, not CASCADE: deleting the created task must not
+    // destroy the archived record of the request that asked for it.
+    "ALTER TABLE inbox ADD COLUMN converted_task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1229,7 +1244,7 @@ const DIAGRAM_EVENT_COLUMNS: &str = "id, diagram_id, actor, action, summary, at"
 /// they are null exactly when `task_id` is.
 const INBOX_COLUMNS: &str = "i.id, i.project_id, i.author, i.body, i.created_at, i.updated_at, \
      i.read_at, i.archived_at, i.kind, i.task_id, t.description, p.name, i.archive_reason, \
-     i.archive_outcome";
+     i.archive_outcome, i.converted_task_id";
 
 /// Longest `archive_reason` an archive may carry (mesa task 1168): a verdict,
 /// not a report — the item's body is where the long text already is.
@@ -1265,6 +1280,7 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
         archive_reason: row.get(12)?,
         archive_outcome: outcome
             .map(|o| ArchiveOutcome::parse(&o).expect("invalid archive outcome in db")),
+        converted_task_id: row.get(14)?,
     })
 }
 
@@ -4825,17 +4841,34 @@ impl Store {
     }
 
     /// Routes an inbox item to a project by **converting it into a backlog
-    /// task** in that project and then deleting the item — it "moves" out of
-    /// the inbox onto the board, pending triage. The task's description is the
-    /// item's body **verbatim** — since task 660 a task has no title to derive,
-    /// and the board label comes from the body's first line for free
-    /// (`types::task_name`, 50 chars — deliberately not the same width as the
-    /// inbox watcher's own 60-char session name, which has its own fallback);
-    /// priority defaults to medium. Returns the created `Task`. Assigning to an
-    /// unknown project is a `validation` error, mirroring a task's `--project`.
-    /// Atomic: the task insert (with its creation event) and the inbox delete
-    /// happen in one transaction, so a triaged item never vanishes without a
-    /// task to show for it.
+    /// task** in that project and **archiving the item** as converted — it
+    /// "moves" out of the live inbox onto the board, pending triage, leaving
+    /// the request itself as the record of what was asked for. The task's
+    /// description is the item's body **verbatim** — since task 660 a task has
+    /// no title to derive, and the board label comes from the body's first line
+    /// for free (`types::task_name`, 50 chars — deliberately not the same width
+    /// as the inbox watcher's own 60-char session name, which has its own
+    /// fallback); priority defaults to medium. Returns the created `Task`.
+    /// Assigning to an unknown project is a `validation` error, mirroring a
+    /// task's `--project`.
+    ///
+    /// Until mesa task 1269 this **deleted** the item, which made
+    /// [`ArchiveOutcome::ConvertedToTask`] a value nothing could write and lost
+    /// the request the moment it was triaged. The archived row now carries
+    /// `archived_at`, `archive_outcome = converted-to-task` and
+    /// `converted_task_id` — the task it became. `archive_reason` is left alone
+    /// (assign has no prose verdict; `inbox archive --reason` is the surface for
+    /// that) and so is `read_at`, which is a fact about the past.
+    ///
+    /// An item that was **already archived but not converted** — somebody set
+    /// it aside as `not-actionable` and then changed their mind — may still be
+    /// assigned: the outcome is overwritten to `converted-to-task` and the stamp
+    /// refreshed. Only an already-**converted** item is a `conflict`, naming the
+    /// task it already became.
+    ///
+    /// Atomic: the claim, the task insert (with its creation event) and the
+    /// pointer back are one transaction, so a triaged item never loses its
+    /// archive without a task to show for it.
     pub fn assign_inbox_item(&mut self, id: i64, project_id: i64) -> Result<Task> {
         let item = self.get_inbox_item(id)?;
         let project_exists: bool = self.conn.query_row(
@@ -4847,13 +4880,38 @@ impl Store {
             return Err(Error::Validation(format!("project {project_id} not found")));
         }
         let tx = self.conn.transaction()?;
-        // Claim the item by deleting it FIRST, inside the transaction: if a
-        // concurrent assign already converted it, this affects 0 rows and we
-        // bail before creating a (duplicate) task. The body was read above and
-        // is immutable, so reading it outside the tx is safe.
-        let claimed = tx.execute("DELETE FROM inbox WHERE id = ?1", [id])?;
+        // Claim-then-fill, in that order and inside one transaction: the task
+        // id only exists after the insert, so the archive is written FIRST as
+        // the claim and `converted_task_id` filled in below. The claim is a
+        // *write* guarded by `converted_task_id IS NULL`, which is what makes
+        // it airtight — a second, concurrent assign blocks here on the write
+        // lock until this transaction commits, then sees the pointer set and
+        // affects 0 rows, so it can never create a duplicate task. (Claiming on
+        // `archived_at IS NULL` instead would refuse an item somebody archived
+        // as `not-actionable` and then changed their mind about.) The body was
+        // read above and is immutable, so reading it outside the tx is safe.
+        let claimed = tx.execute(
+            "UPDATE inbox SET archived_at = datetime('now'), archive_outcome = ?2, \
+                    updated_at = datetime('now') \
+             WHERE id = ?1 AND converted_task_id IS NULL",
+            (id, ArchiveOutcome::ConvertedToTask.as_str()),
+        )?;
         if claimed == 0 {
-            return Err(Error::NotFound(format!("inbox item {id} not found")));
+            // Two different reasons for 0 rows, and the caller needs to tell
+            // them apart: no such row at all, or one already converted.
+            let already: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT converted_task_id FROM inbox WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            return match already {
+                Some(Some(task_id)) => Err(Error::Conflict(format!(
+                    "inbox item {id} has already been converted to task {task_id}"
+                ))),
+                _ => Err(Error::NotFound(format!("inbox item {id} not found"))),
+            };
         }
         tx.execute(
             "INSERT INTO tasks \
@@ -4877,6 +4935,12 @@ impl Store {
             "INSERT INTO task_events (task_id, from_status, to_status, at) \
              VALUES (?1, NULL, ?2, datetime('now'))",
             (task_id, initial_status),
+        )?;
+        // The second half of the claim: the pointer back to what the item
+        // became, now that there is an id to point at.
+        tx.execute(
+            "UPDATE inbox SET converted_task_id = ?2 WHERE id = ?1",
+            (id, task_id),
         )?;
         tx.commit()?;
         self.get_task(task_id)
@@ -11825,12 +11889,24 @@ mod tests {
         assert_eq!(task.description, "ship the auth fix\nmore detail here");
         assert_eq!(task.name, "ship the auth fix");
 
-        // The item has moved out of the inbox entirely.
-        assert!(matches!(
-            store.get_inbox_item(item.id),
-            Err(Error::NotFound(_))
-        ));
-        assert!(store.list_inbox_items(None).unwrap().is_empty());
+        // The item is out of the LIVE inbox but not destroyed (mesa task
+        // 1269): it is archived as converted, pointing at what it became.
+        let archived = store.get_inbox_item(item.id).unwrap();
+        assert!(archived.archived_at.is_some());
+        assert_eq!(
+            archived.archive_outcome,
+            Some(ArchiveOutcome::ConvertedToTask)
+        );
+        assert_eq!(archived.converted_task_id, Some(task.id));
+        // Assign writes no prose verdict, and reading is untouched.
+        assert_eq!(archived.archive_reason, None);
+        assert_eq!(archived.read_at, None);
+        // `list_inbox_items` is unscoped (the page filters by `archived_at`),
+        // so the row is still listed — and archived, which is what takes it out
+        // of the New view and the unread badge.
+        let listed = store.list_inbox_items(None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].archived_at.is_some());
 
         // A single-line item: body and name coincide, no duplication to avoid.
         let single = store
@@ -11839,6 +11915,78 @@ mod tests {
         let t2 = store.assign_inbox_item(single.id, p.id).unwrap();
         assert_eq!(t2.description, "quick note");
         assert_eq!(t2.name, "quick note");
+    }
+
+    /// The claim is `converted_task_id IS NULL`, so assigning an item twice is
+    /// a `conflict` naming the task it already became — never a second task
+    /// (mesa task 1269).
+    #[test]
+    fn assigning_a_converted_inbox_item_again_is_a_conflict() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let origin = origin_task(&mut store);
+        let item = store
+            .create_inbox_item(None, "convert me once", InboxKind::ChangeRequest, origin)
+            .unwrap();
+
+        let task = store.assign_inbox_item(item.id, p.id).unwrap();
+        let err = store.assign_inbox_item(item.id, p.id).unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)));
+        assert!(err.to_string().contains(&task.id.to_string()));
+        // And nothing was written: one task, one pointer, unchanged.
+        let after = store.get_inbox_item(item.id).unwrap();
+        assert_eq!(after.converted_task_id, Some(task.id));
+        assert_eq!(store.list_tasks(None).unwrap().len(), 2);
+    }
+
+    /// An item somebody archived as `not-actionable` and then changed their
+    /// mind about may still be assigned: only an already-*converted* item is a
+    /// conflict (mesa task 1269).
+    #[test]
+    fn an_archived_but_unconverted_inbox_item_may_still_be_assigned() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let origin = origin_task(&mut store);
+        let item = store
+            .create_inbox_item(None, "second thoughts", InboxKind::ChangeRequest, origin)
+            .unwrap();
+        store
+            .set_inbox_item_archived(
+                item.id,
+                true,
+                Some("not worth doing"),
+                Some(ArchiveOutcome::NotActionable),
+            )
+            .unwrap();
+
+        let task = store.assign_inbox_item(item.id, p.id).unwrap();
+        let after = store.get_inbox_item(item.id).unwrap();
+        assert_eq!(after.converted_task_id, Some(task.id));
+        // The outcome is overwritten; the prose verdict somebody wrote is not
+        // assign's to touch.
+        assert_eq!(after.archive_outcome, Some(ArchiveOutcome::ConvertedToTask));
+        assert_eq!(after.archive_reason.as_deref(), Some("not worth doing"));
+    }
+
+    /// `converted_task_id` is `ON DELETE SET NULL`: deleting the created task
+    /// loses the pointer, never the archived record of the request (mesa task
+    /// 1269).
+    #[test]
+    fn deleting_the_converted_task_leaves_the_archived_inbox_item() {
+        let (mut store, _dir) = temp_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let origin = origin_task(&mut store);
+        let item = store
+            .create_inbox_item(None, "outlives its task", InboxKind::ChangeRequest, origin)
+            .unwrap();
+        let task = store.assign_inbox_item(item.id, p.id).unwrap();
+
+        store.delete_task(task.id).unwrap();
+        let after = store.get_inbox_item(item.id).unwrap();
+        assert_eq!(after.converted_task_id, None);
+        assert_eq!(after.body, "outlives its task");
+        assert!(after.archived_at.is_some());
+        assert_eq!(after.archive_outcome, Some(ArchiveOutcome::ConvertedToTask));
     }
 
     #[test]
@@ -13345,15 +13493,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            70,
-            "a fresh db should report user_version 70"
+            71,
+            "a fresh db should report user_version 71"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 70);
+        assert_eq!(version, 71);
     }
 
     // ---- the session retrospective (mesa task 1158) ----
@@ -13657,8 +13805,8 @@ mod tests {
         assert_eq!(linked.inbox_item_id, Some(item.id));
         assert_eq!(linked.count, 1, "linking bumps nothing");
         assert_eq!(store.retro_status(72).unwrap().linked, 1);
-        // Triage deletes the item it assigns; the finding keeps its memory
-        // and only drops the pointer (ON DELETE SET NULL).
+        // The item may be deleted outright; the finding keeps its memory and
+        // only drops the pointer (ON DELETE SET NULL).
         store.delete_inbox_item(item.id).unwrap();
         assert_eq!(
             store.get_retro_finding(finding.id).unwrap().inbox_item_id,

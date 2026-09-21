@@ -126,10 +126,11 @@ re-file the same suggestions as new and the count that makes a finding worth
 acting on would never accumulate. `retro_runs` is persisted for the same
 reason: the cadence is three days, and a restart must not reset it.
 
-`inbox_item_id` is `ON DELETE SET NULL`. Triage *deletes* the item it assigns
-(`assign_inbox_item` converts it into a task), and the finding must keep its
-memory — count, evidence, the fact it was filed — when that happens; only the
-pointer goes. `mesa retro status` reports both counts (`findings`, `linked`).
+`inbox_item_id` is `ON DELETE SET NULL`. The item a finding was filed as may be
+*deleted* outright by triage, and the finding must keep its memory — count,
+evidence, the fact it was filed — when that happens; only the pointer goes.
+(Since mesa task 1269 `assign_inbox_item` archives the item rather than deleting
+it, so triage's convert-to-task outcome no longer drops the pointer at all.) `mesa retro status` reports both counts (`findings`, `linked`).
 
 ## How one tick works
 

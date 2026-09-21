@@ -1,6 +1,6 @@
-# inaros-codesearch
+# codesearch
 
-Registers one tool, `codesearch` (`mcp__inaros-codesearch__codesearch`), that
+Registers one tool, `codesearch` (`mcp__codesearch__codesearch`), that
 drives the `helios` CLI over the current repo's index so structural questions
 go to an AST index instead of grep.
 
@@ -22,7 +22,7 @@ mistaken call says so instead of silently answering a different question.
 
 ## Running it
 
-    claude --plugin-dir <mesa>/plugins/inaros-codesearch
+    claude --plugin-dir <mesa>/plugins/codesearch
 
 Requires `helios` on PATH and an index in the repo (`helios init` once).
 
@@ -44,20 +44,20 @@ module; `claude plugin validate .` shows what the engine reads from it.
 ## Installed copy
 
 `claude plugin marketplace add <mesa>` + `claude plugin install
-inaros-codesearch@mesa` makes it always-on at user scope. Install
-copies the tree into `~/.claude/plugins/cache/mesa/inaros-codesearch/<version>`,
+codesearch@mesa` makes it always-on at user scope. Install
+copies the tree into `~/.claude/plugins/cache/mesa/codesearch/<version>`,
 keyed by that version, so **edits here do not reach an installed session**: bump
-`version` in the manifest and re-run `claude plugin update inaros-codesearch`,
+`version` in the manifest and re-run `claude plugin update codesearch`,
 or develop against `--plugin-dir`, which reads this folder live and reloads on
 save.
 
 ## Developing locally
 
 Symlinking this folder into `~/.claude/skills/` loads it as
-`inaros-codesearch@skills-dir` straight from the working tree, so an edit to
+`codesearch@skills-dir` straight from the working tree, so an edit to
 `hooks/codesearch.ts` reaches the next session with no `version` bump and no
 `--plugin-dir` flag — unlike the installed copy above. An installed plugin of
 the same name takes precedence and keeps the symlinked copy unloaded, so
 uninstall it first.
 
-    ln -s <mesa>/plugins/inaros-codesearch ~/.claude/skills/inaros-codesearch
+    ln -s <mesa>/plugins/codesearch ~/.claude/skills/codesearch

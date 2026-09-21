@@ -7,8 +7,8 @@
   },
   "plugins": [
     {
-      "name": "inaros-codesearch",
-      "source": "./plugins/inaros-codesearch",
+      "name": "codesearch",
+      "source": "./plugins/codesearch",
       "description": "Structural code search for agents: registers the `codesearch` tool, which drives the helios index (symbols, deps, flow, summary, files, diff, status) instead of grepping."
     }
   ]

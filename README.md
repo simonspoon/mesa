@@ -447,18 +447,18 @@ start locations in the global Agents sidebar.
 
   ```bash
   claude plugin marketplace add /path/to/mesa
-  claude plugin install inaros-codesearch@mesa
+  claude plugin install codesearch@mesa
   ```
 
-  There is one so far — `inaros-codesearch`, which registers a `codesearch`
+  There is one so far — `codesearch`, which registers a `codesearch`
   tool that drives the external `helios` index (symbols, deps, flow) instead of
   grepping. Installing copies the plugin into `~/.claude/plugins/cache` keyed by
   its version, so an edit here reaches a session only after a `version` bump in
   its `.claude-plugin/plugin.json` and a `claude plugin update`; to develop
   against the working tree instead, run `claude --plugin-dir
-  plugins/inaros-codesearch`, which reads the folder live. Symlinking the
+  plugins/codesearch`, which reads the folder live. Symlinking the
   plugin folder into `~/.claude/skills/` does the same thing always-on —
-  Claude Code loads it as `inaros-codesearch@skills-dir` from the working
+  Claude Code loads it as `codesearch@skills-dir` from the working
   tree, so an edit needs no version bump — but an installed plugin of the same
   name takes precedence, and disabling it does not free the name, so uninstall
   it first.

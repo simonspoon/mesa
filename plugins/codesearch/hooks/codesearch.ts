@@ -112,7 +112,7 @@ export const register: Register = (on) => {
 
   on('session.start', ($, e, next) => $.tool.register(tool).then(() => next(e)))
 
-  on('tool.call', { tool: 'mcp__inaros-codesearch__codesearch' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__codesearch__codesearch' }, async ($, e) => {
     const input = e as Record<string, unknown>
     const operation = input.operation as Op
     const spec = OPS[operation]

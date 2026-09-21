@@ -50,3 +50,14 @@ keyed by that version, so **edits here do not reach an installed session**: bump
 `version` in the manifest and re-run `claude plugin update inaros-codesearch`,
 or develop against `--plugin-dir`, which reads this folder live and reloads on
 save.
+
+## Developing locally
+
+Symlinking this folder into `~/.claude/skills/` loads it as
+`inaros-codesearch@skills-dir` straight from the working tree, so an edit to
+`hooks/codesearch.ts` reaches the next session with no `version` bump and no
+`--plugin-dir` flag — unlike the installed copy above. An installed plugin of
+the same name takes precedence and keeps the symlinked copy unloaded, so
+uninstall it first.
+
+    ln -s <mesa>/plugins/inaros-codesearch ~/.claude/skills/inaros-codesearch

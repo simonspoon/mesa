@@ -4,6 +4,12 @@ Registers one tool, `codesearch` (`mcp__codesearch__codesearch`), that
 drives the `helios` CLI over the current repo's index so structural questions
 go to an AST index instead of grep.
 
+**Not loaded by default.** Nothing registers this plugin: agents never reached
+for the tool it offers, and `helios` is promoted through the bash tools table
+in the global CLAUDE.md instead. Load it for one session when you want it:
+
+    claude --plugin-dir <mesa>/plugins
+
 | operation | helios | arguments |
 | --- | --- | --- |
 | `symbols` | `helios symbols` | grep, kind, file, scope, visibility, param, returns, body, limit, offset |
@@ -56,8 +62,10 @@ save.
 Symlinking this folder into `~/.claude/skills/` loads it as
 `codesearch@skills-dir` straight from the working tree, so an edit to
 `hooks/codesearch.ts` reaches the next session with no `version` bump and no
-`--plugin-dir` flag — unlike the installed copy above. An installed plugin of
-the same name takes precedence and keeps the symlinked copy unloaded, so
-uninstall it first.
+`--plugin-dir` flag — unlike the installed copy above. That makes it always-on
+in every session, which is why no such symlink is in place; prefer
+`--plugin-dir` above unless you are editing the plugin itself. An installed
+plugin of the same name takes precedence and keeps the symlinked copy
+unloaded, so uninstall it first.
 
     ln -s <mesa>/plugins/codesearch ~/.claude/skills/codesearch

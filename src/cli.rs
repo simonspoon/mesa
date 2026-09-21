@@ -6682,6 +6682,7 @@ mod tests {
             action: Some(LiveAction::Navigate),
             target: Some("#/projects/2".into()),
             notice: None,
+            agent_id: Some("agent_abc".into()),
             created_at: "2026-01-01 00:00:00".into(),
             delivered_at: Some("2026-01-01 00:00:01".into()),
             played_at: Some("2026-01-01 00:00:02".into()),
@@ -7175,6 +7176,10 @@ mod tests {
                 // and what tells mesa's own report about the agent from a
                 // turn the agent said. Kept.
                 "notice",
+                // The Claude Code session that produced the turn (mesa task
+                // 1252): a bounded id or null, and what locates a handoff in
+                // the sequence. Kept.
+                "agent_id",
                 "created_at",
                 // Both bounded (a timestamp or null), and both are fields a
                 // command exists to write: `live listen` stamps `delivered_at`

@@ -22,6 +22,7 @@ function turn(id: number, patch: Partial<LiveTurn> = {}): LiveTurn {
     action: null,
     target: null,
     notice: null,
+    agent_id: null,
     created_at: '2026-01-01 00:00:00',
     delivered_at: null,
     played_at: null,

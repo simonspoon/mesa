@@ -1009,6 +1009,16 @@ const MIGRATIONS: &[&str] = &[
     // is. A column rather than a second table: it is one bounded value on the
     // row it describes.
     "ALTER TABLE inbox ADD COLUMN archive_outcome TEXT;",
+    // Task 1252: which Claude Code session produced each turn, stamped from
+    // the session's own `agent_id` at insert. A handoff (task 1150) was
+    // visible only as `live_sessions.lease` climbing, which says one happened
+    // but not where in the conversation — `predecessor_agent_id` is transient
+    // by design, taken and cleared by the successor's first listen, so
+    // nothing in the turn sequence located the seam. Stamped on the row, the
+    // seam is simply where two consecutive turns disagree. Nullable, and
+    // legitimately null for a whole session: a spawn that printed no receipt
+    // never binds an agent at all.
+    "ALTER TABLE live_turns ADD COLUMN agent_id TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1241,7 +1251,7 @@ pub struct LiveRest {
 }
 
 const LIVE_TURN_COLUMNS: &str = "id, session_id, role, text, action, target, \
-     created_at, delivered_at, played_at, notice";
+     created_at, delivered_at, played_at, notice, agent_id";
 
 /// Longest route mesa will store or navigate to. A route is a hash path the
 /// page already knows how to render, not free text, so the bound is generous
@@ -1343,6 +1353,7 @@ fn row_to_live_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveTurn> {
         action: action.map(|a| LiveAction::parse(&a).expect("invalid live turn action in db")),
         target: row.get(5)?,
         notice: notice.map(|n| LiveNotice::parse(&n).expect("invalid live turn notice in db")),
+        agent_id: row.get(10)?,
         created_at: row.get(6)?,
         delivered_at: row.get(7)?,
         played_at: row.get(8)?,
@@ -5295,14 +5306,15 @@ impl Store {
             (None, None) => None,
         };
         self.conn.execute(
-            "INSERT INTO live_turns (session_id, role, text, action, target, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            "INSERT INTO live_turns (session_id, role, text, action, target, agent_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
             (
                 session_id,
                 role.as_str(),
                 text,
                 action.map(|a| a.as_str()),
                 target.as_deref(),
+                session.agent_id.as_deref(),
             ),
         )?;
         let id = self.conn.last_insert_rowid();
@@ -5385,13 +5397,14 @@ impl Store {
             return Ok((turn, false));
         }
         self.conn.execute(
-            "INSERT INTO live_turns (session_id, role, text, notice, created_at) \
-             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            "INSERT INTO live_turns (session_id, role, text, notice, agent_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
             (
                 session_id,
                 LiveRole::Mesa.as_str(),
                 live::notice_text(kind),
                 kind.as_str(),
+                session.agent_id.as_deref(),
             ),
         )?;
         let id = self.conn.last_insert_rowid();
@@ -12147,6 +12160,44 @@ mod tests {
         assert_eq!(store.take_live_predecessor(session.id).unwrap(), None);
     }
 
+    /// The turn sequence locates the handoff (mesa task 1252): each turn is
+    /// stamped with whichever agent was bound when it was written, so the
+    /// seam is simply where two consecutive turns disagree — the lease says
+    /// one happened, and `predecessor_agent_id` is gone by then. A turn
+    /// written before any agent is bound carries none, which is a legitimate
+    /// state for a whole session rather than a missing value.
+    #[test]
+    fn a_live_turn_is_stamped_with_the_agent_that_produced_it() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+
+        let unbound = store
+            .add_live_turn(session.id, LiveRole::User, "before any spawn", None, None)
+            .unwrap();
+        assert_eq!(unbound.agent_id, None);
+
+        store.bind_live_agent(session.id, Some("first")).unwrap();
+        let before = store
+            .add_live_turn(session.id, LiveRole::User, "under the first", None, None)
+            .unwrap();
+        assert_eq!(before.agent_id.as_deref(), Some("first"));
+
+        store
+            .hand_off_live_session(session.id, Some("second"), None)
+            .unwrap();
+        let after = store
+            .add_live_turn(session.id, LiveRole::Mesa, "under the second", None, None)
+            .unwrap();
+        assert_eq!(after.agent_id.as_deref(), Some("second"));
+
+        let turns = store.list_live_turns(session.id, None, 50).unwrap();
+        let stamps: Vec<Option<&str>> = turns.iter().map(|t| t.agent_id.as_deref()).collect();
+        assert_eq!(stamps, vec![None, Some("first"), Some("second")]);
+        // The handoff sits between the two turns whose stamps differ.
+        assert_eq!(turns[1].id, before.id);
+        assert_eq!(turns[2].id, after.id);
+    }
+
     /// A handoff carrying a dream receipt (mesa task 1155) rests the session
     /// in the same write that binds the successor; a plain handoff rests
     /// nothing; the wake answers the receipt exactly once; ending clears a
@@ -12985,15 +13036,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            67,
-            "a fresh db should report user_version 67"
+            68,
+            "a fresh db should report user_version 68"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 67);
+        assert_eq!(version, 68);
     }
 
     // ---- the session retrospective (mesa task 1158) ----

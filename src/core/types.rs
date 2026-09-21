@@ -3861,6 +3861,14 @@ pub struct LiveTurn {
     /// something the agent said. Spoken and shown like any mesa turn, labelled
     /// as a notice in the transcript, and never indexed into the archive.
     pub notice: Option<LiveNotice>,
+    /// The Claude Code session that produced this turn, stamped from the live
+    /// session's own `agent_id` at insert (mesa task 1252). Null when no
+    /// agent was ever bound — a spawn that printed no receipt leaves it
+    /// unset for the session's whole life. It is what locates a **handoff**
+    /// in the transcript: the seam is where two consecutive turns disagree on
+    /// it, since `predecessor_agent_id` is cleared by the successor's first
+    /// listen and the lease says only that one happened, not where.
+    pub agent_id: Option<String>,
     /// When the turn was recorded (SQLite `datetime` text, UTC).
     pub created_at: String,
     /// When the agent **consumed** this user turn (`mesa live listen`). Stamped

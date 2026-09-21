@@ -3337,7 +3337,7 @@ NP=$(jqs .id)
 ok "live notice permission: a mesa turn with the fixed sentence, no action, notice=permission"
 
 run 0 "$MESA" live notice --quiet permission
-[ "$(jq -c 'keys' <<<"$STDOUT")" = '["action","created_at","delivered_at","id","notice","played_at","role","session_id","target"]' ] ||
+[ "$(jq -c 'keys' <<<"$STDOUT")" = '["action","agent_id","created_at","delivered_at","id","notice","played_at","role","session_id","target"]' ] ||
   fail "notice --quiet: key set (got $(jq -c keys <<<"$STDOUT"))"
 [ "$(jqs .notice)" = "permission" ] || fail "notice --quiet keeps notice"
 [ "$(jqs .id)" = "$NP" ] || fail "dedupe: a second permission notice in one span must answer the existing id"

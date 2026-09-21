@@ -36,10 +36,13 @@ export interface DraftState {
 /**
  * True when this tab is holding work that is not on disk.
  *
- * `editing` is part of the test, not an optimization: cancelling an edit leaves
- * the abandoned draft in place (that is what lets a re-open of the same tab
- * still show it), and a cancelled edit is not unsaved work the user is about to
- * lose — they already said to drop it.
+ * `editing` is part of the test, not an optimization: both ways out of edit
+ * mode drop it, and that alone is what makes the tab read clean — a draft left
+ * behind by one of them is not unsaved work the user is about to lose, they
+ * already said to leave. Which way out it was is not observable afterwards:
+ * `FilesView`'s `startEdit` is the only writer of `editing: true` and it
+ * re-reads the file on every entry, so the next edit starts from disk whatever
+ * the last one left in `draft`.
  *
  * A missing entry is a file nobody has opened the editor on, which is clean.
  */

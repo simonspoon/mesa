@@ -28,6 +28,7 @@ import {
 import {
   closeLabel,
   dirtyPaths,
+  isDirty,
   needsCloseConfirm,
   tabLabel,
 } from '../fileDirty'
@@ -501,6 +502,12 @@ function ContentPane({
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
+  /** Which way out of edit mode is waiting on the unsaved-changes prompt, if
+   *  either: `discard` throws the edits away, `keep` only leaves the editor.
+   *  Named rather than a boolean because the bar has to say which it is. */
+  const [pendingLeave, setPendingLeave] = useState<'discard' | 'keep' | null>(
+    null,
+  )
   // The caret the status bar reports (task 809). Local, and not in
   // `FileUiState`: it describes where one live textarea's cursor is, so it dies
   // with the mounted editor exactly as `saving` does. A freshly opened editor
@@ -1013,12 +1020,33 @@ function ContentPane({
     })
   }
 
-  function cancelEdit() {
+  /**
+   * Leaves edit mode for the read view (mesa task 1271).
+   *
+   * Either way `editing` drops, and that is what makes the tab read clean
+   * (`fileDirty.ts`). `discard` is the difference between the two controls
+   * that reach it: Cancel additionally puts `draft` back to `baseline`, so the
+   * work is thrown away at the point the user decides to throw it away rather
+   * than incidentally later. It is not observable *after* the fact — `startEdit`
+   * is the only writer of `editing: true` and it re-reads the file every time,
+   * so the next edit starts from disk whichever button was pressed — which is
+   * exactly why the discard is written here and not left to that re-read.
+   */
+  function leaveEdit(discard: boolean) {
+    setPendingLeave(null)
     setSaveError(null)
     // The crossing back is the same one, in the other direction: the viewer
     // searches the bytes on disk, the draft was LF-normalised.
     carryFind(data!.content)
-    onUi({ editing: false })
+    onUi(discard ? { editing: false, draft: ui.baseline } : { editing: false })
+  }
+
+  /** Both controls' click: a dirty buffer is worth interrupting for, a clean
+   *  one is not — with nothing to lose the prompt would only be a keystroke
+   *  between the user and the view they asked for. */
+  function requestLeave(action: 'discard' | 'keep') {
+    if (isDirty(ui)) setPendingLeave(action)
+    else leaveEdit(action === 'discard')
   }
 
   async function save() {
@@ -1036,7 +1064,7 @@ function ContentPane({
       // the caret, the scroll and the find bar, and on a markdown file lands
       // the user in rendered prose instead of the source they were editing. The
       // Save button shares the binding's meaning rather than the other way
-      // round; Cancel is how edit mode is left.
+      // round; End editing is how edit mode is left.
       onUi({ baseline: draft })
       refetch()
     } catch (e) {
@@ -1086,9 +1114,14 @@ function ContentPane({
       // stepping matches deliberately leaves the caret in the code, so the
       // editor is where Escape usually lands while a find is running. With the
       // bar up it therefore closes the bar; only once it is gone does the key
-      // discard the edit. The other order would let one keystroke throw away a
-      // whole draft as the answer to "I'm done searching".
-      onCancel={findOpen ? closeFind : cancelEdit}
+      // leave the editor. The other order would let one keystroke end a whole
+      // edit as the answer to "I'm done searching".
+      //
+      // It is End editing and not Cancel (mesa task 1271) for the same reason:
+      // a key that a reader may well press by reflex must not be the one that
+      // throws the draft away — and keeping the draft is exactly what this
+      // binding already did. A dirty buffer still raises the prompt first.
+      onCancel={findOpen ? closeFind : () => requestLeave('keep')}
       onSave={save}
       wrap={wrap}
       onCaret={setCaret}
@@ -1192,12 +1225,33 @@ function ContentPane({
               <button onClick={save} disabled={saving}>
                 {saving ? 'Saving…' : 'Save'}
               </button>
-              <button onClick={cancelEdit} disabled={saving}>
-                Cancel
+              {/* Only while there is something to throw away (mesa task 1271).
+               * Over a clean buffer Cancel and End editing would do the same
+               * thing, and two buttons for one outcome is how a person picks
+               * the destructive one by accident. A successful save cleans the
+               * buffer, so the button withdraws itself. */}
+              {isDirty(ui) && (
+                <button onClick={() => requestLeave('discard')} disabled={saving}>
+                  Cancel
+                </button>
+              )}
+              <button onClick={() => requestLeave('keep')} disabled={saving}>
+                End editing
               </button>
             </span>
           )}
         </p>
+        {/* Under the header rather than over the file, for the reason the
+            close prompt is under the tab strip: pushing the content down is
+            what makes it impossible to miss. */}
+        {pendingLeave !== null && (
+          <LeaveEditConfirmBar
+            path={data.path}
+            discard={pendingLeave === 'discard'}
+            onConfirm={() => leaveEdit(pendingLeave === 'discard')}
+            onCancel={() => setPendingLeave(null)}
+          />
+        )}
         {findOpen && (
           <FindBar
             query={find.query}
@@ -2691,6 +2745,57 @@ function CloseConfirmBar({
       </button>
       {/* Autofocused so the keyboard route in (Alt+W) has a keyboard route
           back out, and so Enter answers the safe way. */}
+      <button autoFocus onClick={onCancel}>
+        keep editing
+      </button>
+    </div>
+  )
+}
+
+/**
+ * The prompt a dirty buffer puts between the user and either way out of edit
+ * mode (mesa task 1271).
+ *
+ * `CloseConfirmBar`'s shape and classes for the reason given there — mesa's
+ * confirmations are inline and non-modal, never `window.confirm` — but its own
+ * component, because the two ways out do not cost the same thing and a bar
+ * that said "discard" for both would be lying about one of them. Cancel throws
+ * the edits away then and there and gets the red button; End editing only
+ * leaves the editor and gets an ordinary one. What the two share is the fact
+ * worth interrupting for: the file on disk does not have these edits.
+ */
+function LeaveEditConfirmBar({
+  path,
+  discard,
+  onConfirm,
+  onCancel,
+}: {
+  path: string
+  discard: boolean
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  return (
+    <div
+      className="files-close-confirm confirm-delete"
+      role="alert"
+      // Escape resolves the safe way, and is stopped all the same — the editor
+      // underneath answers the key by leaving edit mode, which is the thing
+      // this bar exists to ask about. (`CloseConfirmBar` says the same.)
+      onKeyDown={(e) => {
+        if (e.key !== 'Escape') return
+        e.preventDefault()
+        e.stopPropagation()
+        onCancel()
+      }}
+    >
+      <span className="confirm-message">
+        {basename(path)} has unsaved changes.
+      </span>
+      <button className={discard ? 'danger' : undefined} onClick={onConfirm}>
+        {discard ? 'discard edits' : 'leave without saving'}
+      </button>
+      {/* Autofocused so Enter answers the safe way, as it does one pane over. */}
       <button autoFocus onClick={onCancel}>
         keep editing
       </button>

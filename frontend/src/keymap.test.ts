@@ -192,6 +192,24 @@ describe('matchesShortcut', () => {
     input.remove()
   })
 
+  it('lets a bare function key through from inside a text field', () => {
+    // mesa task 1268: the listen shortcut rebound to F5 mutes the microphone
+    // and hands focus back to the live capture box, so every press after the
+    // first is a bare key inside a textarea. A function key types nothing, so
+    // `shouldIgnoreShortcut` no longer stands it down there.
+    const box = document.createElement('textarea')
+    document.body.appendChild(box)
+    const keymap = resolveKeymap({
+      actions: [
+        { action: 'live-listen', value: ['F5'], default: DEFAULT_KEYMAP['live-listen'] },
+      ],
+    })
+    expect(keymap['live-listen']).toEqual(['F5'])
+    expect(matchesShortcut('live-listen', dispatch('F5', {}, box), keymap)).toBe(true)
+    expect(matchesShortcut('live-listen', dispatch('F5'), keymap)).toBe(true)
+    box.remove()
+  })
+
   it('leaves a modifier chord claimed from inside a text field', () => {
     const input = document.createElement('input')
     document.body.appendChild(input)
@@ -211,6 +229,16 @@ describe('matchesShortcut', () => {
         DEFAULT_KEYMAP,
       ),
     ).toBe(true)
+    const box = document.createElement('textarea')
+    document.body.appendChild(box)
+    expect(
+      matchesShortcut(
+        'live-listen',
+        dispatch('L', { meta: true, shift: true }, box),
+        DEFAULT_KEYMAP,
+      ),
+    ).toBe(true)
+    box.remove()
     input.remove()
   })
 })

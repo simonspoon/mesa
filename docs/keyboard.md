@@ -138,7 +138,11 @@ Returns `true` (suppress) for, in order:
    their existing owners, e.g. the command palette.
 2. `e.target.closest(...)` matches a text input, `textarea`,
    `contenteditable`, or a native `select` — typing and native select
-   option-cycling/type-ahead win.
+   option-cycling/type-ahead win. A **function key (F1–F24) is exempt from
+   this rule alone** (mesa task 1268): it produces no text, so the reason for
+   standing a bare shortcut down inside a field does not apply, and a shortcut
+   rebound to one fires wherever the caret sits — a bare letter is suppressed
+   there exactly as before.
 3. `e.target.closest('.xterm, .agent-terminal')` — xterm panes read real
    `keydown` events.
 4. A diagram canvas is mounted anywhere on the page (`.diagram`) — it

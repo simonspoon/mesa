@@ -56,6 +56,30 @@ describe('shouldIgnoreShortcut', () => {
     expect(ignores(mount(html))).toBe(true)
   })
 
+  // A function key produces no text, so the reason rule 2 suppresses a bare
+  // key inside a field does not apply to it (mesa task 1268). Only that
+  // family: a letter is still typed into the box.
+  it('does not ignore a function key inside a text field', () => {
+    expect(ignores(mount('<textarea id="t"></textarea>'), { key: 'F5' })).toBe(
+      false,
+    )
+    expect(ignores(mount('<input id="t">'), { key: 'F12' })).toBe(false)
+  })
+
+  it('still ignores a bare letter inside a text field', () => {
+    expect(ignores(mount('<textarea id="t"></textarea>'), { key: 'l' })).toBe(
+      true,
+    )
+  })
+
+  it('ignores a function key in an xterm pane — it reads real keydowns', () => {
+    expect(
+      ignores(mount('<div class="xterm"><span id="t"></span></div>'), {
+        key: 'F5',
+      }),
+    ).toBe(true)
+  })
+
   it('does not ignore a contenteditable="false" subtree', () => {
     expect(ignores(mount('<div id="t" contenteditable="false"></div>'))).toBe(
       false,

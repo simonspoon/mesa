@@ -5,6 +5,15 @@
 // *chord* shortcut that steals a browser binding checks its own sibling
 // below, for the reason set out there.
 
+/** A function key, F1 through F24. Rule 2 below suppresses a bare shortcut
+ *  because the key would otherwise be *typed into* the focused field; a
+ *  function key produces no text, so that reason does not apply to it and a
+ *  shortcut rebound to one fires wherever the caret sits (mesa task 1268 — a
+ *  live-listen rebound to F5 worked once, then never again, because muting
+ *  hands focus back to the capture box). Only this family: Escape, the arrows,
+ *  Enter, Tab and Space all have in-field meaning. */
+const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/
+
 /**
  * True when a global single-key shortcut must ignore this keystroke.
  *
@@ -14,6 +23,8 @@
  *    duplicate-frame, etc).
  * 2. The event target is inside a text input, textarea, contenteditable, or
  *    native <select> — typing and native select option-cycling/type-ahead.
+ *    A function key is the one exception, for the reason `FUNCTION_KEY`
+ *    above gives.
  * 3. The event target is inside an xterm terminal pane (`.xterm` or
  *    `.agent-terminal`).
  * 4. A diagram canvas is mounted anywhere on the page (`.diagram`) —
@@ -27,6 +38,7 @@ export function shouldIgnoreShortcut(e: KeyboardEvent): boolean {
   const target = e.target instanceof Element ? e.target : null
 
   if (
+    !FUNCTION_KEY.test(e.key) &&
     target?.closest(
       'input, textarea, select, [contenteditable=""], [contenteditable="true"]',
     )

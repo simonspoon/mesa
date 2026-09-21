@@ -93,33 +93,42 @@ ok "fixtures: project A, task $TASK_A"
 # ---- the finding log: record, dedup bump, a second fingerprint ----
 
 run 0 "$MESA" retro finding record --fingerprint swe/denial --subject swe --kind denial \
-  --summary "swe keeps asking to run git push" --evidence "session abc: 3 denials"
+  --summary "swe keeps asking to run git push" --evidence "session abc: 3 denials" \
+  --session-id sess-1
 [ "$(jqs .new)" = "true" ] || fail "first record must be new: $STDOUT"
 F1=$(jqs .finding.id)
 [ "$(jqs .finding.count)" = "1" ] || fail "a new finding has count 1: $STDOUT"
 [ "$(jqs .finding.evidence)" = "session abc: 3 denials" ] || fail "evidence is the line given: $STDOUT"
 [ "$(jqs .finding.inbox_item_id)" = "null" ] || fail "a new finding is unlinked: $STDOUT"
+[ "$(jqs '.finding.session_ids | join(",")')" = "sess-1" ] ||
+  fail "the recorded session id rides back: $STDOUT"
 FULL_KEYS=$(keys "$(jqs .finding)")
-[ "$FULL_KEYS" = "count,evidence,fingerprint,first_seen_at,id,inbox_item_id,kind,last_seen_at,subject,summary" ] ||
+[ "$FULL_KEYS" = "count,evidence,fingerprint,first_seen_at,id,inbox_item_id,kind,last_seen_at,session_ids,subject,summary" ] ||
   fail "finding key set: $FULL_KEYS"
 ok "finding record: a new fingerprint is {new: true, finding: {count 1, evidence as given, unlinked}}"
 
 run 0 "$MESA" retro finding record --fingerprint swe/denial --subject swe --kind denial \
-  --summary "a different summary" --evidence "session def: 2 denials"
+  --summary "a different summary" --evidence "session def: 2 denials" --session-id sess-2
 [ "$(jqs .new)" = "false" ] || fail "the repeat must answer new: false: $STDOUT"
 [ "$(jqs .finding.id)" = "$F1" ] || fail "the repeat is the same row: $STDOUT"
 [ "$(jqs .finding.count)" = "2" ] || fail "the repeat bumps count to 2: $STDOUT"
 [ "$(jqs .finding.summary)" = "swe keeps asking to run git push" ] || fail "the summary stays as first recorded: $STDOUT"
 [ "$(jqs .finding.evidence)" = "$(printf 'session abc: 3 denials\nsession def: 2 denials')" ] ||
   fail "evidence is appended, newest last: $STDOUT"
-ok "finding record of a known fingerprint: new false, count 2, evidence appended, summary kept"
+# The acceptance of mesa task 1255: a second session is KEPT beside the first,
+# which is the whole reason the ids are a sibling table and not a column.
+[ "$(jqs '.finding.session_ids | join(",")')" = "sess-1,sess-2" ] ||
+  fail "a repeat from another session keeps both ids: $STDOUT"
+ok "finding record of a known fingerprint: new false, count 2, evidence appended, summary kept, both session ids"
 
 run 0 "$MESA" retro finding record --fingerprint khora/timeout --subject khora --kind timeout \
   --summary "khora find hangs on a slow page"
 [ "$(jqs .new)" = "true" ] || fail "a different fingerprint is new: $STDOUT"
 F2=$(jqs .finding.id)
 [ "$(jqs .finding.evidence)" = "null" ] || fail "no --evidence is null, not empty: $STDOUT"
-ok "a second fingerprint is a new finding"
+[ "$(jqs '.finding.session_ids | length')" = "0" ] ||
+  fail "no --session-id is an empty set, not a null: $STDOUT"
+ok "a second fingerprint is a new finding, recorded without a session id"
 
 # ---- --quiet: record/link/show drop summary + evidence; list rejects it ----
 
@@ -128,13 +137,17 @@ ok "a second fingerprint is a new finding"
 # is a real newest-seen order rather than the id tiebreak.
 sleep 1
 run 0 "$MESA" retro finding record --quiet --fingerprint swe/denial --subject swe --kind denial \
-  --summary x --evidence "session ghi: 1 denial"
+  --summary x --evidence "session ghi: 1 denial" --session-id sess-1
 [ "$(jqs .new)" = "false" ] || fail "quiet record keeps the composite's keys: $STDOUT"
 [ "$(jqs .finding.count)" = "3" ] || fail "quiet changes stdout only: $STDOUT"
-[ "$(keys "$(jqs .finding)")" = "count,fingerprint,first_seen_at,id,inbox_item_id,kind,last_seen_at,subject" ] ||
+[ "$(jqs '.finding.session_ids | join(",")')" = "sess-1,sess-2" ] ||
+  fail "a repeat from a known session is idempotent: $STDOUT"
+# session_ids is a bounded set of pointers — the point of recording one — so
+# --quiet KEEPS it.
+[ "$(keys "$(jqs .finding)")" = "count,fingerprint,first_seen_at,id,inbox_item_id,kind,last_seen_at,session_ids,subject" ] ||
   fail "quiet finding key set: $(keys "$(jqs .finding)")"
 run 0 "$MESA" retro finding show "$F1" --quiet
-[ "$(keys "$STDOUT")" = "count,fingerprint,first_seen_at,id,inbox_item_id,kind,last_seen_at,subject" ] ||
+[ "$(keys "$STDOUT")" = "count,fingerprint,first_seen_at,id,inbox_item_id,kind,last_seen_at,session_ids,subject" ] ||
   fail "quiet show key set: $(keys "$STDOUT")"
 run 0 "$MESA" retro finding show "$F1"
 [ "$(keys "$STDOUT")" = "$FULL_KEYS" ] || fail "default show is the full record: $(keys "$STDOUT")"
@@ -143,13 +156,15 @@ run 0 "$MESA" retro finding get "$F1"
 [ "$(jqs .id)" = "$F1" ] || fail "get is an alias for show"
 run 2 "$MESA" retro finding list --quiet
 [ -z "$STDOUT" ] || fail "a usage error prints nothing on stdout"
-ok "--quiet drops summary and evidence on record/show and is a usage error (exit 2) on list"
+ok "--quiet drops summary and evidence (keeping session_ids) on record/show and is a usage error (exit 2) on list"
 
 # ---- list: newest-seen first, bare array, --limit ----
 
 run 0 "$MESA" retro finding list
 [ "$(jqs 'map(.id) | join(",")')" = "$F1,$F2" ] || fail "list is most recently seen first: $STDOUT"
 [ "$(jqs 'map(has("summary")) | all')" = "true" ] || fail "list carries the full rows: $STDOUT"
+[ "$(jqs '.[0].session_ids | join(",")')" = "sess-1,sess-2" ] ||
+  fail "list derives the session ids too: $STDOUT"
 run 0 "$MESA" retro finding list --limit 1
 [ "$(jqs 'length')" = "1" ] || fail "--limit bounds the list: $STDOUT"
 [ "$(jqs '.[0].id')" = "$F1" ] || fail "--limit keeps the newest-seen: $STDOUT"
@@ -161,9 +176,10 @@ run 0 "$MESA" inbox add --task "$TASK_A" --author retro --kind change-request "s
 ITEM=$(jqs .id)
 run 0 "$MESA" retro finding link --id "$F1" --inbox-item "$ITEM"
 [ "$(jqs .inbox_item_id)" = "$ITEM" ] || fail "link sets inbox_item_id: $STDOUT"
+[ "$(jqs '.session_ids | join(",")')" = "sess-1,sess-2" ] || fail "link derives the ids too: $STDOUT"
 [ "$(jqs .count)" = "3" ] || fail "link bumps nothing: $STDOUT"
 run 0 "$MESA" retro finding link --id "$F1" --inbox-item "$ITEM" --quiet
-[ "$(keys "$STDOUT")" = "count,fingerprint,first_seen_at,id,inbox_item_id,kind,last_seen_at,subject" ] ||
+[ "$(keys "$STDOUT")" = "count,fingerprint,first_seen_at,id,inbox_item_id,kind,last_seen_at,session_ids,subject" ] ||
   fail "quiet link key set: $(keys "$STDOUT")"
 run 1 "$MESA" retro finding link --id 9999 --inbox-item "$ITEM"
 [ "$(jqe .error.code)" = "not_found" ] || fail "linking an unknown finding is not_found: $STDERR"
@@ -199,6 +215,8 @@ check_validation "long subject" --fingerprint f --subject "$LONG_KEY" --kind k -
 check_validation "long kind" --fingerprint f --subject s --kind "$LONG_KEY" --summary sum
 check_validation "long summary" --fingerprint f --subject s --kind k --summary "$LONG_SUMMARY"
 check_validation "long evidence" --fingerprint f --subject s --kind k --summary sum --evidence "$LONG_EVIDENCE"
+check_validation "blank session id" --fingerprint f --subject s --kind k --summary sum --session-id "  "
+check_validation "long session id" --fingerprint f --subject s --kind k --summary sum --session-id "$LONG_KEY"
 run 0 "$MESA" retro finding list
 [ "$(jqs 'length')" = "2" ] || fail "a rejected record writes nothing: $STDOUT"
 run 2 "$MESA" retro finding record --fingerprint f --subject s --kind k

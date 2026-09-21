@@ -34,4 +34,11 @@ command_prefixes: Array<string>,
  * classifier verdict names no tool of its own, so for those this is
  * entirely the call row's.
  */
-tools: Array<string>, count: number, };
+tools: Array<string>, 
+/**
+ * The distinct sessions that contributed to this row, sorted and capped
+ * (`core::cc::ERROR_SESSION_LIMIT`) — where to go and read the failure,
+ * which the counts alone never say. The counts count every session
+ * regardless.
+ */
+sessions: Array<string>, count: number, };

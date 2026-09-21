@@ -1226,9 +1226,10 @@ MESA_CC_PROJECTS_DIR="$TMP/etree" MESA_DB="$TMP/errors.db" \
   "$BIN" cc errors --window all | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
-for k in ["generated_at_unix","window","since","total","by_tool","by_command","by_message","denials"]:
+for k in ["generated_at_unix","window","since","session","total","by_tool","by_command","by_message","denials"]:
     assert k in d, f"missing key {k}"
 assert d["window"]=="all" and d["since"] is None, d
+assert d["session"] is None, "an unfiltered view echoes no session"
 # Five failures: the `ls` that SUCCEEDED is not one, and neither is the
 # `toolUseResult` object/string on either line — `content[].is_error` is the
 # only signal read.
@@ -1286,11 +1287,64 @@ assert cls["command_prefixes"]==["rm"], cls
 hook_same=den[("hook",CLS)]
 assert hook_same["count"]==1 and hook_same["command_prefixes"]==["chmod"], hook_same
 assert [x["count"] for x in d["denials"]]==sorted((x["count"] for x in d["denials"]),reverse=True), d["denials"]
+# Every row names the sessions it came from (mesa task 1255), deduped: this
+# tree is one session, subagent included, so each list is exactly ["e"].
+for group in ["by_tool","by_command","by_message","denials"]:
+    for x in d[group]:
+        assert x["sessions"]==["e"], (group,x)
 # A classifier refusal is in `denials` AND in `by_message` — two projections
 # of the same errors, exactly as a Bash failure is in by_tool and by_command.
 assert by_msg.get("Permission for this action was denied by the Claude Code auto mode classifier. Reason: "+CLS)==(2,0,2), d["by_message"]
 print("cc errors ok")
 ' || fail "cc errors shape/counts"
+
+# ---- cc errors --session: the same rows, narrowed to one session ----
+#
+# Its own tree again: the counts above are pinned to that one, and this needs
+# two sessions failing the same way to show both the `sessions` list and the
+# filter.
+mkdir -p "$TMP/stree/-two-sessions"
+cat > "$TMP/stree/-two-sessions/one.jsonl" <<'JSONL'
+{"type":"assistant","uuid":"s1a","sessionId":"sx","timestamp":"2026-06-15T03:00:00.000Z","cwd":"/home/me/two","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"su_1","name":"Bash","input":{"command":"sed -n p missing"}},{"type":"tool_use","id":"su_2","name":"Bash","input":{"command":"sed -n p gone"}}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"user","uuid":"s1b","sessionId":"sx","timestamp":"2026-06-15T03:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"su_1","is_error":true,"content":"sed: no such file"}]}}
+{"type":"user","uuid":"s1c","sessionId":"sx","timestamp":"2026-06-15T03:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"su_2","is_error":true,"content":"sed: no such file"}]}}
+JSONL
+cat > "$TMP/stree/-two-sessions/two.jsonl" <<'JSONL'
+{"type":"assistant","uuid":"s2a","sessionId":"sy","timestamp":"2026-06-15T03:10:00.000Z","cwd":"/home/me/two","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"su_3","name":"Bash","input":{"command":"sed -n p absent"}}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"user","uuid":"s2b","sessionId":"sy","timestamp":"2026-06-15T03:10:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"su_3","is_error":true,"content":"sed: no such file"}]}}
+JSONL
+
+MESA_CC_PROJECTS_DIR="$TMP/stree" MESA_DB="$TMP/sessions.db"   "$BIN" cc errors --window all | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["session"] is None, d
+assert d["total"]["errors"]==3, d["total"]
+# One row per grouping, naming both sessions — sorted and deduped, `sx`
+# having contributed twice.
+assert [x["sessions"] for x in d["by_tool"]]==[["sx","sy"]], d["by_tool"]
+assert [x["sessions"] for x in d["by_command"]]==[["sx","sy"]], d["by_command"]
+assert [x["sessions"] for x in d["by_message"]]==[["sx","sy"]], d["by_message"]
+print("cc errors: sessions named ok")
+' || fail "cc errors did not name its sessions"
+
+MESA_CC_PROJECTS_DIR="$TMP/stree" MESA_DB="$TMP/sessions.db"   "$BIN" cc errors --window all --session sx | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["session"]=="sx", "the filter is echoed back: %r" % d["session"]
+assert d["total"]=={"errors":2,"sidechain":0,"top_level":2,"denials":0}, d["total"]
+assert [x["sessions"] for x in d["by_command"]]==[["sx"]], d["by_command"]
+assert d["by_command"][0]["errors"]==2, d["by_command"]
+print("cc errors --session ok")
+' || fail "cc errors --session did not narrow the view"
+
+# An unknown session is a zero state, not an error.
+MESA_CC_PROJECTS_DIR="$TMP/stree" MESA_DB="$TMP/sessions.db"   "$BIN" cc errors --window all --session nope | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d["session"]=="nope" and d["total"]["errors"]==0, d
+assert d["by_tool"]==[] and d["denials"]==[], d
+print("cc errors --session <unknown> is a zero state ok")
+' || fail "cc errors --session with an unknown id was not a zero state"
 
 # The window is the ordinary one, and an empty one is a zero-state, not an error.
 MESA_CC_PROJECTS_DIR="$TMP/etree" MESA_DB="$TMP/errors.db" \

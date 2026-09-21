@@ -1019,6 +1019,20 @@ const MIGRATIONS: &[&str] = &[
     // legitimately null for a whole session: a spawn that printed no receipt
     // never binds an agent at all.
     "ALTER TABLE live_turns ADD COLUMN agent_id TEXT;",
+    // Task 1255: which Claude Code sessions a retro finding was seen in.
+    // Findings upsert on `fingerprint`, so one row spans every run that has
+    // reported that friction — a single `session_id` column would keep only
+    // the last one, and the whole value of the pointer is that a repeat names
+    // a *second* session to go and read. A sibling table instead, one row per
+    // (finding, session), written `INSERT OR IGNORE` on both the new-finding
+    // and the bump path, and derived back onto `RetroFinding::session_ids` on
+    // every read — never stored on the finding's own row.
+    "CREATE TABLE retro_finding_sessions (
+        finding_id    INTEGER NOT NULL REFERENCES retro_findings(id) ON DELETE CASCADE,
+        session_id    TEXT    NOT NULL,
+        first_seen_at TEXT    NOT NULL,
+        PRIMARY KEY (finding_id, session_id)
+    );",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1470,6 +1484,9 @@ pub const RETRO_CLAIM_GRACE_MINUTES: u32 = 10;
 const RETRO_FINDING_COLUMNS: &str = "id, fingerprint, subject, kind, summary, count, evidence, \
                                      first_seen_at, last_seen_at, inbox_item_id";
 
+/// Builds a finding with an **empty** `session_ids` — the sibling rows are a
+/// second query, so every caller fills it in (`Store::attach_finding_sessions`)
+/// before handing the finding out.
 fn row_to_retro_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetroFinding> {
     Ok(RetroFinding {
         id: row.get(0)?,
@@ -1482,6 +1499,7 @@ fn row_to_retro_finding(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetroFindin
         first_seen_at: row.get(7)?,
         last_seen_at: row.get(8)?,
         inbox_item_id: row.get(9)?,
+        session_ids: Vec::new(),
     })
 }
 
@@ -2682,6 +2700,10 @@ pub struct CcToolErrorRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CcToolErrorRecord {
     pub tool_use_id: String,
+    /// The Claude Code session the failure happened in (mesa task 1255) —
+    /// stored on the row since the table was written, and what lets
+    /// `mesa cc errors` both filter and attribute.
+    pub session_id: String,
     pub sidechain: bool,
     pub denial_kind: Option<String>,
     pub denial_tool: Option<String>,
@@ -5711,10 +5733,16 @@ impl Store {
         kind: &str,
         summary: &str,
         evidence: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<(RetroFinding, bool)> {
         let fingerprint = Self::validate_retro_key("fingerprint", fingerprint)?;
         let subject = Self::validate_retro_key("subject", subject)?;
         let kind = Self::validate_retro_key("kind", kind)?;
+        // Validated with the other keys, before anything is written: a bad
+        // session id must not leave a finding behind either.
+        let session_id = session_id
+            .map(|s| Self::validate_retro_key("session id", s))
+            .transpose()?;
         let summary = summary.trim();
         if summary.is_empty() {
             return Err(Error::Validation(
@@ -5760,7 +5788,57 @@ impl Store {
                 *id
             }
         };
+        // On both paths, so re-recording a known fingerprint from a second
+        // session keeps both ids; `OR IGNORE` makes a repeat from the same
+        // one idempotent.
+        if let Some(session_id) = session_id {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO retro_finding_sessions \
+                 (finding_id, session_id, first_seen_at) \
+                 VALUES (?1, ?2, datetime('now'))",
+                (id, session_id),
+            )?;
+        }
         Ok((self.get_retro_finding(id)?, existing.is_none()))
+    }
+
+    /// The sessions one finding was observed in, ascending —
+    /// `RetroFinding::session_ids`, derived on every read.
+    fn finding_sessions(&self, finding_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id FROM retro_finding_sessions \
+             WHERE finding_id = ?1 ORDER BY session_id",
+        )?;
+        let rows = stmt.query_map([finding_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// [`Store::finding_sessions`] for a whole page of findings in one query,
+    /// so `list_retro_findings` is not an N+1 over a list of up to
+    /// [`RETRO_FINDINGS_LIST_MAX`].
+    fn attach_finding_sessions(&self, findings: &mut [RetroFinding]) -> Result<()> {
+        if findings.is_empty() {
+            return Ok(());
+        }
+        let ids = findings
+            .iter()
+            .map(|f| f.id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT finding_id, session_id FROM retro_finding_sessions \
+             WHERE finding_id IN ({ids}) ORDER BY session_id"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut by_finding: HashMap<i64, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (finding_id, session_id) = row?;
+            by_finding.entry(finding_id).or_default().push(session_id);
+        }
+        for finding in findings {
+            finding.session_ids = by_finding.remove(&finding.id).unwrap_or_default();
+        }
+        Ok(())
     }
 
     fn validate_retro_key<'a>(label: &str, value: &'a str) -> Result<&'a str> {
@@ -5795,7 +5873,8 @@ impl Store {
     }
 
     pub fn get_retro_finding(&self, id: i64) -> Result<RetroFinding> {
-        self.conn
+        let mut finding = self
+            .conn
             .query_row(
                 &format!("SELECT {RETRO_FINDING_COLUMNS} FROM retro_findings WHERE id = ?1"),
                 [id],
@@ -5806,7 +5885,9 @@ impl Store {
                     Error::NotFound(format!("retro finding {id} not found"))
                 }
                 e => Error::Db(e),
-            })
+            })?;
+        finding.session_ids = self.finding_sessions(id)?;
+        Ok(finding)
     }
 
     /// The finding log, most recently seen first. `limit` is clamped into
@@ -5818,7 +5899,9 @@ impl Store {
              ORDER BY last_seen_at DESC, id DESC LIMIT ?1"
         ))?;
         let rows = stmt.query_map([limit], row_to_retro_finding)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut findings = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        self.attach_finding_sessions(&mut findings)?;
+        Ok(findings)
     }
 
     // ---- live memory: the notebook and the archive (mesa task 1147) ----
@@ -7586,25 +7669,34 @@ impl Store {
     /// ingested still counts, it is just unattributed — the two rows are
     /// written from two different transcript lines that a byte-cursor batch
     /// boundary may fall between.
-    pub fn cc_read_tool_errors(&self, cutoff: Option<i64>) -> Result<Vec<CcToolErrorRecord>> {
+    ///
+    /// `session` (mesa task 1255) narrows the population to one session,
+    /// applied in SQL so `idx_cc_tool_errors_session` does the work; `None`
+    /// is every session, byte-identical to before.
+    pub fn cc_read_tool_errors(
+        &self,
+        cutoff: Option<i64>,
+        session: Option<&str>,
+    ) -> Result<Vec<CcToolErrorRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT e.tool_use_id, e.sidechain, e.denial_kind, e.denial_tool, \
+            "SELECT e.tool_use_id, e.session_id, e.sidechain, e.denial_kind, e.denial_tool, \
                     e.denial_command, e.denial_reason, e.signature, c.name, c.target \
              FROM cc_tool_errors e \
              LEFT JOIN cc_tool_calls c ON c.tool_use_id = e.tool_use_id \
-             WHERE ?1 IS NULL OR e.ts >= ?1",
+             WHERE (?1 IS NULL OR e.ts >= ?1) AND (?2 IS NULL OR e.session_id = ?2)",
         )?;
-        let rows = stmt.query_map([cutoff], |r| {
+        let rows = stmt.query_map(rusqlite::params![cutoff, session], |r| {
             Ok(CcToolErrorRecord {
                 tool_use_id: r.get(0)?,
-                sidechain: r.get::<_, i64>(1)? != 0,
-                denial_kind: r.get(2)?,
-                denial_tool: r.get(3)?,
-                denial_command: r.get(4)?,
-                denial_reason: r.get(5)?,
-                signature: r.get(6)?,
-                name: r.get(7)?,
-                target: r.get(8)?,
+                session_id: r.get(1)?,
+                sidechain: r.get::<_, i64>(2)? != 0,
+                denial_kind: r.get(3)?,
+                denial_tool: r.get(4)?,
+                denial_command: r.get(5)?,
+                denial_reason: r.get(6)?,
+                signature: r.get(7)?,
+                name: r.get(8)?,
+                target: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -13036,15 +13128,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            68,
-            "a fresh db should report user_version 68"
+            69,
+            "a fresh db should report user_version 69"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 68);
+        assert_eq!(version, 69);
     }
 
     // ---- the session retrospective (mesa task 1158) ----
@@ -13182,6 +13274,7 @@ mod tests {
                 "denial",
                 "swe keeps asking to run git push",
                 Some("session abc: 3 denials"),
+                None,
             )
             .unwrap();
         assert!(is_new);
@@ -13199,6 +13292,7 @@ mod tests {
                 "denial",
                 "a different summary",
                 Some("session def: 2 denials"),
+                None,
             )
             .unwrap();
         assert!(!is_new);
@@ -13213,14 +13307,21 @@ mod tests {
 
         // A report with no evidence bumps the count and leaves the field.
         let (third, _) = store
-            .record_retro_finding("swe/denial", "swe", "denial", "x", None)
+            .record_retro_finding("swe/denial", "swe", "denial", "x", None, None)
             .unwrap();
         assert_eq!(third.count, 3);
         assert_eq!(third.evidence, again.evidence);
 
         // A different fingerprint is a new row; the list is newest-seen first.
         let (other, is_new) = store
-            .record_retro_finding("khora/timeout", "khora", "timeout", "khora hangs", None)
+            .record_retro_finding(
+                "khora/timeout",
+                "khora",
+                "timeout",
+                "khora hangs",
+                None,
+                None,
+            )
             .unwrap();
         assert!(is_new);
         assert_eq!(other.evidence, None);
@@ -13284,21 +13385,21 @@ mod tests {
             ("long kind", ("f", "s", long_key.as_str(), "sum", None)),
         ] {
             let err = store
-                .record_retro_finding(args.0, args.1, args.2, args.3, args.4)
+                .record_retro_finding(args.0, args.1, args.2, args.3, args.4, None)
                 .unwrap_err();
             assert!(matches!(err, Error::Validation(_)), "{label}: {err}");
         }
         let long_summary = "s".repeat(RETRO_SUMMARY_MAX + 1);
         assert!(matches!(
             store
-                .record_retro_finding("f", "s", "k", &long_summary, None)
+                .record_retro_finding("f", "s", "k", &long_summary, None, None)
                 .unwrap_err(),
             Error::Validation(_)
         ));
         let long_evidence = "e".repeat(RETRO_EVIDENCE_LINE_MAX + 1);
         assert!(matches!(
             store
-                .record_retro_finding("f", "s", "k", "sum", Some(&long_evidence))
+                .record_retro_finding("f", "s", "k", "sum", Some(&long_evidence), None)
                 .unwrap_err(),
             Error::Validation(_)
         ));
@@ -13308,7 +13409,7 @@ mod tests {
         );
 
         let (finding, _) = store
-            .record_retro_finding("f", "s", "k", "sum", None)
+            .record_retro_finding("f", "s", "k", "sum", None, None)
             .unwrap();
         assert!(matches!(
             store.link_retro_finding(finding.id + 1, 1).unwrap_err(),
@@ -13350,6 +13451,117 @@ mod tests {
             store.get_retro_finding(finding.id + 1).unwrap_err(),
             Error::NotFound(_)
         ));
+    }
+
+    /// The acceptance of mesa task 1255: a fingerprint spans runs, so the
+    /// sessions it was seen in are a **set** on a sibling table, not a column
+    /// the next report overwrites.
+    #[test]
+    fn a_findings_session_ids_accumulate_across_reports_of_one_fingerprint() {
+        let (mut store, _dir) = temp_store();
+        let (first, is_new) = store
+            .record_retro_finding(
+                "swe/denial",
+                "swe",
+                "denial",
+                "sum",
+                None,
+                Some("  sess-b "),
+            )
+            .unwrap();
+        assert!(is_new);
+        assert_eq!(first.session_ids, vec!["sess-b".to_string()], "trimmed");
+
+        // The same fingerprint from a second session keeps BOTH — the whole
+        // reason this is not one column.
+        let (again, is_new) = store
+            .record_retro_finding("swe/denial", "swe", "denial", "sum", None, Some("sess-a"))
+            .unwrap();
+        assert!(!is_new);
+        assert_eq!(again.id, first.id);
+        assert_eq!(
+            again.session_ids,
+            vec!["sess-a".to_string(), "sess-b".to_string()],
+            "ascending, and the earlier session is not lost"
+        );
+
+        // A repeat from a session already recorded is idempotent, and a
+        // report with no session at all leaves the set alone.
+        let (again, _) = store
+            .record_retro_finding("swe/denial", "swe", "denial", "sum", None, Some("sess-a"))
+            .unwrap();
+        assert_eq!(again.session_ids.len(), 2);
+        let (again, _) = store
+            .record_retro_finding("swe/denial", "swe", "denial", "sum", None, None)
+            .unwrap();
+        assert_eq!(again.session_ids.len(), 2);
+        assert_eq!(again.count, 4, "every report still bumps the count");
+
+        // A finding nobody attributed carries an empty set, never a null.
+        let (other, _) = store
+            .record_retro_finding("khora/timeout", "khora", "timeout", "sum", None, None)
+            .unwrap();
+        assert!(other.session_ids.is_empty());
+
+        // Every read path derives them: show, list and link alike.
+        assert_eq!(
+            store.get_retro_finding(first.id).unwrap().session_ids.len(),
+            2
+        );
+        let listed = store.list_retro_findings(50).unwrap();
+        let ids: HashMap<i64, Vec<String>> =
+            listed.into_iter().map(|f| (f.id, f.session_ids)).collect();
+        assert_eq!(
+            ids.get(&first.id).map(Vec::len),
+            Some(2),
+            "list is not an N+1 but still carries the sessions"
+        );
+        assert_eq!(ids.get(&other.id).map(Vec::len), Some(0));
+
+        let project = store.create_project("p", None, None, None, None).unwrap();
+        let task = store
+            .create_task(
+                project.id,
+                "t",
+                Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let item = store
+            .create_inbox_item(Some("retro"), "friction", InboxKind::ChangeRequest, task.id)
+            .unwrap();
+        assert_eq!(
+            store
+                .link_retro_finding(first.id, item.id)
+                .unwrap()
+                .session_ids
+                .len(),
+            2
+        );
+    }
+
+    /// A session id is validated with the other keys, so a blank one refuses
+    /// the whole report rather than filing a finding with nothing attached.
+    #[test]
+    fn a_blank_session_id_is_validation_writing_no_finding() {
+        let (mut store, _dir) = temp_store();
+        let long = "s".repeat(RETRO_KEY_MAX + 1);
+        for bad in ["", "   ", long.as_str()] {
+            assert!(matches!(
+                store
+                    .record_retro_finding("f", "s", "k", "sum", None, Some(bad))
+                    .unwrap_err(),
+                Error::Validation(_)
+            ));
+        }
+        assert!(
+            store.list_retro_findings(10).unwrap().is_empty(),
+            "a rejected session id writes no finding either"
+        );
     }
 
     /// Pins the dream-pass migration (mesa task 1152) at index 57: the

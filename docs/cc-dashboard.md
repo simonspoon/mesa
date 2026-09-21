@@ -194,12 +194,28 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   denials in seven rows** — 83 + 3 + 1 from the classifier, 3 + 1 + 1 + 1 from
   hooks.
 
+  Every row also names **which sessions** it came from (mesa task 1255):
+  `by_tool`, `by_command`, `by_message` and `denials` each carry a `sessions`
+  list — the distinct `cc_tool_errors.session_id`s that contributed to that
+  row, sorted and capped at `ERROR_SESSION_LIMIT` the way
+  `command_prefixes` is, the counts still counting every session regardless.
+  A count says a thing keeps failing; the session id is where to go and read
+  it (`mesa cc session <id>`, `mesa cc text`), which is what the
+  retrospective's attribution step needs and what the view used to make a
+  reader guess at. The column has been on the table since it shipped; it was
+  simply never selected.
+
+  `--session <id>` narrows the whole view to one session — applied in SQL so
+  `idx_cc_tool_errors_session` does the work, echoed back as the response's
+  `session` (null when unfiltered), and an unknown id is a zero state rather
+  than an error, exactly as an empty window is.
+
   Like every derived `cc_*` column, this only exists for lines ingested since
   the table shipped: `mesa cc sync --rebuild` clears the cursors and backfills
   the history in one re-walk. There is deliberately **no HTTP route and no web
-  view** — it is a CLI verb, `mesa cc errors [--window …]`, taking the same
-  windows `cc summary` does (subscription windows included) and rejecting
-  `--quiet` like every other `cc` subcommand.
+  view** — it is a CLI verb, `mesa cc errors [--window …] [--session <id>]`,
+  taking the same windows `cc summary` does (subscription windows included)
+  and rejecting `--quiet` like every other `cc` subcommand.
 - **One API response is several transcript lines, and usage is counted once per
   response.** Claude Code writes a single assistant response as a *line per
   content-block group* — typically a `thinking` line, then the

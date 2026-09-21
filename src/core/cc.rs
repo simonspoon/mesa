@@ -585,6 +585,22 @@ fn denial_kind_from(name: &str) -> CcDenialKind {
 /// listing more commands says nothing, and the `count` still counts them all.
 const DENIAL_PREFIX_LIMIT: usize = 8;
 
+/// How many distinct sessions one error row reports (mesa task 1255).
+///
+/// [`DENIAL_PREFIX_LIMIT`]'s job on the same terms: the list is there so a
+/// reader can go and open one of them, and a row seen in more sessions than
+/// this is a recurring class whose `errors` count already says so.
+const ERROR_SESSION_LIMIT: usize = 8;
+
+/// Records one row's session against a group, deduped by the set and bounded
+/// by [`ERROR_SESSION_LIMIT`] — the cap the denial accumulator applies to its
+/// own collected-alongside sets.
+fn note_session(sessions: &mut BTreeSet<String>, session_id: &str) {
+    if sessions.len() < ERROR_SESSION_LIMIT {
+        sessions.insert(session_id.to_string());
+    }
+}
+
 /// Shell words that are a family of commands rather than a command, so the
 /// second word is what says what actually ran. `git push` and `git status`
 /// fail for unrelated reasons; grouping both under `git` says nothing.
@@ -975,43 +991,58 @@ struct RawIteration {
 /// Db-backed like [`collect`] rather than a live transcript read like
 /// [`live`]: the question is what has been going wrong *over a window*, and a
 /// transcript Claude Code has since deleted still counts.
-pub fn errors(store: &Store, window: &str) -> Result<CcErrors> {
-    errors_inner(store, window, None)
+pub fn errors(store: &Store, window: &str, session: Option<&str>) -> Result<CcErrors> {
+    errors_inner(store, window, None, session)
 }
 
 /// [`errors`] with a caller-supplied cutoff, for the reason [`collect_since`]
 /// has one: a subscription window's start comes from the live usage endpoint,
 /// not the clock.
-pub fn errors_since(store: &Store, window: &str, since: i64) -> Result<CcErrors> {
-    errors_inner(store, window, Some(since))
+pub fn errors_since(
+    store: &Store,
+    window: &str,
+    since: i64,
+    session: Option<&str>,
+) -> Result<CcErrors> {
+    errors_inner(store, window, Some(since), session)
 }
 
-fn errors_inner(store: &Store, window: &str, since: Option<i64>) -> Result<CcErrors> {
+fn errors_inner(
+    store: &Store,
+    window: &str,
+    since: Option<i64>,
+    session: Option<&str>,
+) -> Result<CcErrors> {
     let now = now_unix();
     if since.is_none() {
         reject_usage_window(window)?;
     }
     let cutoff = since.or_else(|| window_cutoff(window, now));
 
-    let rows = store.cc_read_tool_errors(cutoff)?;
+    let rows = store.cc_read_tool_errors(cutoff, session)?;
     let mut total = CcErrorTotals {
         errors: 0,
         sidechain: 0,
         top_level: 0,
         denials: 0,
     };
-    // `(errors, sidechain)` per group; `top_level` is the difference, so the
-    // three can never disagree.
-    let mut by_tool: HashMap<String, (i64, i64)> = HashMap::new();
-    let mut by_command: HashMap<String, (i64, i64)> = HashMap::new();
-    let mut by_message: HashMap<String, (i64, i64)> = HashMap::new();
+    // `(errors, sidechain, sessions)` per group; `top_level` is the
+    // difference of the first two, so the three counts can never disagree.
+    // The sessions are a `BTreeSet` capped on insert, the denial accumulator's
+    // own rule below: sorted for free, and the cap is a bound rather than a
+    // ranking.
+    type GroupAcc = (i64, i64, BTreeSet<String>);
+    let mut by_tool: HashMap<String, GroupAcc> = HashMap::new();
+    let mut by_command: HashMap<String, GroupAcc> = HashMap::new();
+    let mut by_message: HashMap<String, GroupAcc> = HashMap::new();
     // Keyed on `(kind, reason)` and on neither the command nor the tool: one
     // rule refusing the same thing repeatedly is the news this view exists to
     // carry, and both of those vary underneath it — a hook fires from
     // different containing command lines, a classifier verdict blocks four
     // different tools. Each is collected alongside instead, deduped and
-    // ordered by its `BTreeSet`.
-    type DenialAcc = (i64, BTreeSet<String>, BTreeSet<String>);
+    // ordered by its `BTreeSet` — and, since mesa task 1255, the sessions it
+    // was refused in.
+    type DenialAcc = (i64, BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
     let mut denials: HashMap<(CcDenialKind, String), DenialAcc> = HashMap::new();
 
     for r in &rows {
@@ -1030,6 +1061,7 @@ fn errors_inner(store: &Store, window: &str, since: Option<i64>) -> Result<CcErr
         let e = by_tool.entry(name).or_default();
         e.0 += 1;
         e.1 += i64::from(r.sidechain);
+        note_session(&mut e.2, &r.session_id);
 
         // `target` for a `Bash` call *is* its command — `tool_target` lifts
         // `input.command` — so the prefixes are derived at read time and no
@@ -1043,17 +1075,20 @@ fn errors_inner(store: &Store, window: &str, since: Option<i64>) -> Result<CcErr
             let e = by_command.entry(prefix).or_default();
             e.0 += 1;
             e.1 += i64::from(r.sidechain);
+            note_session(&mut e.2, &r.session_id);
         }
         if let Some(signature) = r.signature.clone() {
             let e = by_message.entry(signature).or_default();
             e.0 += 1;
             e.1 += i64::from(r.sidechain);
+            note_session(&mut e.2, &r.session_id);
         }
         if let Some(kind) = r.denial_kind.as_deref().map(denial_kind_from) {
             total.denials += 1;
             let reason = r.denial_reason.clone().unwrap_or_default();
             let d = denials.entry((kind, reason)).or_default();
             d.0 += 1;
+            note_session(&mut d.3, &r.session_id);
             // What the message named, else what the call ran. A refusal that
             // spelled its command into its prose, and every classifier
             // verdict, still has a real call behind it.
@@ -1076,11 +1111,12 @@ fn errors_inner(store: &Store, window: &str, since: Option<i64>) -> Result<CcErr
 
     let mut by_tool: Vec<CcErrorToolStat> = by_tool
         .into_iter()
-        .map(|(name, (errors, sidechain))| CcErrorToolStat {
+        .map(|(name, (errors, sidechain, sessions))| CcErrorToolStat {
             name,
             errors,
             sidechain,
             top_level: errors - sidechain,
+            sessions: sessions.into_iter().collect(),
         })
         .collect();
     // Most failures first, ties broken by name so the output is stable across
@@ -1089,12 +1125,15 @@ fn errors_inner(store: &Store, window: &str, since: Option<i64>) -> Result<CcErr
 
     let mut by_command: Vec<CcErrorCommandStat> = by_command
         .into_iter()
-        .map(|(prefix, (errors, sidechain))| CcErrorCommandStat {
-            prefix,
-            errors,
-            sidechain,
-            top_level: errors - sidechain,
-        })
+        .map(
+            |(prefix, (errors, sidechain, sessions))| CcErrorCommandStat {
+                prefix,
+                errors,
+                sidechain,
+                top_level: errors - sidechain,
+                sessions: sessions.into_iter().collect(),
+            },
+        )
         .collect();
     by_command.sort_by(|a, b| {
         b.errors
@@ -1104,12 +1143,15 @@ fn errors_inner(store: &Store, window: &str, since: Option<i64>) -> Result<CcErr
 
     let mut by_message: Vec<CcErrorMessageStat> = by_message
         .into_iter()
-        .map(|(signature, (errors, sidechain))| CcErrorMessageStat {
-            signature,
-            errors,
-            sidechain,
-            top_level: errors - sidechain,
-        })
+        .map(
+            |(signature, (errors, sidechain, sessions))| CcErrorMessageStat {
+                signature,
+                errors,
+                sidechain,
+                top_level: errors - sidechain,
+                sessions: sessions.into_iter().collect(),
+            },
+        )
         .collect();
     by_message.sort_by(|a, b| {
         b.errors
@@ -1123,13 +1165,16 @@ fn errors_inner(store: &Store, window: &str, since: Option<i64>) -> Result<CcErr
 
     let mut denials: Vec<CcErrorDenial> = denials
         .into_iter()
-        .map(|((kind, reason), (count, prefixes, tools))| CcErrorDenial {
-            kind,
-            reason,
-            command_prefixes: prefixes.into_iter().collect(),
-            tools: tools.into_iter().collect(),
-            count,
-        })
+        .map(
+            |((kind, reason), (count, prefixes, tools, sessions))| CcErrorDenial {
+                kind,
+                reason,
+                command_prefixes: prefixes.into_iter().collect(),
+                tools: tools.into_iter().collect(),
+                sessions: sessions.into_iter().collect(),
+                count,
+            },
+        )
         .collect();
     denials.sort_by(|a, b| {
         b.count
@@ -1142,6 +1187,7 @@ fn errors_inner(store: &Store, window: &str, since: Option<i64>) -> Result<CcErr
         generated_at_unix: now,
         window: window.to_string(),
         since: cutoff.map(fmt_date),
+        session: session.map(str::to_string),
         total,
         by_tool,
         by_command,
@@ -7363,7 +7409,7 @@ mod tests {
         unsafe {
             std::env::remove_var("MESA_CC_PROJECTS_DIR");
         }
-        let e = errors(&store, "all").unwrap();
+        let e = errors(&store, "all", None).unwrap();
 
         assert_eq!(e.total.errors, 3, "the successful tu2 result is not one");
         assert_eq!(e.total.sidechain, 1);
@@ -7414,8 +7460,64 @@ mod tests {
 
         // Re-ingesting the same file adds nothing: the rows insert on their
         // `tool_use_id`, like every other cc row.
-        let again = errors(&store, "all").unwrap();
+        let again = errors(&store, "all", None).unwrap();
         assert_eq!(again.total.errors, e.total.errors);
+    }
+
+    /// mesa task 1255: which sessions a row's failures came from, and the
+    /// `--session` narrowing that lets a reader open one of them.
+    #[test]
+    fn the_errors_view_names_its_sessions_and_narrows_to_one() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("projects").join("-two-sessions");
+        fs::create_dir_all(&proj).unwrap();
+        // The same command failing the same way in two sessions: one row in
+        // every grouping, and the two sessions reported alongside.
+        write_jsonl(
+            &proj,
+            "one.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"a1","sessionId":"s1","timestamp":"2026-06-15T01:00:00.000Z","cwd":"/w","message":{"model":"claude-opus-5","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"sed -n p missing"}},{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"sed -n p gone"}}]}}"#,
+                r#"{"type":"user","uuid":"r1","sessionId":"s1","timestamp":"2026-06-15T01:00:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","is_error":true,"content":"sed: no such file"}]}}"#,
+                r#"{"type":"user","uuid":"r2","sessionId":"s1","timestamp":"2026-06-15T01:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu2","is_error":true,"content":"sed: no such file"}]}}"#,
+            ],
+        );
+        write_jsonl(
+            &proj,
+            "two.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"b1","sessionId":"s2","timestamp":"2026-06-15T01:10:00.000Z","cwd":"/w","message":{"model":"claude-opus-5","content":[{"type":"tool_use","id":"tu3","name":"Bash","input":{"command":"sed -n p absent"}}]}}"#,
+                r#"{"type":"user","uuid":"r3","sessionId":"s2","timestamp":"2026-06-15T01:10:01.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu3","is_error":true,"content":"sed: no such file"}]}}"#,
+            ],
+        );
+        let mut store = Store::open(&tmp.path().join("mesa.db")).unwrap();
+        // SAFETY: ENV_LOCK gives this test exclusive access to the env var.
+        unsafe {
+            std::env::set_var("MESA_CC_PROJECTS_DIR", tmp.path().join("projects"));
+        }
+        sync(&mut store, false).unwrap();
+        unsafe {
+            std::env::remove_var("MESA_CC_PROJECTS_DIR");
+        }
+
+        let e = errors(&store, "all", None).unwrap();
+        assert_eq!(e.session, None, "unfiltered echoes no session");
+        assert_eq!(e.total.errors, 3);
+        let both = vec!["s1".to_string(), "s2".to_string()];
+        // Deduped — s1 contributed twice — and sorted, in all three groupings.
+        assert_eq!(e.by_tool[0].sessions, both, "{:?}", e.by_tool);
+        assert_eq!(e.by_command[0].sessions, both, "{:?}", e.by_command);
+        assert_eq!(e.by_message[0].sessions, both, "{:?}", e.by_message);
+
+        let one = errors(&store, "all", Some("s1")).unwrap();
+        assert_eq!(one.session.as_deref(), Some("s1"), "the filter echoes back");
+        assert_eq!(one.total.errors, 2, "narrowed to the one session");
+        assert_eq!(one.by_command[0].sessions, vec!["s1".to_string()]);
+        // An unknown session is an empty view, not an error.
+        let none = errors(&store, "all", Some("nope")).unwrap();
+        assert_eq!(none.total.errors, 0);
+        assert!(none.by_tool.is_empty());
     }
 
     /// The acceptance criterion the first cut missed: one rule refusing the
@@ -7471,7 +7573,7 @@ mod tests {
             )
             .unwrap();
 
-        let e = errors(&store, "all").unwrap();
+        let e = errors(&store, "all", None).unwrap();
         assert_eq!(e.total.denials, 3);
         assert_eq!(e.denials.len(), 1, "one reason is one row: {:?}", e.denials);
         assert_eq!(e.denials[0].count, 3);
@@ -7523,7 +7625,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let e = errors(&store, "all").unwrap();
+        let e = errors(&store, "all", None).unwrap();
         assert_eq!(e.total.errors, 1);
         assert_eq!(e.by_tool.len(), 1);
         assert_eq!(e.by_tool[0].name, "unknown");

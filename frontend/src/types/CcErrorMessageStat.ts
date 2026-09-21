@@ -10,4 +10,11 @@ export type CcErrorMessageStat = {
  * hex runs and digits masked. Untrusted text, sanitized and capped at
  * ingest like every other stored transcript-derived string.
  */
-signature: string, errors: number, sidechain: number, top_level: number, };
+signature: string, errors: number, sidechain: number, top_level: number, 
+/**
+ * The distinct sessions that contributed to this row, sorted and capped
+ * (`core::cc::ERROR_SESSION_LIMIT`) — where to go and read the failure,
+ * which the counts alone never say. The counts count every session
+ * regardless.
+ */
+sessions: Array<string>, };

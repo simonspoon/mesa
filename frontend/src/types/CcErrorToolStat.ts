@@ -3,4 +3,11 @@
 /**
  * Failures rolled up by tool name.
  */
-export type CcErrorToolStat = { name: string, errors: number, sidechain: number, top_level: number, };
+export type CcErrorToolStat = { name: string, errors: number, sidechain: number, top_level: number, 
+/**
+ * The distinct sessions that contributed to this row, sorted and capped
+ * (`core::cc::ERROR_SESSION_LIMIT`) — where to go and read the failure,
+ * which the counts alone never say. The counts count every session
+ * regardless.
+ */
+sessions: Array<string>, };

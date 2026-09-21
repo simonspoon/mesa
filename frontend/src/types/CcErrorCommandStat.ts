@@ -3,4 +3,11 @@
 /**
  * Failures rolled up by the normalized head of a `Bash` command.
  */
-export type CcErrorCommandStat = { prefix: string, errors: number, sidechain: number, top_level: number, };
+export type CcErrorCommandStat = { prefix: string, errors: number, sidechain: number, top_level: number, 
+/**
+ * The distinct sessions that contributed to this row, sorted and capped
+ * (`core::cc::ERROR_SESSION_LIMIT`) — where to go and read the failure,
+ * which the counts alone never say. The counts count every session
+ * regardless.
+ */
+sessions: Array<string>, };

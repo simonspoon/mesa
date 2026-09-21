@@ -1806,6 +1806,10 @@ EXAMPLES
         /// One line of evidence for this report (≤ 2000 characters)
         #[arg(long, value_name = "TEXT")]
         evidence: Option<String>,
+        /// The Claude Code session this was observed in (≤ 200 characters);
+        /// kept beside every other session a repeat of this fingerprint names
+        #[arg(long, value_name = "SID")]
+        session_id: Option<String>,
         /// Print the finding minus its summary and evidence
         #[arg(long)]
         quiet: bool,
@@ -2697,6 +2701,10 @@ EXAMPLES
         /// Code subscription window (needs the live usage endpoint)
         #[arg(long, default_value = "30d")]
         window: String,
+        /// Only failures from this Claude Code session; every session when
+        /// absent
+        #[arg(long, value_name = "SID")]
+        session: Option<String>,
     },
     /// Print per-skill usage as a bare JSON array, highest token use first
     Skills {
@@ -4594,14 +4602,14 @@ fn cc_collect(store: &Store, window: &str) -> Result<crate::core::CcDashboard> {
 /// subscription windows, whose cutoff only the live usage endpoint knows — and
 /// exists twice because the two views build different objects, not because
 /// they take different windows.
-fn cc_errors(store: &Store, window: &str) -> Result<crate::core::CcErrors> {
+fn cc_errors(store: &Store, window: &str, session: Option<&str>) -> Result<crate::core::CcErrors> {
     if !crate::core::cc::is_usage_window(window) {
-        return crate::core::cc::errors(store, window);
+        return crate::core::cc::errors(store, window, session);
     }
     let usage = crate::core::usage::fetch().map_err(Error::Unavailable)?;
     let since = crate::core::cc::usage_window_start(window, &usage)
         .ok_or_else(|| Error::Unavailable(format!("no open {window} usage window to report on")))?;
-    crate::core::cc::errors_since(store, window, since)
+    crate::core::cc::errors_since(store, window, since, session)
 }
 
 /// Dashboard reads (`summary`/`sessions`/`skills`) auto-ingest new transcript
@@ -4671,10 +4679,10 @@ fn run_cc(cmd: CcCmd) -> Result<()> {
             // makes it answer for a session that has never been ingested.
             print_json(&crate::core::cc::session_chat(&session_id, limit)?)
         }
-        CcCmd::Errors { window } => {
+        CcCmd::Errors { window, session } => {
             let mut store = Store::open_default()?;
             crate::core::cc::sync(&mut store, false)?;
-            print_json(&cc_errors(&store, &window)?)
+            print_json(&cc_errors(&store, &window, session.as_deref())?)
         }
         CcCmd::Skills { window } => {
             let mut store = Store::open_default()?;
@@ -5439,6 +5447,7 @@ fn run_retro_finding(store: &mut Store, cmd: RetroFindingCmd) -> Result<()> {
             kind,
             summary,
             evidence,
+            session_id,
             quiet,
         } => {
             let (finding, is_new) = store.record_retro_finding(
@@ -5447,6 +5456,7 @@ fn run_retro_finding(store: &mut Store, cmd: RetroFindingCmd) -> Result<()> {
                 &kind,
                 &summary,
                 evidence.as_deref(),
+                session_id.as_deref(),
             )?;
             // A composite: the key structure stays, the member is compacted.
             let finding = if quiet {
@@ -7291,6 +7301,7 @@ mod tests {
             first_seen_at: "2026-09-01 00:00:00".into(),
             last_seen_at: "2026-09-04 00:00:00".into(),
             inbox_item_id: Some(9),
+            session_ids: vec!["abc".into(), "def".into()],
         }
     }
 
@@ -7315,6 +7326,9 @@ mod tests {
                 "first_seen_at",
                 "last_seen_at",
                 "inbox_item_id",
+                // A bounded set of pointers, and the whole point of recording
+                // one. KEPT.
+                "session_ids",
             ]),
             "RetroFinding gained/lost a field: decide whether it belongs in \
              the --quiet shape before updating this list",

@@ -25,7 +25,12 @@ window: string,
 /**
  * Inclusive cutoff date (`YYYY-MM-DD`), or null for `all`.
  */
-since: string | null, total: CcErrorTotals, 
+since: string | null, 
+/**
+ * The session the caller narrowed to (`mesa cc errors --session`, mesa
+ * task 1255), echoed back; null when the view is every session.
+ */
+session: string | null, total: CcErrorTotals, 
 /**
  * Most failures first. `name` is `unknown` for an error whose own
  * `tool_use` line has not been ingested.

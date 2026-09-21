@@ -3060,6 +3060,9 @@ pub struct CcErrors {
     pub window: String,
     /// Inclusive cutoff date (`YYYY-MM-DD`), or null for `all`.
     pub since: Option<String>,
+    /// The session the caller narrowed to (`mesa cc errors --session`, mesa
+    /// task 1255), echoed back; null when the view is every session.
+    pub session: Option<String>,
     pub total: CcErrorTotals,
     /// Most failures first. `name` is `unknown` for an error whose own
     /// `tool_use` line has not been ingested.
@@ -3105,6 +3108,11 @@ pub struct CcErrorToolStat {
     pub sidechain: i64,
     #[ts(type = "number")]
     pub top_level: i64,
+    /// The distinct sessions that contributed to this row, sorted and capped
+    /// (`core::cc::ERROR_SESSION_LIMIT`) — where to go and read the failure,
+    /// which the counts alone never say. The counts count every session
+    /// regardless.
+    pub sessions: Vec<String>,
 }
 
 /// Failures rolled up by their normalized message signature
@@ -3122,6 +3130,11 @@ pub struct CcErrorMessageStat {
     pub sidechain: i64,
     #[ts(type = "number")]
     pub top_level: i64,
+    /// The distinct sessions that contributed to this row, sorted and capped
+    /// (`core::cc::ERROR_SESSION_LIMIT`) — where to go and read the failure,
+    /// which the counts alone never say. The counts count every session
+    /// regardless.
+    pub sessions: Vec<String>,
 }
 
 /// Failures rolled up by the normalized head of a `Bash` command.
@@ -3135,6 +3148,11 @@ pub struct CcErrorCommandStat {
     pub sidechain: i64,
     #[ts(type = "number")]
     pub top_level: i64,
+    /// The distinct sessions that contributed to this row, sorted and capped
+    /// (`core::cc::ERROR_SESSION_LIMIT`) — where to go and read the failure,
+    /// which the counts alone never say. The counts count every session
+    /// regardless.
+    pub sessions: Vec<String>,
 }
 
 /// Which mechanism refused a call. Two of them, deliberately never merged:
@@ -3180,6 +3198,11 @@ pub struct CcErrorDenial {
     /// classifier verdict names no tool of its own, so for those this is
     /// entirely the call row's.
     pub tools: Vec<String>,
+    /// The distinct sessions that contributed to this row, sorted and capped
+    /// (`core::cc::ERROR_SESSION_LIMIT`) — where to go and read the failure,
+    /// which the counts alone never say. The counts count every session
+    /// regardless.
+    pub sessions: Vec<String>,
     #[ts(type = "number")]
     pub count: i64,
 }
@@ -4037,6 +4060,16 @@ pub struct RetroFinding {
     pub first_seen_at: String,
     pub last_seen_at: String,
     pub inbox_item_id: Option<i64>,
+    /// The Claude Code sessions this friction was observed in, ascending
+    /// (mesa task 1255). **Derived on every read** from the sibling
+    /// `retro_finding_sessions` table, never a column on the finding: a
+    /// fingerprint spans every run that reported it, and the point of the
+    /// pointer is that a repeat names a *second* session to go and read.
+    /// Empty for a finding recorded without one — attribution is
+    /// best-effort, and the agent never guesses a session.
+    ///
+    /// A bounded set of pointers, so `--quiet` keeps it.
+    pub session_ids: Vec<String>,
 }
 
 /// What `mesa retro status` prints (mesa task 1158): the last run, the

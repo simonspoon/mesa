@@ -112,6 +112,10 @@ case "\$1" in
     echo "Starting background service…"
     echo "backgrounded · deadbeef (idle — send a prompt to start)"
     ;;
+  stop)
+    # The whole argv, so the gate can pin that mesa runs exactly: stop <id>
+    printf '%s\n' "\$*" >> "$STUB_DIR/stops"
+    ;;
   *) exit 2 ;;
 esac
 EOF
@@ -240,6 +244,31 @@ origin_status() { # origin_status <method> <path> <origin> [body]
 [ "$(origin_status GET "/api/agents" 'https://evil.example')" = "403" ] ||
   fail "GET /api/agents foreign Origin: must be 403"
 ok "list/spawn/global-list reject foreign Origin (cross-site defense), allow local"
+
+# ---- API: POST /api/agents/{id}/stop — the other end of the spawn ----
+# mesa never infers past a session's `state` (docs/agents.md); stopping one is
+# how a finished-but-misclassified row leaves the list, since a stopped session
+# leaves `claude agents --json`, which is what GET /api/agents reads.
+api 200 POST "/api/agents/toplvl001/stop" '{}'
+[ "$(jqb .id)" = "toplvl001" ] || fail "POST stop: echoes the job id it stopped"
+[ "$(cat "$STUB_DIR/stops")" = "stop toplvl001" ] ||
+  fail "POST stop: argv must be exactly 'stop <id>' (got '$(cat "$STUB_DIR/stops")')"
+ok "POST /api/agents/{id}/stop runs claude stop <id> and echoes the id"
+
+# The id lands on an argv, so it is constrained exactly as attach's is — a
+# leading dash could otherwise be parsed as a flag. Neither reaches `claude`.
+api 422 POST "/api/agents/-rf/stop" '{}'
+[ "$(jqb .error.code)" = "validation" ] || fail "POST stop: leading-dash id must be validation"
+api 422 POST "/api/agents/bad%20id!/stop" '{}'
+[ "$(jqb .error.code)" = "validation" ] || fail "POST stop: invalid id must be validation"
+[ "$(wc -l < "$STUB_DIR/stops")" -eq 1 ] || fail "POST stop: a refused id must never reach claude"
+ok "POST stop refuses a dash-leading/invalid id (422) without reaching claude"
+
+# Same cross-site defense as every other agents route.
+[ "$(origin_status POST "/api/agents/toplvl001/stop" 'https://evil.example' '{}')" = "403" ] ||
+  fail "POST stop foreign Origin: must be 403"
+[ "$(wc -l < "$STUB_DIR/stops")" -eq 1 ] || fail "POST stop: a refused request must never reach claude"
+ok "POST /api/agents/{id}/stop rejects a foreign Origin (cross-site defense)"
 
 # A dead claude CLI is an upstream failure: 502 unavailable. Use a fresh
 # project/folder so the 2s in-memory list cache can't serve this request.
@@ -422,6 +451,18 @@ lan_ws() { # lan_ws <path> <host> [origin]
   fail "--lan: attach must refuse a foreign Origin (cross-site WS hijack)"
 [ "$(lan_ws /api/agents/deadbeef/attach 'evil.example')" = "403" ] ||
   fail "--lan: attach must refuse a DNS-name Host (rebinding defense)"
+
+# The stop route shares that gate too (mesa task 1289).
+[ "$(lan_req POST "/api/agents/toplvl001/stop" "evil.example:$LAN_PORT" '' '{}')" = "403" ] ||
+  fail "--lan: stop must reject a DNS-name Host (rebinding defense)"
+[ "$(lan_req POST "/api/agents/toplvl001/stop" "192.0.2.7:$LAN_PORT" 'https://evil.example' '{}')" = "403" ] ||
+  fail "--lan: stop must reject a foreign Origin (cross-site defense)"
+[ "$(lan_req POST "/api/agents/toplvl001/stop" "192.0.2.7:$LAN_PORT" "http://192.0.2.7:$LAN_PORT" '{}')" = "200" ] ||
+  fail "--lan: stop must pass from a LAN-shaped page"
+# Exactly one more `claude stop` than the default-mode section left behind:
+# only the request that passed the gate ran one.
+[ "$(cat "$STUB_DIR/stops")" = "stop toplvl001
+stop toplvl001" ] || fail "--lan: only the permitted stop reached claude ($(cat "$STUB_DIR/stops"))"
 
 kill "$LAN_PID" 2>/dev/null; LAN_PID=""
 ok "--lan: agent routes + local_path writes + attach serve local/IP clients; rebinding & cross-site shapes stay 403"

@@ -2105,7 +2105,7 @@ fn router(state: AppState) -> Router {
             get(render_project_artifact),
         )
         // Agents: live Claude Code sessions under a project's folder. All
-        // four routes share `require_agent_access` (terminal access = code
+        // five routes share `require_agent_access` (terminal access = code
         // execution): loopback-only in default mode, LAN-page-authenticated
         // under `--lan`.
         .route(
@@ -2117,6 +2117,9 @@ fn router(state: AppState) -> Router {
         // this has no `path`/empty-state wrapper: it is just the bare array).
         .route("/api/agents", get(list_all_agents))
         .route("/api/agents/{id}/attach", get(attach_agent))
+        // The other end of the spawn (mesa task 1289): `claude stop <id>`, so
+        // a session the sidebar can no longer act on can leave the list.
+        .route("/api/agents/{id}/stop", post(stop_agent))
         // Terminal page: a raw `$SHELL` PTY per connection, no session
         // registry (unlike the agent routes above). Shares
         // `require_agent_access` unchanged — see that fn's doc.
@@ -8355,10 +8358,26 @@ async fn attach_agent(
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     require_agent_access(&state, &addr, &headers)?;
-    // The id lands on `claude attach`'s argv — no shell is involved, but
-    // constrain it anyway so arbitrary strings never reach an exec. A leading
-    // `-` is refused too, so the id can never be parsed as a `claude attach`
-    // flag (the id charset otherwise allows `-`).
+    require_agent_job_id(&id)?;
+    let size = PtySize {
+        rows: q.rows.unwrap_or(40),
+        cols: q.cols.unwrap_or(120),
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    Ok(ws.on_upgrade(move |socket| async move {
+        if let Err(err) = bridge_attach(socket, id, size).await {
+            eprintln!("agent attach bridge: {err}");
+        }
+    }))
+}
+
+/// The short background job id lands on a `claude` argv — no shell is
+/// involved, but constrain it anyway so arbitrary strings never reach an
+/// exec. A leading `-` is refused too, so the id can never be parsed as a
+/// flag (the id charset otherwise allows `-`). Shared by [`attach_agent`] and
+/// [`stop_agent`], which put the same id on `claude attach` and `claude stop`.
+fn require_agent_job_id(id: &str) -> ApiResult<()> {
     if id.is_empty()
         || id.len() > 64
         || id.starts_with('-')
@@ -8372,17 +8391,44 @@ async fn attach_agent(
             message: format!("invalid agent id {id:?}"),
         });
     }
-    let size = PtySize {
-        rows: q.rows.unwrap_or(40),
-        cols: q.cols.unwrap_or(120),
-        pixel_width: 0,
-        pixel_height: 0,
-    };
-    Ok(ws.on_upgrade(move |socket| async move {
-        if let Err(err) = bridge_attach(socket, id, size).await {
-            eprintln!("agent attach bridge: {err}");
-        }
-    }))
+    Ok(())
+}
+
+/// Stops the background session with short job id `{id}` (`claude stop <id>`)
+/// — the Agents sidebar's one way to take a finished-but-misclassified row
+/// out of its list (mesa task 1289).
+///
+/// `state` is Claude Code's own classifier and mesa never second-guesses it
+/// (docs/agents.md: inferring past it was twice a mesa bug). What mesa can
+/// offer instead is the other end of the spawn: a stopped session leaves
+/// `claude agents --json`, which is the feed `GET /api/agents` reads, so the
+/// row simply goes. The conversation is kept — `claude attach <id>` resumes
+/// it — which is the reversibility that stands in for the confirmation prompt
+/// mesa deliberately does not have.
+///
+/// `require_agent_access` like every other agents route: stopping a session is
+/// the same capability class as starting or attaching to one. A missing or
+/// failing `claude` is `unavailable`, as it is on the list and spawn routes.
+async fn stop_agent(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    require_agent_job_id(&id)?;
+    let job = id.clone();
+    tokio::task::spawn_blocking(move || agents::stop(&job))
+        .await
+        .map_err(|e| agents_unavailable(format!("agent stop panicked: {e}")))?
+        .map_err(agents_unavailable)?;
+    // Same cache invalidation as a spawn and as the live-session stop: the
+    // sidebar must show the session gone on its next poll rather than after
+    // the TTL. Cleared whole — the stopped session's folder is whatever it was
+    // started in, and the global list caches under its own key.
+    state.agents_cache.lock().unwrap().clear();
+    state.agents_gen.fetch_add(1, Ordering::SeqCst);
+    Ok(Json(serde_json::json!({ "id": id })).into_response())
 }
 
 /// Upgrades to a WebSocket bridged onto a real interactive shell in a PTY —
@@ -13984,6 +14030,116 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             .map(|p| p.name)
             .collect();
         assert_eq!(names, vec!["from-the-lan".to_string()]);
+    }
+
+    /// `POST /api/agents/{id}/stop` carries the agents' own
+    /// `require_agent_access` (mesa task 1289) — stopping a session is the same
+    /// capability class as starting or attaching to one. Default mode refuses a
+    /// non-loopback peer outright; under `--lan` a page this server handed out
+    /// may stop a session, while a rebound page (DNS-name Host) and a
+    /// cross-site one (foreign Origin) stay refused. `scripts/agents-check.sh`
+    /// drives the Host/Origin half over real HTTP; only this test can forge the
+    /// peer.
+    // `ENV_LOCK` is held across the handler's `.await`s on purpose: it guards
+    // a process-global env var, and `#[tokio::test]` is a current-thread
+    // runtime, so no other task on it can contend for the guard while this one
+    // is parked. It must outlive every call for the same reason.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn lan_page_may_stop_an_agent_but_not_from_a_rebound_page() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN / MESA_CONFIG_FILE for its duration; it is held
+        // across the `.await`s on purpose, since the handler shells out to the
+        // stub the variable names.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stop_log = stub_dir.path().join("stops.log");
+        let bin = stub_claude_reaper(
+            stub_dir.path(),
+            &stub_dir.path().join("agents.json"),
+            &stop_log,
+        );
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let stop = |state: AppState, peer: SocketAddr, headers: HeaderMap, id: &'static str| async move {
+            stop_agent(
+                State(state),
+                ConnectInfo(peer),
+                headers,
+                Path(id.to_string()),
+            )
+            .await
+        };
+        let local = || hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
+
+        // Default mode: a local page reaches it and the stub is really run.
+        let (_dir, state) = test_state();
+        assert!(!state.lan);
+        stop(
+            state.clone(),
+            loopback(),
+            loopback_agent_headers(),
+            "job0001",
+        )
+        .await
+        .unwrap();
+        assert_eq!(stops(&stop_log), vec!["job0001".to_string()]);
+        // …and a malformed id never reaches an argv at all.
+        assert_eq!(
+            stop(state.clone(), loopback(), loopback_agent_headers(), "-rf")
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(stops(&stop_log), vec!["job0001".to_string()]);
+        // A non-loopback peer is refused outright in default mode.
+        assert!(
+            stop(state, lan_peer(), local(), "job0002")
+                .await
+                .unwrap_err()
+                .status
+                .is_client_error()
+        );
+
+        let (_dir, mut state) = test_state();
+        state.lan = true;
+        stop(state.clone(), lan_peer(), local(), "job0002")
+            .await
+            .unwrap();
+        assert!(
+            stop(
+                state.clone(),
+                lan_peer(),
+                hdrs(Some("evil.example.com:0"), None),
+                "job0003"
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+        assert!(
+            stop(
+                state,
+                lan_peer(),
+                hdrs(Some("192.168.1.50:0"), Some("http://evil.example.com")),
+                "job0004"
+            )
+            .await
+            .unwrap_err()
+            .status
+            .is_client_error()
+        );
+        unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+
+        // Only the two that passed the gate ever reached `claude stop`.
+        assert_eq!(
+            stops(&stop_log),
+            vec!["job0001".to_string(), "job0002".to_string()]
+        );
     }
 
     #[tokio::test]

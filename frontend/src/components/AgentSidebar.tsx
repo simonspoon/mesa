@@ -17,7 +17,7 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import { listAllAgents, listProjects, spawnProjectAgent } from '../api'
+import { listAllAgents, listProjects, spawnProjectAgent, stopAgent } from '../api'
 import { liveWorkLabel, projectForCwd } from '../agentProject'
 import {
   childElapsed,
@@ -640,6 +640,14 @@ type ListPaneProps = {
   onToggleSection: (bucket: Bucket) => void
   onTogglePane: (agentId: string) => void
   onToggleChildPane: (parentId: string, child: AgentChild) => void
+  /** `claude stop` on one row's session — the only way a finished session
+   * mesa has misclassified can leave the list (mesa task 1289). */
+  onStop: (agentId: string) => void
+  /** Job ids with a stop in flight; their buttons stand down until it lands. */
+  stoppingIds: string[]
+  /** A failed stop, shown above the list — the one outcome the next poll
+   * cannot tell the reader about, since a refused stop changes nothing. */
+  stopError: string | null
 }
 
 /** The 'Agents' session-list rail's body content (mesa task 414) — the
@@ -656,9 +664,13 @@ function AgentListContent({
   onToggleSection,
   onTogglePane,
   onToggleChildPane,
+  onStop,
+  stoppingIds,
+  stopError,
 }: ListPaneProps) {
   return (
     <div className="agent-sidebar-list">
+      {stopError && <p className="error">{stopError}</p>}
       {error && !sessionsLoaded ? (
           <p className="error">{error}</p>
         ) : !sessionsLoaded ? (
@@ -705,6 +717,29 @@ function AgentListContent({
                         >
                           <div className="agent-row-title">
                             <span className="agent-name">{agentLabel(a)}</span>
+                            {/* Only a background session has a short job id,
+                                and `claude stop` takes exactly that — an
+                                interactive one has nothing to stop, the same
+                                reason its row is not attachable. No
+                                confirmation: the conversation survives a stop
+                                and `claude attach` resumes it, which is the
+                                reversibility mesa uses instead of a prompt. */}
+                            {a.id !== null && (
+                              <button
+                                type="button"
+                                className="agent-row-stop"
+                                title={`Stop this session (claude stop ${a.id}). The conversation is kept — claude attach ${a.id} resumes it.`}
+                                // The row underneath toggles the attach pane;
+                                // a press on the button is about the button.
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  if (a.id !== null) onStop(a.id)
+                                }}
+                                disabled={stoppingIds.includes(a.id)}
+                              >
+                                stop
+                              </button>
+                            )}
                           </div>
                           <div className="agent-row-badges">
                             <span className={`badge agent-kind-${a.kind}`}>{a.kind}</span>
@@ -1126,6 +1161,11 @@ export function AgentSidebar({
   const [addPrompt, setAddPrompt] = useState('')
   const [adding, setAdding] = useState(false)
   const [addError, setAddError] = useState<string | null>(null)
+  // Job ids with a `claude stop` in flight, and the last failure. A successful
+  // stop needs no state of its own: the row leaves `claude agents --json`, so
+  // the refetch below is what removes it.
+  const [stoppingIds, setStoppingIds] = useState<string[]>([])
+  const [stopError, setStopError] = useState<string | null>(null)
   // Bumped by closeAddAgent and every new submit — a submit's `.then`/`.catch`
   // only applies its result if this still matches the id it captured, so
   // canceling (or reopening the form for a different project) before a spawn
@@ -1471,6 +1511,35 @@ export function AgentSidebar({
     onToggleSection: (bucket) => setCollapsedSections((s) => ({ ...s, [bucket]: !s[bucket] })),
     onTogglePane: togglePane,
     onToggleChildPane: (parentId, child) => togglePane(childPaneId(parentId, child)),
+    onStop: stopSession,
+    stoppingIds,
+    stopError,
+  }
+
+  /**
+   * `claude stop <id>` on one session (mesa task 1289).
+   *
+   * mesa never infers past a session's `state` — Claude Code owns that
+   * classifier — so a session that finished but reads `blocked` has no way
+   * out of this list on its own. Stopping it is the way out that needs no
+   * inference: a stopped session leaves `claude agents --json`, which is the
+   * feed this list polls, so the refetch is what removes the row rather than
+   * any local edit.
+   */
+  function stopSession(id: string) {
+    if (stoppingIds.includes(id)) return
+    setStopError(null)
+    setStoppingIds((ids) => [...ids, id])
+    stopAgent(id).then(
+      () => {
+        setStoppingIds((ids) => ids.filter((x) => x !== id))
+        refetch()
+      },
+      (err: unknown) => {
+        setStoppingIds((ids) => ids.filter((x) => x !== id))
+        setStopError(err instanceof Error ? err.message : String(err))
+      },
+    )
   }
 
   function togglePane(id: string) {

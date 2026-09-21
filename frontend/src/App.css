@@ -3320,6 +3320,32 @@ main {
   text-overflow: ellipsis;
 }
 
+/* `claude stop` on this row's session (mesa task 1289). Pinned right and
+   never shrinking, so the name beside it is the only part that ellipsizes —
+   the same division of the line the meta row below makes. */
+.agent-row-stop {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0 0.3rem;
+  font-size: 0.7rem;
+  line-height: 1.5;
+  border: 1px solid var(--border-bright);
+  border-radius: 3px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.agent-row-stop:hover:not(:disabled) {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+.agent-row-stop:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .agent-row-badges {
   display: flex;
   flex-wrap: wrap;

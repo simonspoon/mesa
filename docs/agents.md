@@ -78,7 +78,20 @@ a different tool yields sessions the sidebar can't list or attach to.
   sentinel key (`ALL_AGENTS_CACHE_KEY`, a NUL-prefixed string no real
   `local_path` can equal) — same 2s TTL, same "collapse concurrent polls"
   rationale, just keyed once instead of per-folder.
-- **All four agent routes share one mode-dependent access gate**,
+- `POST /api/agents/{id}/stop` → `claude stop <id>`, the other end of the
+  spawn (mesa task 1289), answering `{id}`. The Agents sidebar's stop control
+  is its only caller. mesa never infers past a session's `state` — that was
+  twice a mesa bug (tasks 571, 858) and stays gone — but a **stopped** session
+  leaves `claude agents --json`, which is the feed `GET /api/agents` reads, so
+  a finished-but-misclassified row is gone from the next poll by that alone —
+  no dismiss list, and nothing hidden client-side.
+  No confirmation prompt: `claude stop` keeps the conversation and `claude
+  attach <id>` resumes it, which is the reversibility that stands in for one.
+  Only background sessions have a short id, so an interactive one is not
+  stoppable, exactly as it is not attachable. A failing/missing `claude` is
+  **502 `unavailable`**; a malformed id is **422 `validation`**, the same argv
+  guard `attach` applies.
+- **All five agent routes share one mode-dependent access gate**,
   `require_agent_access`. Terminal access is code execution — a strictly
   stronger capability than the task CRUD the rest of the API exposes — so the
   browser-as-confused-deputy holes stay closed in BOTH modes; what differs is

@@ -691,6 +691,14 @@ export function spawnProjectAgent(
   return request(`/api/projects/${id}/agents`, jsonInit('POST', body))
 }
 
+/** Stops a background session (`claude stop <id>`) — the other end of the
+ * spawn. The conversation is kept (`claude attach <id>` resumes it); what
+ * changes is that a stopped session leaves `claude agents --json`, so the
+ * sidebar's next poll no longer lists it. */
+export function stopAgent(id: string): Promise<{ id: string }> {
+  return request(`/api/agents/${encodeURIComponent(id)}/stop`, jsonInit('POST', {}))
+}
+
 // ---- diagrams ----
 // The guard middleware requires a JSON Content-Type on every mutating method,
 // so even body-less DELETEs send the header (src/api.rs Requirement 7).

@@ -146,8 +146,17 @@ export function PtyTerminal({
       // Resizes fit()'d during the CONNECTING window were dropped (the guard
       // below only sends when OPEN); push the current size once so the PTY
       // matches the actual viewport rather than the initial query-param size.
-      lastSent = { cols: term.cols, rows: term.rows }
-      ws.send(JSON.stringify({ resize: lastSent }))
+      // Through the same filter as every other frame, undebounced because
+      // there is nothing to coalesce with: connecting happens right after a
+      // split or an Auto Tile rebuild, which is exactly when `fit()` has had a
+      // degenerate box to measure, and a live TUI must not be told it is two
+      // columns wide. Refused here leaves `lastSent` null and the PTY on the
+      // query-param size it was opened with, until a real geometry arrives.
+      const opened = nextResizeFrame(null, { cols: term.cols, rows: term.rows })
+      if (opened !== null) {
+        lastSent = opened
+        ws.send(JSON.stringify({ resize: opened }))
+      }
       // Handed out only once the socket is open, and withdrawn again below the
       // moment it closes: an outside writer (the chat composer) has no
       // keyboard in front of it to notice a dropped message, so "there is no
@@ -173,9 +182,12 @@ export function PtyTerminal({
     const dataSub = term.onData((d) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(encoder.encode(d))
     })
-    // The one point where a resize frame reaches the wire — every caller of
-    // `fit()` (the observer below, the tier effect, a reparent) arrives here,
-    // which is why the coalescing is here and not in any one of them.
+    // Every resize frame on this socket goes through `nextResizeFrame` — this
+    // one and the connect-time push above are the only two senders. The
+    // *debounce* is only here, where it belongs: every caller of `fit()` (the
+    // observer below, the tier effect, a reparent) arrives at this handler, so
+    // coalescing once here covers all of them, while the connect-time push is
+    // a single frame with nothing to coalesce with.
     const resizeSub = term.onResize(({ cols, rows }) => {
       if (resizeTimer.current !== null) clearTimeout(resizeTimer.current)
       resizeTimer.current = window.setTimeout(() => {

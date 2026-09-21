@@ -17,6 +17,7 @@ function item(
     read_at,
     archived_at,
     archive_reason: null,
+    archive_outcome: null,
     kind: 'task-summary',
     task_id: 42,
     task_name: 'ship the auth fix',

@@ -837,6 +837,24 @@ api 200 GET "/api/inbox/$ARCH_ID"
 [ "$(jqb .archived_at)" = "null" ] || fail "inbox archive: an over-length reason must write nothing"
 ok "POST /api/inbox/{id}/archive: reason stored as archive_reason, kept on re-archive, cleared by undo, 422 past 1000 chars writing nothing"
 
+# `outcome` (mesa task 1248) is the enumerated twin and rides the same way; a
+# value outside the fixed four is a 422 from serde, writing nothing.
+api 200 POST "/api/inbox/$ARCH_ID/archive" '{"archived":true,"outcome":"converted-to-task"}'
+[ "$(jqb .archive_outcome)" = "converted-to-task" ] ||
+  fail "inbox archive: outcome must be stored as archive_outcome"
+api 200 POST "/api/inbox/$ARCH_ID/archive" '{"archived":true,"outcome":"duplicate"}'
+[ "$(jqb .archive_outcome)" = "converted-to-task" ] ||
+  fail "inbox archive: re-archiving must not move the outcome"
+api 200 GET "/api/inbox/$ARCH_ID"
+[ "$(jqb .archive_outcome)" = "converted-to-task" ] || fail "inbox archive: the outcome must persist"
+api 200 POST "/api/inbox/$ARCH_ID/archive" '{"archived":false}'
+[ "$(jqb .archive_outcome)" = "null" ] ||
+  fail "inbox archive: the un-archive must clear the outcome with the stamp"
+api 422 POST "/api/inbox/$ARCH_ID/archive" '{"archived":true,"outcome":"bogus"}'
+api 200 GET "/api/inbox/$ARCH_ID"
+[ "$(jqb .archived_at)" = "null" ] || fail "inbox archive: an unknown outcome must write nothing"
+ok "POST /api/inbox/{id}/archive: outcome stored as archive_outcome, kept on re-archive, cleared by undo, 422 for an unknown value writing nothing"
+
 api 404 POST "/api/inbox/999999/archive" '{"archived":true}'
 [ "$(jqb .error.code)" = "not_found" ] ||
   fail "inbox archive: unknown id must be not_found"

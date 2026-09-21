@@ -708,13 +708,20 @@ export function InboxView({ filter }: { filter: InboxFilter }) {
                       <span className="inbox-unread"> · unread</span>
                     )}
                   </div>
-                  {/* Why it was set aside (mesa task 1168) — the archiver's
-                      verdict, one muted line under the meta line, only where
-                      there is one: the Archived view is where a reader asks
-                      "why is this here". */}
-                  {item.archive_reason !== null && (
+                  {/* Why it was set aside (mesa task 1168) and how it was
+                      disposed of (mesa task 1248) — the archiver's verdict,
+                      one muted line under the meta line, only where there is
+                      one: the Archived view is where a reader asks "why is
+                      this here". Either half may be absent; the outcome's four
+                      words are already readable, so they render verbatim. */}
+                  {(item.archive_reason !== null ||
+                    item.archive_outcome !== null) && (
                     <div className="muted diagram-meta">
-                      archived: {item.archive_reason}
+                      archived: {item.archive_outcome}
+                      {item.archive_outcome !== null &&
+                        item.archive_reason !== null &&
+                        ' · '}
+                      {item.archive_reason}
                     </div>
                   )}
                   {speakError?.id === item.id && (

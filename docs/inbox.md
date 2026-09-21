@@ -139,6 +139,20 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
   a usage error (exit 2). Bounded, and the field the flag exists to write, so
   it stays in the `--quiet` projection; the Archived view shows it as one
   muted line under the item's meta line.
+  An archive may also say **how** it was disposed of (mesa task 1248,
+  migration index 66): `archive_outcome` is the enumerated twin of the reason
+  beside it — `mesa inbox archive <id> --outcome <outcome>`, `POST
+  .../archive {"archived": true, "outcome": "<outcome>"}` — one of exactly
+  four fixed words, `report` | `duplicate` | `not-actionable` |
+  `converted-to-task`, so the answers can be counted where the prose reason
+  can only be read. It rides with the stamp on identical terms: written only
+  on the archive, left alone by a re-archive, cleared by the un-archive, so it
+  too is null exactly when `archived_at` is, and `--outcome` beside `--undo`
+  is a usage error (exit 2) — as is a word outside the four (clap's
+  `value_parser`, so exit 2 and nothing written; over HTTP an unknown word is
+  a 422 `validation` from serde). Bounded, and the field the flag exists to
+  write, so it stays in the `--quiet` projection, and the Archived view shows
+  it on that same muted line beside the reason.
 - No event/history table: an item *is* the record. The safety floor is the
   delete echo + `mesa backup`; once converted, the created task is the record.
 - `list` returns items newest first; the `--project N`/`?project=` filter still
@@ -154,9 +168,10 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
   project and **prints the created task**; assigning to a project id that does
   not exist is `validation` (an unknown project *name* is `not_found`, from the
   shared resolver). `read <id>` marks the item read (idempotent — a second
-  call echoes the item unchanged). `archive <id> [--reason <why>]` sets the
-  item aside and `archive <id> --undo` puts it back, clearing the reason
-  (idempotent both ways; `--reason` with `--undo` is exit 2). `delete` echoes
+  call echoes the item unchanged). `archive <id> [--reason <why>] [--outcome <outcome>]` sets the
+  item aside and `archive <id> --undo` puts it back, clearing both the reason
+  and the outcome (idempotent both ways; `--reason` or `--outcome` with
+  `--undo` is exit 2). `delete` echoes
   the destroyed item.
 - API: `/api/inbox` (GET list, POST create — body `{body, task_id, author,
   kind}`; `body` and `task_id` required, the rest optional),
@@ -164,10 +179,11 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
   `/api/inbox/{id}/read` (POST, mark read — its own route rather than a key on
   the PATCH, which *assigns*: that one answers with the created task and leaves
   no item behind, so the two could never share a body),
-  `/api/inbox/{id}/archive` (POST, body `{archived: <bool>, reason?: <text>}`
-  — its own route for the same reason, and the direction rides in the body
-  because this one toggles; `reason` is optional, stored as `archive_reason`
-  on the way in and ignored on the way back). PATCH body is
+  `/api/inbox/{id}/archive` (POST, body `{archived: <bool>, reason?: <text>,
+  outcome?: <outcome>}` — its own route for the same reason, and the direction
+  rides in the body because this one toggles; both `reason` and `outcome` are
+  optional, stored as `archive_reason`/`archive_outcome` on the way in and
+  ignored on the way back). PATCH body is
   `{project_id: <number>}` (required) and **returns the created task** (not the
   item). Web UI: the **Inbox** lives above Projects in the sidebar (with an
   unread-count badge); `#/inbox` lists items, each with an "Assign to"

@@ -25,14 +25,14 @@ use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::json;
 
 use crate::core::{
-    Artifact, ArtifactPatch, Diagram, DiagramPatch, DiagramType, DiagramView, EdgeMarker, EdgeNew,
-    EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch, FrameShape, ImportDoc,
-    InboxItem, InboxKind, LIVE_TEXT_MAX, LibraryBundle, LibraryItem, LibraryKind, LibraryPatch,
-    LibraryScope, LibrarySyncStatus, LiveAction, LiveBoard, LiveBoardKind, LiveNotebookEntry,
-    LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority,
-    Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch,
-    Status, Store, Task, TaskPatch, TaskReceipt, agents, board, cc, config, files, library, live,
-    look, migrate, receipt, retro, system,
+    ArchiveOutcome, Artifact, ArtifactPatch, Diagram, DiagramPatch, DiagramType, DiagramView,
+    EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch,
+    FrameShape, ImportDoc, InboxItem, InboxKind, LIVE_TEXT_MAX, LibraryBundle, LibraryItem,
+    LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus, LiveAction, LiveBoard,
+    LiveBoardKind, LiveNotebookEntry, LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary,
+    LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg,
+    ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, TaskReceipt, agents, board, cc,
+    config, files, library, live, look, migrate, receipt, retro, system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -994,7 +994,9 @@ EXAMPLES
     /// Unlike `read` this toggles: `--undo` puts the item back in the live
     /// inbox. Both directions are idempotent. `--reason` records why
     /// ("duplicate of task 12", "shipped in abc123"); it is stored as
-    /// `archive_reason` and cleared by `--undo`.
+    /// `archive_reason` and cleared by `--undo`; `--outcome` records the same
+    /// verdict in one of four fixed words (mesa task 1248), stored as
+    /// `archive_outcome` and cleared the same way.
     Archive {
         /// Inbox item id
         id: i64,
@@ -1005,6 +1007,15 @@ EXAMPLES
         /// `archive_reason`. Meaningless with `--undo`, so the pair is a usage error
         #[arg(long, value_name = "TEXT", conflicts_with = "undo")]
         reason: Option<String>,
+        /// How the item was disposed of, in one of four fixed words; stored as
+        /// `archive_outcome`. Meaningless with `--undo`, so the pair is a usage error
+        #[arg(
+            long,
+            value_parser = parse_archive_outcome,
+            value_name = "OUTCOME",
+            conflicts_with = "undo"
+        )]
+        outcome: Option<ArchiveOutcome>,
         /// Print the item without its `body` instead of in full
         #[arg(long)]
         quiet: bool,
@@ -3158,6 +3169,12 @@ fn parse_inbox_kind(s: &str) -> std::result::Result<InboxKind, String> {
     InboxKind::parse(s).ok_or_else(|| format!("'{s}' is not one of task-summary|change-request"))
 }
 
+fn parse_archive_outcome(s: &str) -> std::result::Result<ArchiveOutcome, String> {
+    ArchiveOutcome::parse(s).ok_or_else(|| {
+        format!("'{s}' is not one of report|duplicate|not-actionable|converted-to-task")
+    })
+}
+
 fn parse_library_kind(s: &str) -> std::result::Result<LibraryKind, String> {
     LibraryKind::parse(s)
         .ok_or_else(|| format!("'{s}' is not one of agent|skill|hook|prompt|claude-md"))
@@ -4769,9 +4786,10 @@ fn run_inbox(cmd: InboxCmd) -> Result<()> {
             id,
             undo,
             reason,
+            outcome,
             quiet,
         } => print_inbox_item(
-            &store.set_inbox_item_archived(id, !undo, reason.as_deref())?,
+            &store.set_inbox_item_archived(id, !undo, reason.as_deref(), outcome)?,
             quiet,
         ),
         InboxCmd::Delete { id, quiet } => print_inbox_item(&store.delete_inbox_item(id)?, quiet),
@@ -6567,6 +6585,7 @@ mod tests {
             read_at: Some("2026-01-02 00:00:00".into()),
             archived_at: None,
             archive_reason: None,
+            archive_outcome: None,
             kind: InboxKind::TaskSummary,
             task_id: Some(3),
             task_name: Some("the task this report is about".into()),
@@ -6893,6 +6912,10 @@ mod tests {
                 // archive --reason` exists to write — a quiet echo that
                 // dropped it would read as "the reason didn't take".
                 "archive_reason",
+                // Task 1248: one of four fixed words, so bounded — and it is
+                // what `inbox archive --outcome` exists to write, the same
+                // reasoning that keeps `archive_reason`.
+                "archive_outcome",
                 // Task 846: one of two fixed words, so bounded — and it is
                 // what decides who reads the item, which a quiet echo that
                 // dropped it could not show.

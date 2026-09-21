@@ -1498,6 +1498,45 @@ impl Default for InboxKind {
     }
 }
 
+/// How an archived item was *disposed of* (mesa task 1248) — the enumerated
+/// twin of `archive_reason`, which says it in prose. Four fixed answers, so a
+/// reader can count them and an agent can be told which one to write:
+/// **report** (an item addressed to a person, nothing to do), **duplicate**
+/// (the work is already named somewhere else), **not-actionable** (the request
+/// cannot be acted on as written) and **converted-to-task** (the work now
+/// lives as a task). Nullable — an archive may still say nothing at all — and
+/// so there is no `Default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum ArchiveOutcome {
+    Report,
+    Duplicate,
+    NotActionable,
+    ConvertedToTask,
+}
+
+impl ArchiveOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArchiveOutcome::Report => "report",
+            ArchiveOutcome::Duplicate => "duplicate",
+            ArchiveOutcome::NotActionable => "not-actionable",
+            ArchiveOutcome::ConvertedToTask => "converted-to-task",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ArchiveOutcome> {
+        match s {
+            "report" => Some(ArchiveOutcome::Report),
+            "duplicate" => Some(ArchiveOutcome::Duplicate),
+            "not-actionable" => Some(ArchiveOutcome::NotActionable),
+            "converted-to-task" => Some(ArchiveOutcome::ConvertedToTask),
+            _ => None,
+        }
+    }
+}
+
 /// A global inbox item: a free-text project-update request an agent sends to
 /// one shared inbox, not yet tied to any project. The inbox lives *above*
 /// projects: items arrive unassigned, and a person later routes each one to the
@@ -1541,6 +1580,12 @@ pub struct InboxItem {
     /// by an archive and cleared by the un-archive, so it is null exactly when
     /// `archived_at` is.
     pub archive_reason: Option<String>,
+    /// How the item was disposed of (mesa task 1248) — the enumerated twin of
+    /// `archive_reason` above, one of four fixed words rather than prose, so
+    /// the answers can be counted. It rides with the stamp the same way:
+    /// written only by an archive and cleared by the un-archive, so it is null
+    /// exactly when `archived_at` is.
+    pub archive_outcome: Option<ArchiveOutcome>,
     /// The task this item is **about** (mesa task 847) — required at creation,
     /// because every item arrives from an agent working a task and an item with
     /// no origin cannot say where it came from. Null only on a row that

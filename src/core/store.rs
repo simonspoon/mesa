@@ -8,13 +8,14 @@ use super::attachments;
 use super::files;
 use super::live;
 use super::types::{
-    AnchorSide, Artifact, Attachment, Diagram, DiagramEvent, DiagramType, DiagramView, DiffStat,
-    EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit, InboxItem, InboxKind,
-    LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction, LiveBoard, LiveBoardKind,
-    LiveBoardSummary, LiveContext, LiveMemoryHit, LiveNotebookEntry, LiveNotice, LiveRole,
-    LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority, Project, RetroFinding,
-    RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind, ScriptRunRecord, ScriptRunStatus,
-    Status, Task, TaskEvent, TaskReceipt, Waypoint, is_valid_artifact_content_type, task_name,
+    AnchorSide, ArchiveOutcome, Artifact, Attachment, Diagram, DiagramEvent, DiagramType,
+    DiagramView, DiffStat, EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit,
+    InboxItem, InboxKind, LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction,
+    LiveBoard, LiveBoardKind, LiveBoardSummary, LiveContext, LiveMemoryHit, LiveNotebookEntry,
+    LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority,
+    Project, RetroFinding, RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind,
+    ScriptRunRecord, ScriptRunStatus, Status, Task, TaskEvent, TaskReceipt, Waypoint,
+    is_valid_artifact_content_type, task_name,
 };
 
 #[derive(Debug)]
@@ -1000,6 +1001,14 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE(project_id, path)
     );
     CREATE INDEX project_paths_by_project ON project_paths (project_id, added_at, id);",
+    // Task 1248: *how* an inbox item was disposed of, beside the prose
+    // `archive_reason` at index 60. One of four fixed words — `report`,
+    // `duplicate`, `not-actionable`, `converted-to-task` — written only by an
+    // archive (`set_inbox_item_archived`, optional) and cleared by the
+    // un-archive, so like the reason it is null exactly when `archived_at`
+    // is. A column rather than a second table: it is one bounded value on the
+    // row it describes.
+    "ALTER TABLE inbox ADD COLUMN archive_outcome TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1177,7 +1186,8 @@ const DIAGRAM_EVENT_COLUMNS: &str = "id, diagram_id, actor, action, summary, at"
 /// and its project's name. Both arrive through `INBOX_FROM`'s left joins, so
 /// they are null exactly when `task_id` is.
 const INBOX_COLUMNS: &str = "i.id, i.project_id, i.author, i.body, i.created_at, i.updated_at, \
-     i.read_at, i.archived_at, i.kind, i.task_id, t.description, p.name, i.archive_reason";
+     i.read_at, i.archived_at, i.kind, i.task_id, t.description, p.name, i.archive_reason, \
+     i.archive_outcome";
 
 /// Longest `archive_reason` an archive may carry (mesa task 1168): a verdict,
 /// not a report — the item's body is where the long text already is.
@@ -1193,6 +1203,7 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
     let kind: String = row.get(8)?;
     let task_id: Option<i64> = row.get(9)?;
     let description: Option<String> = row.get(10)?;
+    let outcome: Option<String> = row.get(13)?;
     Ok(InboxItem {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -1210,6 +1221,8 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
         },
         project_name: row.get(11)?,
         archive_reason: row.get(12)?,
+        archive_outcome: outcome
+            .map(|o| ArchiveOutcome::parse(&o).expect("invalid archive outcome in db")),
     })
 }
 
@@ -4815,11 +4828,17 @@ impl Store {
     /// an archived item leaves both alone, and un-archiving clears both.
     /// `reason` is ignored on the way back, so a caller cannot store one on a
     /// live item.
+    ///
+    /// `outcome` (mesa task 1248) is the enumerated twin of `reason` — one of
+    /// four fixed words rather than prose — and rides with the stamp on
+    /// exactly the same terms: written only on the archive, left alone by a
+    /// re-archive, cleared by the un-archive.
     pub fn set_inbox_item_archived(
         &mut self,
         id: i64,
         archived: bool,
         reason: Option<&str>,
+        outcome: Option<ArchiveOutcome>,
     ) -> Result<InboxItem> {
         // The read first, for the `not_found` the caller expects; the write
         // then decides on the row itself (see `mark_inbox_item_read`) so a
@@ -4834,14 +4853,14 @@ impl Store {
             }
             self.conn.execute(
                 "UPDATE inbox SET archived_at = datetime('now'), archive_reason = ?2, \
-                 updated_at = datetime('now') \
+                 archive_outcome = ?3, updated_at = datetime('now') \
                  WHERE id = ?1 AND archived_at IS NULL",
-                rusqlite::params![id, reason],
+                rusqlite::params![id, reason, outcome.map(|o| o.as_str())],
             )?;
         } else {
             self.conn.execute(
                 "UPDATE inbox SET archived_at = NULL, archive_reason = NULL, \
-                 updated_at = datetime('now') \
+                 archive_outcome = NULL, updated_at = datetime('now') \
                  WHERE id = ?1 AND archived_at IS NOT NULL",
                 [id],
             )?;
@@ -11665,7 +11684,7 @@ mod tests {
         assert_eq!(item.archived_at, None);
 
         let archived = store
-            .set_inbox_item_archived(item.id, true, Some("nothing to do"))
+            .set_inbox_item_archived(item.id, true, Some("nothing to do"), None)
             .unwrap();
         let stamp = archived
             .archived_at
@@ -11680,7 +11699,7 @@ mod tests {
 
         // Re-archiving moves neither the stamp nor the reason (mesa task 1168).
         let again = store
-            .set_inbox_item_archived(item.id, true, Some("a second verdict"))
+            .set_inbox_item_archived(item.id, true, Some("a second verdict"), None)
             .unwrap();
         assert_eq!(again.archived_at, Some(stamp));
         assert_eq!(again.updated_at, archived.updated_at);
@@ -11688,7 +11707,9 @@ mod tests {
 
         // …and back, which clears the stamp rather than adding a second one —
         // and the reason with it, so it is null exactly when the stamp is.
-        let live = store.set_inbox_item_archived(item.id, false, None).unwrap();
+        let live = store
+            .set_inbox_item_archived(item.id, false, None, None)
+            .unwrap();
         assert_eq!(live.archived_at, None);
         assert_eq!(live.archive_reason, None);
         // Archiving is independent of reading: an item can be set aside unread.
@@ -11707,7 +11728,7 @@ mod tests {
             .unwrap();
         let long = "x".repeat(INBOX_ARCHIVE_REASON_MAX + 1);
         assert!(matches!(
-            store.set_inbox_item_archived(item.id, true, Some(&long)),
+            store.set_inbox_item_archived(item.id, true, Some(&long), None),
             Err(Error::Validation(_))
         ));
         let still_live = store.get_inbox_item(item.id).unwrap();
@@ -11715,17 +11736,79 @@ mod tests {
         assert_eq!(still_live.archive_reason, None);
 
         let archived = store
-            .set_inbox_item_archived(item.id, true, Some("   "))
+            .set_inbox_item_archived(item.id, true, Some("   "), None)
             .unwrap();
         assert!(archived.archived_at.is_some());
         assert_eq!(archived.archive_reason, None);
+    }
+
+    /// Task 1248: the outcome rides with the stamp on exactly `archive_reason`'s
+    /// terms — written by the archive, left alone by a re-archive that names a
+    /// different one, cleared by the un-archive.
+    #[test]
+    fn set_inbox_item_archived_outcome_rides_with_the_stamp() {
+        let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
+        let item = store
+            .create_inbox_item(
+                None,
+                "already filed as task 3",
+                InboxKind::ChangeRequest,
+                origin,
+            )
+            .unwrap();
+        assert_eq!(item.archive_outcome, None);
+
+        let archived = store
+            .set_inbox_item_archived(item.id, true, None, Some(ArchiveOutcome::Duplicate))
+            .unwrap();
+        assert_eq!(archived.archive_outcome, Some(ArchiveOutcome::Duplicate));
+        // It survives a read back through `INBOX_COLUMNS`, not just the write.
+        assert_eq!(
+            store.get_inbox_item(item.id).unwrap().archive_outcome,
+            Some(ArchiveOutcome::Duplicate)
+        );
+
+        // A re-archive naming a different outcome leaves the stored one alone,
+        // the same `WHERE archived_at IS NULL` guard the stamp and reason get.
+        let again = store
+            .set_inbox_item_archived(item.id, true, None, Some(ArchiveOutcome::Report))
+            .unwrap();
+        assert_eq!(again.archive_outcome, Some(ArchiveOutcome::Duplicate));
+
+        // …and the un-archive clears it, so it is null exactly when the stamp is.
+        let live = store
+            .set_inbox_item_archived(item.id, false, None, None)
+            .unwrap();
+        assert_eq!(live.archived_at, None);
+        assert_eq!(live.archive_outcome, None);
+    }
+
+    /// An archive that names no outcome stores none — which is also the shape
+    /// every row written before mesa task 1248 loads in.
+    #[test]
+    fn set_inbox_item_archived_without_an_outcome_stores_none() {
+        let (mut store, _dir) = temp_store();
+        let origin = origin_task(&mut store);
+        let item = store
+            .create_inbox_item(None, "nothing to do here", InboxKind::TaskSummary, origin)
+            .unwrap();
+        let archived = store
+            .set_inbox_item_archived(item.id, true, Some("read it, nothing to do"), None)
+            .unwrap();
+        assert!(archived.archived_at.is_some());
+        assert_eq!(archived.archive_outcome, None);
+        assert_eq!(
+            store.list_inbox_items(None).unwrap()[0].archive_outcome,
+            None
+        );
     }
 
     #[test]
     fn set_inbox_item_archived_unknown_id_is_not_found() {
         let (mut store, _dir) = temp_store();
         assert!(matches!(
-            store.set_inbox_item_archived(999, true, None),
+            store.set_inbox_item_archived(999, true, None, None),
             Err(Error::NotFound(_))
         ));
     }
@@ -12902,15 +12985,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            66,
-            "a fresh db should report user_version 66"
+            67,
+            "a fresh db should report user_version 67"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 66);
+        assert_eq!(version, 67);
     }
 
     // ---- the session retrospective (mesa task 1158) ----

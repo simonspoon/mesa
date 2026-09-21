@@ -38,18 +38,19 @@ use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::core::{
-    AgentSession, AgentSpawned, AnchorSide, Artifact, ArtifactPatch, ArtifactSummary, CcDashboard,
-    CcLiveSession, CcUsage, DiagramPatch, DiagramType, EdgeMarker, EdgeNew, EdgePatch, EdgeStyle,
-    Error, FileTreeEntry, FrameNew, FramePatch, FrameShape, GitCommit, GitCommitFile, GitFileDiff,
-    GitRepoView, GitStatus, GitWorktree, InboxItem, InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP,
-    LibraryBundle, LibraryImportResult, LibraryKind, LibraryPatch, LibraryScope, LiveBoardKind,
-    LiveContext, LiveNotebookEntry, LiveNotice, LiveRole, LiveState, LiveStatus, LiveTranscript,
-    LiveWindow, MesaVersion, ModelRates, NextResult, Priority, ProjectAgents, ProjectFileTree,
-    ProjectGitLog, ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch,
-    STALE_CLAIM_MINUTES, Script, ScriptArg, ScriptPatch, ScriptRunEvent, Status, Store, SystemInfo,
-    Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard,
-    hooks, inbox_triage, library, listen, live, receipt, retro, script_runs, scripts, speech,
-    supervisor, system, version,
+    AgentSession, AgentSpawned, AnchorSide, ArchiveOutcome, Artifact, ArtifactPatch,
+    ArtifactSummary, CcDashboard, CcLiveSession, CcUsage, DiagramPatch, DiagramType, EdgeMarker,
+    EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch, FrameShape,
+    GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree, InboxItem,
+    InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP, LibraryBundle, LibraryImportResult, LibraryKind,
+    LibraryPatch, LibraryScope, LiveBoardKind, LiveContext, LiveNotebookEntry, LiveNotice,
+    LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, MesaVersion, ModelRates,
+    NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
+    ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, STALE_CLAIM_MINUTES, Script,
+    ScriptArg, ScriptPatch, ScriptRunEvent, Status, Store, SystemInfo, Task, TaskPatch,
+    TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard, hooks,
+    inbox_triage, library, listen, live, receipt, retro, script_runs, scripts, speech, supervisor,
+    system, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -3411,6 +3412,12 @@ struct InboxArchive {
     /// ignored on the way back — the un-archive clears it.
     #[serde(default)]
     reason: Option<String>,
+    /// How it was disposed of (mesa task 1248), stored as `archive_outcome`:
+    /// one of four fixed words, so an unknown one is a 422 from serde rather
+    /// than a stored value nobody can read. Optional, and ignored on the way
+    /// back like `reason`.
+    #[serde(default)]
+    outcome: Option<ArchiveOutcome>,
 }
 
 async fn list_inbox(
@@ -3469,10 +3476,13 @@ async fn archive_inbox(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let mut store = state.store.lock().unwrap();
-    Ok(
-        Json(store.set_inbox_item_archived(id, body.archived, body.reason.as_deref())?)
-            .into_response(),
-    )
+    Ok(Json(store.set_inbox_item_archived(
+        id,
+        body.archived,
+        body.reason.as_deref(),
+        body.outcome,
+    )?)
+    .into_response())
 }
 
 /// Speaks one inbox item: the item's body, verbatim, through `kokoro-rs`, back
@@ -12813,6 +12823,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             read_at: None,
             archived_at: None,
             archive_reason: None,
+            archive_outcome: None,
             kind: InboxKind::ChangeRequest,
             task_id: Some(42),
             task_name: Some("make the watcher name sessions".into()),
@@ -13097,14 +13108,14 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         assert!(inbox_item_pending(&request));
         assert!(!inbox_item_pending(&summary), "a summary is never triaged");
         let archived = store
-            .set_inbox_item_archived(request.id, true, Some("duplicate of task 3"))
+            .set_inbox_item_archived(request.id, true, Some("duplicate of task 3"), None)
             .unwrap();
         assert!(
             !inbox_item_pending(&archived),
             "an archived request has been triaged already"
         );
         let restored = store
-            .set_inbox_item_archived(request.id, false, None)
+            .set_inbox_item_archived(request.id, false, None, None)
             .unwrap();
         assert!(inbox_item_pending(&restored), "un-archiving puts it back");
     }
@@ -13144,7 +13155,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 .store
                 .lock()
                 .unwrap()
-                .set_inbox_item_archived(item.id, true, Some("shipped in abc123"))
+                .set_inbox_item_archived(item.id, true, Some("shipped in abc123"), None)
                 .unwrap();
             state.inbox_dispatched.lock().unwrap().clear();
             inbox_watcher_tick(&state);
@@ -13164,7 +13175,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 .store
                 .lock()
                 .unwrap()
-                .set_inbox_item_archived(item.id, false, None)
+                .set_inbox_item_archived(item.id, false, None, None)
                 .unwrap();
             inbox_watcher_tick(&state);
             let log = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -13234,7 +13245,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 .store
                 .lock()
                 .unwrap()
-                .set_inbox_item_archived(item.id, true, Some("not actionable"))
+                .set_inbox_item_archived(item.id, true, Some("not actionable"), None)
                 .unwrap();
             std::fs::write(
                 &agents_file,

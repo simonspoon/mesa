@@ -4,6 +4,8 @@ import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { usePhoneTier } from '../phoneTier'
+import { nextResizeFrame } from '../ptyResize'
+import type { PtyGeometry } from '../ptyResize'
 
 // xterm's font size is a JS option, not a stylesheet property — but the
 // *breakpoint* that chooses it still lives in CSS alone (`--pty-font-size`,
@@ -14,6 +16,13 @@ import { usePhoneTier } from '../phoneTier'
 // Measured at 390x844 (mesa task 560): 13px gives a 7.02px cell, i.e. 48
 // columns of a 337px screen; 11px gives 56. The pane is the whole phone, so
 // the columns are worth more than the extra 2px of glyph.
+// How long the geometry has to hold still before the PTY is told about it. A
+// drag or an Auto Tile rebuild produces a resize per animation frame, and each
+// one is a real SIGWINCH to the TUI on the other end; only where the drag
+// *stops* is a size anybody meant. Long enough to swallow a drag, short enough
+// that a settled pane is the right size before the next keystroke.
+const RESIZE_DEBOUNCE_MS = 150
+
 function ptyFontSize(): number {
   const v = getComputedStyle(document.documentElement).getPropertyValue('--pty-font-size')
   const n = Number.parseFloat(v)
@@ -74,6 +83,9 @@ export function PtyTerminal({
   // would tear down and reopen the socket each time.
   const registerRef = useRef(registerSend)
   const reconnectRef = useRef(registerReconnect)
+  // Only the timer lives here; what is worth sending is `nextResizeFrame`'s,
+  // and the last frame actually sent is per-socket (below).
+  const resizeTimer = useRef<number | null>(null)
   useEffect(() => {
     registerRef.current = registerSend
     reconnectRef.current = registerReconnect
@@ -127,11 +139,15 @@ export function PtyTerminal({
     reconnectRef.current?.(() => setEpoch((e) => e + 1))
     const encoder = new TextEncoder()
     ws.onmessage = (ev) => term.write(new Uint8Array(ev.data as ArrayBuffer))
+    // Per socket, not per component: a fresh connection has told the new PTY
+    // nothing yet, so the first geometry after a reconnect is always news.
+    let lastSent: PtyGeometry | null = null
     ws.onopen = () => {
       // Resizes fit()'d during the CONNECTING window were dropped (the guard
       // below only sends when OPEN); push the current size once so the PTY
       // matches the actual viewport rather than the initial query-param size.
-      ws.send(JSON.stringify({ resize: { cols: term.cols, rows: term.rows } }))
+      lastSent = { cols: term.cols, rows: term.rows }
+      ws.send(JSON.stringify({ resize: lastSent }))
       // Handed out only once the socket is open, and withdrawn again below the
       // moment it closes: an outside writer (the chat composer) has no
       // keyboard in front of it to notice a dropped message, so "there is no
@@ -157,9 +173,19 @@ export function PtyTerminal({
     const dataSub = term.onData((d) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(encoder.encode(d))
     })
+    // The one point where a resize frame reaches the wire — every caller of
+    // `fit()` (the observer below, the tier effect, a reparent) arrives here,
+    // which is why the coalescing is here and not in any one of them.
     const resizeSub = term.onResize(({ cols, rows }) => {
-      if (ws.readyState === WebSocket.OPEN)
-        ws.send(JSON.stringify({ resize: { cols, rows } }))
+      if (resizeTimer.current !== null) clearTimeout(resizeTimer.current)
+      resizeTimer.current = window.setTimeout(() => {
+        resizeTimer.current = null
+        if (ws.readyState !== WebSocket.OPEN) return
+        const frame = nextResizeFrame(lastSent, { cols, rows })
+        if (frame === null) return
+        lastSent = frame
+        ws.send(JSON.stringify({ resize: frame }))
+      }, RESIZE_DEBOUNCE_MS)
     })
     const observer = new ResizeObserver(() => fit.fit())
     observer.observe(el)
@@ -172,6 +198,10 @@ export function PtyTerminal({
       registerRef.current?.(null)
       reconnectRef.current?.(null)
       observer.disconnect()
+      if (resizeTimer.current !== null) {
+        clearTimeout(resizeTimer.current)
+        resizeTimer.current = null
+      }
       dataSub.dispose()
       resizeSub.dispose()
       ws.close()

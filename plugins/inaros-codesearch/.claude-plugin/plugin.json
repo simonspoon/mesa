@@ -1,0 +1,9 @@
+{
+  "name": "inaros-codesearch",
+  "version": "0.1.0",
+  "description": "Structural code search for agents: registers the `codesearch` tool, which drives the helios index (symbols, deps, flow, summary, files, diff, status) instead of grepping.",
+  "author": {
+    "name": "Simon Spoon",
+    "email": "simon@sjspoon.com"
+  }
+}

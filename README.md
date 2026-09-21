@@ -440,6 +440,23 @@ start locations in the global Agents sidebar.
   <id>` or `POST /api/tasks/{id}/execute`, with the full task JSON on stdin and
   the project's `local_path` as cwd. The hook's exit code and output come back
   as data.
+- **Claude Code plugins**: mesa hosts plugins of its own under `plugins/`,
+  listed by relative path in the marketplace manifest at
+  `.claude-plugin/marketplace.json`. Add the repo as a marketplace once, then
+  install from it:
+
+  ```bash
+  claude plugin marketplace add /path/to/mesa
+  claude plugin install inaros-codesearch@mesa
+  ```
+
+  There is one so far — `inaros-codesearch`, which registers a `codesearch`
+  tool that drives the external `helios` index (symbols, deps, flow) instead of
+  grepping. Installing copies the plugin into `~/.claude/plugins/cache` keyed by
+  its version, so an edit here reaches a session only after a `version` bump in
+  its `.claude-plugin/plugin.json` and a `claude plugin update`; to develop
+  against the working tree instead, run `claude --plugin-dir
+  plugins/inaros-codesearch`, which reads the folder live.
 - **CC Dashboard** (`mesa cc`, sidebar entry in the web UI): analytics over
   Claude Code's own session transcripts — tokens, estimated cost, and
   model/skill/agent/project/tool breakdowns — plus live subscription-limit

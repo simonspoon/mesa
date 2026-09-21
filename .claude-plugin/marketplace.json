@@ -1,0 +1,15 @@
+{
+  "name": "mesa",
+  "description": "Claude Code plugins hosted in the mesa repo.",
+  "owner": {
+    "name": "Simon Spoon",
+    "email": "simon@sjspoon.com"
+  },
+  "plugins": [
+    {
+      "name": "inaros-codesearch",
+      "source": "./plugins/inaros-codesearch",
+      "description": "Structural code search for agents: registers the `codesearch` tool, which drives the helios index (symbols, deps, flow, summary, files, diff, status) instead of grepping."
+    }
+  ]
+}

@@ -79,25 +79,55 @@ export function transcriptFor(
 }
 
 /**
- * The next turn the page has to act on, oldest first — a mesa turn the browser
- * has not played and this page has not already taken in hand.
+ * Every turn the page still has to act on, oldest first — the mesa turns the
+ * browser has not played and this page has not already taken in hand.
  *
  * `played_at` is the server's record and `handled` is this page's: the stamp
  * only lands on the *next* poll, so without the second set every poll in that
  * window would start the same turn again. A user turn is never a candidate —
  * the page wrote it, and it is not spoken back.
+ *
+ * The whole list rather than only its head, because a page that may not
+ * *speak* (mesa task 1267 — it is not the session's speaker) still walks past
+ * the turns it cannot say to perform what they do to the browser. It takes
+ * none of them in hand, so each stays on this list until somebody speaks it.
+ */
+export function pendingTurns(
+  turns: readonly LiveTurn[],
+  handled: ReadonlySet<number>,
+): LiveTurn[] {
+  return turns.filter(
+    (turn) => turn.role === 'mesa' && turn.played_at === null && !handled.has(turn.id),
+  )
+}
+
+/**
+ * The next turn the page has to act on — [`pendingTurns`]'s head, and the
+ * whole of what a page that may speak ever needs.
  */
 export function nextUnplayed(
   turns: readonly LiveTurn[],
   handled: ReadonlySet<number>,
 ): LiveTurn | null {
-  for (const turn of turns) {
-    if (turn.role !== 'mesa') continue
-    if (turn.played_at !== null) continue
-    if (handled.has(turn.id)) continue
-    return turn
-  }
-  return null
+  return pendingTurns(turns, handled)[0] ?? null
+}
+
+/**
+ * Whether this page still has a turn's *action* to perform: it does something
+ * to the browser, and this page has not done it yet.
+ *
+ * A second record beside `handled`, and deliberately not the same one (mesa
+ * task 1267). The two sets answer different questions: `handled` is "this page
+ * took the turn in hand to **say** it", `performed` is "this page has already
+ * done what the turn does to the browser". Conflating them orphaned a turn
+ * that a non-speaking page skipped — it was in `handled` for ever, with
+ * nothing to re-admit it, so the page could never say it even once the claim
+ * went free. Every browser showing the conversation performs a `navigate` or a
+ * sidebar fold, exactly once each; only one of them says the words.
+ */
+export function actsOn(turn: LiveTurn, performed: ReadonlySet<number>): boolean {
+  if (performed.has(turn.id)) return false
+  return navigateTarget(turn) !== null || sidebarsIntent(turn) !== null
 }
 
 /**

@@ -45,11 +45,15 @@
 #      survives for `look` to match — task 1016), an impossible box refused,
 #      and which window the box picks: the person's rather than
 #      the headless `mesa` beside it, `unavailable` when nothing is at the box
-#      (or no browser reported one), `conflict` when two windows are;
+#      (or no browser reported one), `conflict` when two windows are; plus the
+#      speaker claim (mesa task 1267) — `POST /api/live/speaker` naming one
+#      client, a route report carrying an id refreshing but never stealing it,
+#      a second client's press moving it, the bounds, and `GET /api/live`
+#      carrying it on the poll the page already makes;
 #   9. the security boundary in default mode — the Host allowlist, the
-#      Content-Type gate on every live write, and the agent gate on the three
-#      routes that carry it (POST/DELETE /api/live, speak) contrasted with the
-#      plain guard on their neighbours;
+#      Content-Type gate on every live write, and the agent gate on the four
+#      routes that carry it (POST/DELETE /api/live, speak, the speaker claim)
+#      contrasted with the plain guard on their neighbours;
 #  10. the same boundary under `--lan`: Host skipped, Content-Type still
 #      firing, and the agent-gated routes keeping their stronger gate;
 #  15. the handoff (mesa task 1150): `mesa live handoff` spawning a successor
@@ -1325,6 +1329,83 @@ run 0 "$MESA" live status
 [ "$(jqs .window.height)" = "982" ] || fail "two clients: the CLI must still see its height"
 ok "two clients on one session: a route-only report keeps the context and box it cannot speak for"
 
+# ---- the speaker claim (mesa task 1267) ----
+#
+# The other thing two clients on one conversation do: both speak it. Every
+# page that has ever pressed Go live or Listen has audio, and `played_at` is
+# stamped only once a turn has finished sounding — a record of what was said,
+# never a claim on what is about to be — so each tab said every reply, half a
+# beat apart. The session now names ONE speaker: claimed by a press, refreshed
+# by that same browser's route report, and never movable by a passive one.
+[ "$(jqb .speaker)" = "null" ] ||
+  fail "speaker: an unclaimed conversation must read null (got $(jqb .speaker))"
+api 200 POST "/api/live/speaker" '{"client":"tab-a"}'
+[ "$(jqb .speaker)" = "tab-a" ] || fail "speaker: the claim must name the claiming client"
+run 0 "$MESA" live status
+[ "$(jqs .speaker)" = "tab-a" ] || fail "speaker: the CLI must read the same claim"
+
+# The other tab, polling away with its own id in the report: the voice does
+# not move. Then the speaker's own report, which is a refresh and keeps it.
+api 200 POST "/api/live/route" '{"route":"#/inbox","client":"tab-b"}'
+[ "$(jqb .speaker)" = "tab-a" ] ||
+  fail "speaker: a passive route report must never take the claim"
+api 200 POST "/api/live/route" '{"route":"#/inbox","client":"tab-a"}'
+[ "$(jqb .speaker)" = "tab-a" ] || fail "speaker: the speaker's own report must keep its claim"
+
+# A press on the second browser moves it outright — the person saying they
+# want to hear the conversation there — and the page learns it on the poll it
+# already makes rather than through anything new.
+api 200 POST "/api/live/speaker" '{"client":"tab-b"}'
+[ "$(jqb .speaker)" = "tab-b" ] || fail "speaker: a second client's press must move the claim"
+api 200 GET "/api/live"
+[ "$(jqb .session.speaker)" = "tab-b" ] ||
+  fail "speaker: GET /api/live must carry the speaker on the 2s poll"
+
+# Bounded and non-empty like every other stored string, and a refusal writes
+# nothing — the voice stays where the last good press put it.
+api 422 POST "/api/live/speaker" '{"client":"   "}'
+[ "$(jqb .error.code)" = "validation" ] || fail "speaker: an empty client id must be validation"
+LONG_CLIENT=$(printf 'x%.0s' $(seq 1 65))
+api 422 POST "/api/live/speaker" "{\"client\":\"$LONG_CLIENT\"}"
+[ "$(jqb .error.code)" = "validation" ] || fail "speaker: an over-long client id must be validation"
+api 200 GET "/api/live"
+[ "$(jqb .session.speaker)" = "tab-b" ] || fail "speaker: a refused claim must write nothing"
+# …and the route report it was riding on is unaffected: the box `live look`
+# matches below is still the desktop's.
+[ "$(jqb .session.window.width)" = "1512" ] ||
+  fail "speaker: claiming the voice must not touch the reported window box"
+ok "the speaker claim: a press names one client, a passive report refreshes but never steals, and GET /api/live carries it"
+
+# A report mesa REFUSES writes nothing — the refresh included. Proving the
+# refresh did not land needs a claim old enough to tell apart, and
+# `datetime('now')` has one-second resolution, so the age is backdated in the
+# db rather than waited out (`library-check.sh`'s own sqlite3 section, and its
+# guard): an hour-old claim reads as unclaimed, an invalid route from its own
+# client is 422 and leaves it that way, and the same report with a valid route
+# revives it. This pins the ten-second expiry over HTTP too — a tab that was
+# closed frees the conversation rather than leaving it mute.
+if command -v sqlite3 >/dev/null; then
+  api 200 POST "/api/live/speaker" '{"client":"tab-b"}'
+  sqlite3 "$MESA_DB" \
+    "UPDATE live_sessions SET speaker_seen_at = datetime('now','-1 hour') WHERE id = $SS;"
+  api 200 GET "/api/live"
+  [ "$(jqb .session.speaker)" = "null" ] ||
+    fail "speaker: a claim nobody refreshed must read back as unclaimed"
+  api 422 POST "/api/live/route" '{"route":"not-a-hash","client":"tab-b"}'
+  [ "$(jqb .error.code)" = "validation" ] || fail "speaker: a bad route must be validation"
+  api 200 GET "/api/live"
+  [ "$(jqb .session.speaker)" = "null" ] ||
+    fail "speaker: a refused route report must NOT refresh the claim it carried"
+  [ "$(jqb .session.route)" = "#/inbox" ] ||
+    fail "speaker: a refused route report must not move the route either"
+  api 200 POST "/api/live/route" '{"route":"#/inbox","client":"tab-b"}'
+  [ "$(jqb .speaker)" = "tab-b" ] ||
+    fail "speaker: a good report from the speaker must revive its own claim"
+  ok "the speaker claim: it expires unrefreshed, and a report mesa refuses writes nothing — the refresh included"
+else
+  echo "skip: sqlite3 is not installed — the stale-claim/refused-report case needs it"
+fi
+
 if [ "$(uname -s)" != "Darwin" ]; then
   # loki drives macOS's own window server, and mesa says so before it goes
   # looking for a binary that could never have worked here — "not installed"
@@ -1433,7 +1514,7 @@ ok "Host allowlist: a foreign Host is 403 on read and write; both allowlisted sp
 # --lan the route does not exist at all (section 12), so the loop's "must be
 # 415" expectation would not hold there.
 for p in "/api/live" "/api/live/utterance" "/api/live/route" "/api/live/turns/$SPOKEN/played" \
-         "/api/live/transcribe"; do
+         "/api/live/speaker" "/api/live/transcribe"; do
   raw POST "$p"
   [ "$STATUS" = "415" ] || fail "POST $p without Content-Type: expected 415, got $STATUS"
   [ "$(jqb .error.code)" = "validation" ] || fail "POST $p no Content-Type: error.code"
@@ -1444,7 +1525,7 @@ raw DELETE "/api/live" -d 'x=1'
 [ "$STATUS" = "415" ] || fail "DELETE /api/live without JSON Content-Type: expected 415, got $STATUS"
 raw GET "/api/live"
 [ "$STATUS" = "200" ] || fail "GET /api/live is exempt from the Content-Type gate"
-ok "Content-Type gate: every live mutation (POST ×5, DELETE) is 415 without JSON; GET is exempt"
+ok "Content-Type gate: every live mutation (POST ×6, DELETE) is 415 without JSON; GET is exempt"
 
 # ---- the agent gate on the three routes that carry it ----
 #
@@ -1464,6 +1545,11 @@ origin_status() { # origin_status <method> <path> <origin> [json-body]
   fail "DELETE /api/live with a foreign Origin must be 403"
 speak "/api/live/turns/$SPOKEN/speak" -H 'Origin: http://evil.example'
 [ "$STATUS" = "403" ] || fail "speak with a foreign Origin must be 403, got $STATUS"
+# The speaker claim (mesa task 1267) carries the same gate: deciding which
+# machine in the house starts talking is the agent routes' posture, not a task
+# edit's — so a foreign Origin is refused here too.
+[ "$(origin_status POST "/api/live/speaker" 'https://evil.example' '{"client":"tab-evil"}')" = "403" ] ||
+  fail "POST /api/live/speaker with a foreign Origin must be 403"
 # …while the plain-guard neighbours are served with that same Origin.
 [ "$(origin_status GET "/api/live" 'https://evil.example')" = "200" ] ||
   fail "GET /api/live must stay on the plain guard (foreign Origin)"
@@ -1475,7 +1561,12 @@ speak "/api/live/turns/$SPOKEN/speak" -H 'Origin: http://evil.example'
   fail "POST /api/live/turns/{id}/played must stay on the plain guard (foreign Origin)"
 [ "$(origin_status POST "/api/live" 'http://localhost:7770' '{}')" = "409" ] ||
   fail "POST /api/live from a local Origin must reach the handler (409: one is live)"
-ok "agent gate: start/stop/speak refuse a foreign Origin; the plain-guard live writes do not"
+[ "$(origin_status POST "/api/live/speaker" 'http://localhost:7770' '{"client":"tab-b"}')" = "200" ] ||
+  fail "POST /api/live/speaker from a local Origin must reach the handler"
+api 200 GET "/api/live"
+[ "$(jqb .session.speaker)" = "tab-b" ] ||
+  fail "the refused foreign-Origin claim must not have taken the voice"
+ok "agent gate: start/stop/speak/speaker refuse a foreign Origin; the plain-guard live writes do not"
 
 # The speak route's second half: a cross-site <audio> subresource sends NO
 # Origin, so `Sec-Fetch-Site` is what refuses it — exactly as the inbox's.
@@ -1555,11 +1646,21 @@ speak "/api/live/turns/$SPOKEN/speak" -H "Host: 192.0.2.7:$LAN_PORT"
 [ "$STATUS" = "200" ] || fail "--lan speak: an IP-literal Host must be served, got $STATUS"
 speak "/api/live/turns/$SPOKEN/speak" -H "Host: 192.0.2.7:999"
 [ "$STATUS" = "403" ] || fail "--lan speak: an IP Host on a foreign port must be 403, got $STATUS"
+# The speaker claim relaxes rather than refusing under --lan, like every other
+# route on this gate: a page this server handed a phone may ask to hear the
+# conversation there, while the rebinding defense stays shut.
+[ "$(lan_status POST "/api/live/speaker" 'evil.example' '{"client":"tab-evil"}')" = "403" ] ||
+  fail "--lan: POST /api/live/speaker must still refuse a DNS-name Host"
+[ "$(lan_status POST "/api/live/speaker" "127.0.0.1:$LAN_PORT" '{"client":"the-phone"}')" = "200" ] ||
+  fail "--lan: POST /api/live/speaker from a local Host must reach the handler"
+raw GET "/api/live" -H "Host: 127.0.0.1:$LAN_PORT"
+[ "$(jqb .session.speaker)" = "the-phone" ] ||
+  fail "--lan: the claim a LAN page made must be the one the poll carries"
 # Still 409 rather than 403 for a local Host: the gate passed and the handler
 # refused, which is what proves the 403s above were the gate and not the store.
 [ "$(lan_status POST "/api/live" "127.0.0.1:$LAN_PORT" '{}')" = "409" ] ||
   fail "--lan: POST /api/live from a local Host must reach the handler"
-ok "--lan: start/stop/speak keep the agent gate (DNS Host 403, local/IP-literal Host through to the handler)"
+ok "--lan: start/stop/speak/speaker keep the agent gate (DNS Host 403, local/IP-literal Host through to the handler)"
 
 [ "$(lan_status DELETE "/api/live" "127.0.0.1:$LAN_PORT" '{}')" = "200" ] ||
   fail "--lan: DELETE /api/live from a local Host must end the session"

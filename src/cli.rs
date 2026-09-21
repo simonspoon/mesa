@@ -3584,8 +3584,8 @@ const QUIET_DROP_FRAME_EDGE: &[&str] = &[];
 const QUIET_DROP_LIVE_TURN: &[&str] = &["text"];
 /// A `LiveSession` has no unbounded field either — ids, one of two status
 /// words, a 200-char route, a four-field context each of whose free-text
-/// fields `Store` caps at 200 chars, a four-integer window box, and
-/// timestamps — so quiet output equals full output. The flag is accepted across the group for uniformity.
+/// fields `Store` caps at 200 chars, a four-integer window box, a 64-char
+/// client id and timestamps — so quiet output equals full output. The flag is accepted across the group for uniformity.
 const QUIET_DROP_LIVE_SESSION: &[&str] = &[];
 /// Keys dropped from a `LiveSummary` under `--quiet` (task 921): its own
 /// unbounded prose body. `session_id`/`created_at`/`updated_at` all stay.
@@ -6680,6 +6680,7 @@ mod tests {
             ended_at: None,
             working_since: Some("2026-01-02 00:00:01".into()),
             resting_since: None,
+            speaker: Some("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0".into()),
         }
     }
 
@@ -7144,6 +7145,10 @@ mod tests {
                 // Bounded (a timestamp or null): the session resting while a
                 // dream pass runs at a handoff (mesa task 1155).
                 "resting_since",
+                // Bounded (an opaque client id of at most 64 chars, or null):
+                // which browser is speaking this conversation aloud (mesa
+                // task 1267).
+                "speaker",
             ]),
             "LiveSession gained/lost a field: every field it has today is \
              bounded — ids, fixed words, timestamps, a 200-char route, a \

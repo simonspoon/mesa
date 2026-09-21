@@ -1033,6 +1033,24 @@ const MIGRATIONS: &[&str] = &[
         first_seen_at TEXT    NOT NULL,
         PRIMARY KEY (finding_id, session_id)
     );",
+    // Task 1267: which browser speaks this conversation aloud. Two mesa tabs
+    // open on one live session each satisfied the page's own playback
+    // predicate, so every reply was said twice: `played_at` is stamped only
+    // *after* a turn has finished sounding, which makes it a record of what
+    // was said rather than a claim on what is about to be, and the set of
+    // turns a page has taken in hand is per-browser React state. Nothing in
+    // the session named a client at all.
+    //
+    // `speaker` is that claim and `speaker_seen_at` is what keeps it honest.
+    // The claim is taken by a deliberate press (Go live, Listen, unmute,
+    // Resume) and refreshed by the claiming browser's own route report, so a
+    // tab that was closed stops refreshing and its claim goes stale — read
+    // back as no claim at all, which frees the conversation rather than
+    // leaving it mute for the tabs that are still open. Null on every row
+    // from before this column, which is exactly the unclaimed conversation
+    // every client may speak.
+    "ALTER TABLE live_sessions ADD COLUMN speaker TEXT;
+    ALTER TABLE live_sessions ADD COLUMN speaker_seen_at TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1252,8 +1270,19 @@ fn row_to_inbox_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboxItem> {
 
 // ---- mesa live (task 855) ----
 
+/// The session's columns, plus one derived value: the **speaker** (mesa task
+/// 1267), which reads as the claiming client only while the claim is fresh.
+///
+/// Ten seconds is long enough that the page's own 2s route report keeps a
+/// live tab's claim alive with three reports' worth of slack, and short
+/// enough that a tab closed mid-conversation leaves it silent for only a
+/// moment. It is judged here, in SQL, on the **store's** clock — the posture
+/// `stale_claim_minutes` takes — rather than handed to the page as two
+/// timestamps to subtract: a browser with a skewed clock must not get to
+/// decide it is still the one speaking.
 const LIVE_SESSION_COLUMNS: &str = "id, project_id, agent_id, status, route, started_at, \
-     updated_at, ended_at, context, working_since, window_box, lease, resting_since";
+     updated_at, ended_at, context, working_since, window_box, lease, resting_since, \
+     CASE WHEN speaker_seen_at >= datetime('now', '-10 seconds') THEN speaker END";
 
 /// What [`Store::live_rest`] answers for a resting session (mesa task 1155).
 #[derive(Debug, Clone, PartialEq)]
@@ -1352,6 +1381,7 @@ fn row_to_live_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveSession>
         working_since: row.get(9)?,
         lease: row.get(11)?,
         resting_since: row.get(12)?,
+        speaker: row.get(13)?,
     })
 }
 
@@ -1556,6 +1586,32 @@ fn validate_live_route(route: &str) -> Result<String> {
         )));
     }
     Ok(route.to_string())
+}
+
+/// Longest a client id may be. It is a browser's own opaque id
+/// (`frontend/src/liveSpeaker.ts` generates a uuid), never anything a person
+/// types, so the bound is only here to refuse a body that is not one.
+const LIVE_CLIENT_MAX: usize = 64;
+
+/// The one client-id rule, shared by the speaker claim and the refresh an
+/// ordinary route report carries: non-empty and bounded. Opaque to `Store`
+/// otherwise — mesa never shows a client id, never speaks it and never hands
+/// it to an agent; it exists only so two browsers can tell each other apart.
+///
+/// Public because the route handler judges the id it was sent **before** it
+/// writes the report it rode in on: the refresh is a second statement, and a
+/// report mesa is going to refuse must not leave one behind.
+pub fn validate_live_client(client: &str) -> Result<String> {
+    let client = client.trim();
+    if client.is_empty() {
+        return Err(Error::Validation("client id must not be empty".into()));
+    }
+    if client.chars().count() > LIVE_CLIENT_MAX {
+        return Err(Error::Validation(format!(
+            "client id must be at most {LIVE_CLIENT_MAX} characters"
+        )));
+    }
+    Ok(client.to_string())
 }
 
 /// The context rule, the twin of [`validate_live_route`]: trim every free-text
@@ -5241,6 +5297,53 @@ impl Store {
             (id, &route, context_given, &context, window_given, &window),
         )?;
         self.get_live_session(id)
+    }
+
+    /// Claims this browser as the session's **speaker** (mesa task 1267) — the
+    /// one client that says mesa's turns out loud.
+    ///
+    /// Claiming is always a **deliberate press** — Go live, Listen, unmute,
+    /// Resume — and never a poll, which is the whole of the rule: a tab
+    /// sitting in the background can report its route all day and never take
+    /// the voice away from the browser the person is actually talking to.
+    /// Between presses the newest one wins outright, with no arbitration to
+    /// lose: pressing Listen on a second machine is someone saying they want
+    /// to hear the conversation *there*.
+    ///
+    /// The claim is stamped rather than counted, so it is also self-expiring
+    /// — see [`LIVE_SESSION_COLUMNS`] for the ten seconds and why the store's
+    /// clock judges them.
+    pub fn claim_live_speaker(&mut self, id: i64, client: &str) -> Result<LiveSession> {
+        let client = validate_live_client(client)?;
+        self.get_live_session(id)?;
+        self.conn.execute(
+            "UPDATE live_sessions SET speaker = ?2, speaker_seen_at = datetime('now'), \
+             updated_at = datetime('now') WHERE id = ?1",
+            (id, &client),
+        )?;
+        self.get_live_session(id)
+    }
+
+    /// Keeps a claim alive, and **only** that: a client that already is the
+    /// speaker refreshes its own `speaker_seen_at`, and one that is not
+    /// changes nothing whatever. This is what the page's ordinary route
+    /// report carries, so a tab that is still open keeps the voice without
+    /// pressing anything — and a tab that was closed stops refreshing, its
+    /// claim goes stale and the conversation is speakable again by whoever is
+    /// left. A passive report never *takes* the claim; only
+    /// [`Store::claim_live_speaker`] does.
+    ///
+    /// Answers nothing: the caller reads the session back regardless, and "I
+    /// am not the speaker" is not news to a report whose subject was where
+    /// the browser is.
+    pub fn touch_live_speaker(&mut self, id: i64, client: &str) -> Result<()> {
+        let client = validate_live_client(client)?;
+        self.conn.execute(
+            "UPDATE live_sessions SET speaker_seen_at = datetime('now') \
+             WHERE id = ?1 AND speaker = ?2",
+            (id, &client),
+        )?;
+        Ok(())
     }
 
     /// Records one utterance. The single write path for turns, and where every
@@ -12644,6 +12747,120 @@ mod tests {
         }
     }
 
+    /// The speaker claim (mesa task 1267): one client at a time, taken by a
+    /// press, and the newest press wins — the person pressing Listen on a
+    /// second machine is saying they want to hear it there.
+    #[test]
+    fn claiming_the_speaker_names_one_client_and_the_newest_press_wins() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        assert_eq!(session.speaker, None, "a fresh conversation is unclaimed");
+
+        let claimed = store.claim_live_speaker(session.id, "  tab-a  ").unwrap();
+        assert_eq!(claimed.speaker.as_deref(), Some("tab-a"));
+        assert_eq!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .speaker
+                .as_deref(),
+            Some("tab-a"),
+        );
+
+        let moved = store.claim_live_speaker(session.id, "tab-b").unwrap();
+        assert_eq!(moved.speaker.as_deref(), Some("tab-b"));
+
+        for bad in ["", "   ", &"x".repeat(LIVE_CLIENT_MAX + 1)] {
+            let err = store.claim_live_speaker(session.id, bad).unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "{bad:?}: {err:?}");
+        }
+        // A refused claim wrote nothing: the speaker is still whoever pressed.
+        assert_eq!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .speaker
+                .as_deref(),
+            Some("tab-b"),
+        );
+    }
+
+    /// The refresh an ordinary route report carries keeps the speaker's own
+    /// claim alive and does nothing at all for anyone else — a passive poll
+    /// is never how the voice moves.
+    #[test]
+    fn a_route_report_refreshes_only_the_speakers_own_claim() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store.claim_live_speaker(session.id, "tab-a").unwrap();
+
+        // The other tab, polling away: still not the speaker, and its report
+        // has not even reset the clock on the claim it does not hold.
+        store.touch_live_speaker(session.id, "tab-b").unwrap();
+        assert_eq!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .speaker
+                .as_deref(),
+            Some("tab-a"),
+        );
+
+        // Backdate the claim past the window, then let each tab report. Only
+        // the speaker's own report brings it back.
+        let backdate = |store: &mut Store| {
+            store
+                .conn
+                .execute(
+                    "UPDATE live_sessions SET speaker_seen_at = \
+                     datetime('now', '-30 seconds') WHERE id = ?1",
+                    [session.id],
+                )
+                .unwrap();
+        };
+        backdate(&mut store);
+        store.touch_live_speaker(session.id, "tab-b").unwrap();
+        assert_eq!(
+            store.get_live_session(session.id).unwrap().speaker,
+            None,
+            "a stranger's report must not revive a claim",
+        );
+        store.touch_live_speaker(session.id, "tab-a").unwrap();
+        assert_eq!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .speaker
+                .as_deref(),
+            Some("tab-a"),
+        );
+    }
+
+    /// A claim nobody refreshes goes stale and reads as no claim at all, so a
+    /// tab closed mid-conversation leaves it speakable rather than mute — and
+    /// the next press takes it cleanly.
+    #[test]
+    fn a_speaker_claim_that_is_not_refreshed_goes_stale() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store.claim_live_speaker(session.id, "closed-tab").unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE live_sessions SET speaker_seen_at = \
+                 datetime('now', '-30 seconds') WHERE id = ?1",
+                [session.id],
+            )
+            .unwrap();
+        assert_eq!(store.get_live_session(session.id).unwrap().speaker, None);
+        assert_eq!(store.current_live_session().unwrap().unwrap().speaker, None);
+
+        let taken = store
+            .claim_live_speaker(session.id, "the-tab-left")
+            .unwrap();
+        assert_eq!(taken.speaker.as_deref(), Some("the-tab-left"));
+    }
+
     #[test]
     fn add_live_turn_records_both_sides_of_the_conversation() {
         let (mut store, _dir) = temp_store();
@@ -13128,15 +13345,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            69,
-            "a fresh db should report user_version 69"
+            70,
+            "a fresh db should report user_version 70"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 69);
+        assert_eq!(version, 70);
     }
 
     // ---- the session retrospective (mesa task 1158) ----

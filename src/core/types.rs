@@ -3855,6 +3855,19 @@ pub struct LiveSession {
     /// queue as ever — but nothing is being worked on, which is what the
     /// page shows. Cleared by ending the session.
     pub resting_since: Option<String>,
+    /// Which browser speaks this conversation aloud (mesa task 1267), or null
+    /// while nobody has claimed it — in which case every client that has had
+    /// a press may speak, which is what mesa did before this field existed
+    /// and what an external client that knows nothing of this rule still
+    /// does.
+    ///
+    /// **Derived on every read**, never the raw column: a claim is refreshed
+    /// by the claiming browser's own route report, and one that has not been
+    /// refreshed for ten seconds reads as null — a tab that was closed must
+    /// not leave the conversation mute. So the page compares this with its
+    /// own client id and needs no clock of its own
+    /// (`frontend/src/liveSpeaker.ts`).
+    pub speaker: Option<String>,
 }
 
 /// One utterance in a live conversation — a dictated line from the user, or a

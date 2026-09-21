@@ -588,6 +588,13 @@ heard, never moved and never cleared, and idempotent so the poll can fire it
 without tracking whether it already has. `list_live_turns` takes an exclusive
 `after` cursor and clamps `limit` into `1..=500`.
 
+It is a **record, never a claim**: it lands once a turn has finished sounding,
+so two browsers both holding an unlocked page will both start the same turn
+long before either stamps it. That is why the session also names a
+[**speaker**](#which-browser-speaks-mesa-task-1267) — and why the claim is a
+separate column rather than an earlier `played_at`, which would say a turn had
+been heard before anyone had heard it.
+
 `notice` (mesa task 1157) marks a `mesa` turn mesa itself wrote about the
 agent — `permission` — rather than one the agent said; it is
 written only by `Store::add_live_notice`, never by `add_live_turn`, and is
@@ -1646,6 +1653,7 @@ takes exactly one value.
 | `POST /api/live/utterance` `{text}` | the dictated user turn | standard write |
 | `POST /api/live/notice` `{kind}` | the notice turn, **200** created or existing (deduped per working span, mesa task 1157); an unknown `kind` is 422 | standard write |
 | `POST /api/live/route` `{route, context?, window?}` | the session, route, context **and window box** recorded — an omitted `context`/`window` leaves the stored one alone, an explicit `null` clears it | standard write |
+| `POST /api/live/speaker` `{client}` | the session, this client now its **speaker** (mesa task 1267) | `require_agent_access` |
 | `POST /api/live/turns/{id}/played` | the stamped turn | standard write |
 | `GET /api/live/turns/{id}/speak` | streaming `audio/wav` | `require_agent_access` **+** `require_same_site_fetch` |
 | `GET /api/live/boards/{id}/render` | one board's body, framed for the browser (task 1071) | standard read, headers identical in both modes |
@@ -1668,8 +1676,11 @@ fixes it. One poll carries at most 500 turns — the ceiling `Store` clamps to
 anyway — so a conversation longer than that is read in cursor-sized pages,
 which is what `?after=` is for.
 
-`POST /api/live/route`'s `route` is required and always written. Its `context`
-and `window` are **three-way keys** (mesa task 1016), the same
+`POST /api/live/route` also takes an optional `client`, which is a **refresh
+and never a claim**: it keeps [the speaker
+claim](#which-browser-speaks-mesa-task-1267) alive when this client already
+holds it and does nothing whatever when it does not. Its `route` is required
+and always written. Its `context` and `window` are **three-way keys** (mesa task 1016), the same
 `double_option` shape `PATCH /api/tasks/{id}`'s clearable fields use:
 
 | the key is… | what it means | what is stored |
@@ -1810,6 +1821,84 @@ from wedging the run on itself. A turn carrying `action: 'navigate'` sets
 order, so the browser moves where the sentence around it said it would; a
 sidebar turn folds or re-opens both panels at the same point in the run, for
 the same reason.
+
+### Which browser speaks (mesa task 1267)
+
+Everything above is per-browser, which is the bug: two mesa tabs open on one
+conversation each have a press behind them, each satisfy the run's predicate,
+and each speak every reply — the same sentence twice, half a beat apart, most
+often a laptop and whatever else was left open. Nothing already in the session
+could settle it. `played_at` is stamped only once a turn has *finished*
+sounding, and the set of turns a page has taken in hand is that page's own
+React state, invisible to every other client.
+
+So a live session names at most one **speaker**:
+
+- `live_sessions.speaker` holds a **client id** — an opaque value each browser
+  generates once and keeps in `localStorage`, `liveSidebarWidth.ts`'s posture:
+  machine-local, never shown, never spoken, never handed to the agent
+  (`frontend/src/liveSpeaker.ts`).
+- **Claiming is always a deliberate press.** `POST /api/live/speaker
+  {client}` is sent by Go live, Listen, un-muting and Resume — the four
+  presses that mean "talk to me *here*" — and by nothing else. The newest
+  press wins outright, with no arbitration to lose: pressing Listen on a
+  second machine is someone saying where they want to hear it.
+- **A poll can never take it.** The page's ordinary route report carries the
+  same id, but only as a *refresh*: `Store::touch_live_speaker` moves
+  `speaker_seen_at` when that client already is the speaker and does nothing
+  at all when it is not. A browser sitting in a background tab reports its
+  route every two seconds for the whole conversation, and never once pulls the
+  voice away from the one the person is talking to.
+- **A claim expires.** `speaker` is derived on every read
+  (`LIVE_SESSION_COLUMNS`): a claim that has not been refreshed for **ten
+  seconds** reads back as `null`. The refresh rides on a report the page
+  already makes twice a second more often than that, so an open tab keeps the
+  voice with slack to spare — and a tab that was *closed* stops refreshing,
+  which frees the conversation instead of leaving it mute for the browsers
+  still in it. The ten seconds are judged in SQL on the **store's** clock, the
+  posture `stale_claim_minutes` takes: a browser with a skewed clock does not
+  get to decide it is still the one speaking.
+
+The page's half is one pure predicate, `liveSpeaker.ts::maySpeak(speaker,
+client)` — `speaker === null || speaker === client` — with both escape hatches
+folded into that first disjunct. An **unclaimed** conversation may be spoken by
+every unlocked client, which is exactly what mesa did before this existed, so a
+client on an older build, or one that never sends a claim, is never silenced by
+a rule it does not know. And a **stale** claim arrives as `null` already, so
+the page needs no clock of its own.
+
+`run()` gates the **speech** on it, not the whole run: a page that is not the
+speaker still performs whatever each turn does to the browser — a `navigate`
+is about what the person is *looking* at, and every browser showing the
+conversation follows it exactly as it did before. It simply does not say the
+words, and leaves `played_at` to the browser that did.
+
+That costs the page a **second set**, and the distinction is load-bearing.
+`handled` means "this page took the turn in hand to **say** it"; `performed`
+(`liveTurns.ts::actsOn`) means "this page has already done what the turn does
+to the browser". One set for both orphaned the turn a non-speaking page
+skipped: it went into `handled`, `nextUnplayed` excludes anything in
+`handled`, and nothing re-admits it — so if the speaker's browser was killed
+mid-sentence, nothing ever stamped `played_at`, its claim went stale, and the
+page that was now free to speak had already struck that turn off its own list.
+The conversation went quiet, which is the exact failure the expiry exists to
+prevent, one remove further back. So a page that may not speak takes the turn
+in hand for **nothing** (`liveSpeaker.ts::takesToSpeak`, the one decision
+`handled` is written on) and walks the whole pending list rather than only its
+head (`liveTurns.ts::pendingTurns`), performing each action once and leaving
+every unsaid turn where whoever ends up with the voice can find it. A
+pure-action turn is unchanged: every browser that reaches it performs it and
+stamps it, the stamp being idempotent server-side.
+
+Two consequences are accepted rather than engineered around: a freed page
+speaks the backlog of genuinely unplayed turns — they were never stamped, so
+saying them is the intent — and a turn the old speaker said in full but
+crashed before stamping may be said twice. Both beat silence.
+
+One note for anyone reading the older text: **`Listen` used to call no route
+at all.** It existed purely to *be* the gesture a browser's autoplay policy
+weighs, and CLAUDE.md said so outright. It now makes exactly one call, the
+claim — still no session state, still nothing the agent sees.
 
 ## The header hub (`LiveHub`, task 857)
 

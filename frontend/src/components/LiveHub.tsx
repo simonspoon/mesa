@@ -4,6 +4,7 @@ import { LiveBand } from './LiveBand'
 import { LiveBoardPanel } from './LiveBoardPanel'
 import { LiveMeter } from './LiveMeter'
 import {
+  claimLiveSpeaker,
   getLive,
   getLiveConfig,
   listProjects,
@@ -45,6 +46,7 @@ import {
 import { currentContext, sameContext, subscribeContext } from '../liveContext'
 import { mayHold, SegmentChain } from '../liveDrain'
 import { isPausePhrase } from '../livePausePhrase'
+import { liveClientId, takesToSpeak } from '../liveSpeaker'
 import {
   audioInputs,
   chosenInput,
@@ -95,9 +97,10 @@ import {
   type LivePending,
 } from '../liveSession'
 import {
+  actsOn,
   advanceCursor,
   navigateTarget,
-  nextUnplayed,
+  pendingTurns,
   releaseForReplay,
   sidebarsIntent,
   spokenText,
@@ -506,6 +509,18 @@ export function LiveHub({
   // which is what the `Listen` control exists for (`liveSession.ts`). State
   // rather than a read of `clock.current`, because it decides what is rendered.
   const [unlocked, setUnlocked] = useState(false)
+  // This browser's own id, and the claim on the conversation's voice it backs
+  // (mesa task 1267 — `liveSpeaker.ts` for why there is a claim at all).
+  // Generated once and kept in `localStorage`, so a page reloaded
+  // mid-conversation goes on being the speaker rather than starting an echo
+  // with itself. It goes nowhere but the claim and the route report.
+  const client = useMemo(() => liveClientId(), [])
+  // Claiming is ambient, exactly as the route report is: the press it rides on
+  // has already done its own work, and a failure — no live session yet, most
+  // often — costs this browser the voice rather than the press.
+  const claimVoice = useCallback(() => {
+    claimLiveSpeaker(client).catch(() => {})
+  }, [client])
   // The conversation panel. Purely visual: closing it calls no route and stops
   // nothing — the session, the audio and the capture box all carry on.
   const [open, setOpen] = useState(false)
@@ -791,6 +806,13 @@ export function LiveHub({
   // would start it again; a turn that failed to speak stays here too, which is
   // what keeps one bad turn from wedging the run on itself.
   const handled = useRef<Set<number>>(new Set())
+  // Turns whose *action* this browser has already performed (mesa task 1267).
+  // A second set rather than a second use of `handled`, because the two
+  // answer different questions — see `liveTurns.ts::actsOn`. Every browser
+  // showing the conversation follows a `navigate` and a sidebar fold, exactly
+  // once each; only the speaker says the words, and a page that skips the
+  // words must leave the turn re-considerable for whoever gets the voice.
+  const performed = useRef<Set<number>>(new Set())
   // The latest transcript for the run, which advances from a media event long
   // after the render that scheduled it.
   const held = useRef<LiveTurn[]>(turns)
@@ -814,6 +836,7 @@ export function LiveHub({
     if (fresh) {
       shown.current = arriving
       handled.current = new Set()
+      performed.current = new Set()
     }
     cursor.current = advanceCursor(cursor.current, data.turns)
     // The watchdog judges this poll against *this poll's* transcript, never
@@ -1349,6 +1372,11 @@ export function LiveHub({
       // lines down would only be re-affirming it. The same reason
       // `listeningRef` is written here rather than left to its effect.
       mutedRef.current = next
+      // Opening the microphone is a press that says "talk to me here", so it
+      // claims the voice (mesa task 1267). Closing it gives nothing up: a
+      // muted page still hears mesa, and moving the voice to another tab
+      // because this one stopped talking would be a second surprise.
+      if (!next) claimVoice()
       if (next) {
         // The switch off is the send (mesa task 1154): the utterance still
         // open is cut onto the chain first, then the chain is closed — which
@@ -1383,6 +1411,7 @@ export function LiveHub({
     },
     [
       blocked,
+      claimVoice,
       live,
       paused,
       reclaim,
@@ -2199,27 +2228,45 @@ export function LiveHub({
     // No press on this browser yet: the conversation may be live elsewhere, but
     // nothing here may sound or navigate without a gesture behind it.
     if (ctx === null || sounding.current !== null) return
-    for (;;) {
-      const turn = nextUnplayed(held.current, handled.current)
-      if (turn === null) return
-      handled.current.add(turn.id)
-      const target = navigateTarget(turn)
-      if (target !== null && window.location.hash !== target) {
-        window.location.hash = target
-        // mesa moved the browser, so the words that follow are still mesa's to
-        // take — even if the person had deliberately clicked elsewhere before.
-        reclaim('navigated', armed.current)
+    // The whole pending list, not just its head: a page that may not speak
+    // still walks past the turns it cannot say, to perform what they do to
+    // the browser (mesa task 1267).
+    for (const turn of pendingTurns(held.current, handled.current)) {
+      // What the turn does to the page — once per browser, speaker or not,
+      // and remembered in its own set so a page that skips the words neither
+      // re-navigates on the next poll nor loses the right to say them later.
+      if (actsOn(turn, performed.current)) {
+        performed.current.add(turn.id)
+        const target = navigateTarget(turn)
+        if (target !== null && window.location.hash !== target) {
+          window.location.hash = target
+          // mesa moved the browser, so the words that follow are still mesa's
+          // to take — even if the person had deliberately clicked elsewhere
+          // before.
+          reclaim('navigated', armed.current)
+        }
+        const sidebars = sidebarsIntent(turn)
+        // Idempotent by construction: App holds the flags, so asking twice for
+        // the state they are already in changes nothing.
+        if (sidebars !== null) onSidebars(sidebars === 'collapse')
       }
-      const sidebars = sidebarsIntent(turn)
-      // Idempotent by construction: App holds the flags, so asking twice for
-      // the state they are already in changes nothing.
-      if (sidebars !== null) onSidebars(sidebars === 'collapse')
-      const text = spokenText(turn)
-      if (text === null) {
-        // A pure navigate turn: it has already done its work.
+      if (spokenText(turn) === null) {
+        // A pure navigate turn: it has already done its work. Taken in hand
+        // and stamped by every browser that reaches it, exactly as before —
+        // the stamp is idempotent server-side.
+        handled.current.add(turn.id)
         markPlayed(turn.id)
         continue
       }
+      if (!takesToSpeak(turn, session?.speaker ?? null, client)) {
+        // Another browser holds the voice. This page takes the turn in hand
+        // for *nothing* — it stays on the pending list, so the speaker says
+        // it, and if that browser is closed mid-sentence and its claim goes
+        // stale, this page can still pick the turn up rather than the
+        // conversation going quiet.
+        continue
+      }
+      handled.current.add(turn.id)
       speak(turn.id, ctx)
       return
     }
@@ -2334,13 +2381,13 @@ export function LiveHub({
       }
       // Remembered only once it landed, so a failed report is retried by the
       // next trigger rather than being treated as already told.
-      reportLiveRoute(route, context, box)
+      reportLiveRoute(route, context, box, client)
         .then(() => {
           reported.current = { route, context, window: box }
         })
         .catch(() => {})
     }, REPORT_DEBOUNCE_MS)
-  }, [])
+  }, [client])
   useEffect(() => {
     reportRoute()
     window.addEventListener('hashchange', reportRoute)
@@ -2447,10 +2494,13 @@ export function LiveHub({
     setUnlocked(true)
     setActionError(null)
     if (button.action === 'listen') {
-      // Joining calls nothing: the press *was* the whole point, and the run can
-      // start on whatever the conversation has already said. It is also the
-      // moment capture takes the keyboard (the went-live effect above fires on
-      // `unlocked` landing).
+      // Joining used to call nothing at all: the press *was* the whole point,
+      // and the run can start on whatever the conversation has already said.
+      // As of mesa task 1267 it makes exactly one call — the claim on the
+      // voice, since "listen here" is precisely what this press means. It is
+      // also the moment capture takes the keyboard (the went-live effect
+      // above fires on `unlocked` landing).
+      claimVoice()
       pump.current()
       setOpen(true)
       return
@@ -2468,7 +2518,14 @@ export function LiveHub({
       // conversation surfaces it (mesa task 1144) rather than leaving it a
       // second click away behind the toggle. Joining, above, does the same.
       setOpen(true)
-      startLive().then(() => refetch(), failed).finally(() => setPending(null))
+      startLive()
+        .then(() => {
+          // There is a session to claim only now, and the press that starts a
+          // conversation is also the one that says it should be heard here.
+          claimVoice()
+          return refetch()
+        }, failed)
+        .finally(() => setPending(null))
       return
     }
     setPending('stop')
@@ -2492,6 +2549,11 @@ export function LiveHub({
       return
     }
     setPausedNow(false)
+    // Stepping back in is a press like Listen, and means the same thing:
+    // speak here again (mesa task 1267). A pause gives the claim up only by
+    // letting it go stale, which is what frees a browser that never comes
+    // back.
+    claimVoice()
     // `reclaim` decides on `listeningRef`, which the render's effect only
     // rewrites on the *next* pass — so read from here it still holds the
     // paused answer (`false`), and capture would grab the keyboard even where

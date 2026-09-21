@@ -91,4 +91,19 @@ working_since: string | null,
  * queue as ever — but nothing is being worked on, which is what the
  * page shows. Cleared by ending the session.
  */
-resting_since: string | null, };
+resting_since: string | null, 
+/**
+ * Which browser speaks this conversation aloud (mesa task 1267), or null
+ * while nobody has claimed it — in which case every client that has had
+ * a press may speak, which is what mesa did before this field existed
+ * and what an external client that knows nothing of this rule still
+ * does.
+ *
+ * **Derived on every read**, never the raw column: a claim is refreshed
+ * by the claiming browser's own route report, and one that has not been
+ * refreshed for ten seconds reads as null — a tab that was closed must
+ * not leave the conversation mute. So the page compares this with its
+ * own client id and needs no clock of its own
+ * (`frontend/src/liveSpeaker.ts`).
+ */
+speaker: string | null, };

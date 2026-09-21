@@ -1046,8 +1046,23 @@ export function reportLiveRoute(
   route: string,
   context: LiveContext | null,
   window: LiveWindow | null,
+  client: string,
 ): Promise<LiveSession> {
-  return request('/api/live/route', jsonInit('POST', { route, context, window }))
+  return request('/api/live/route', jsonInit('POST', { route, context, window, client }))
+}
+
+/**
+ * Claims this browser as the conversation's speaker (mesa task 1267) — the
+ * one client that says mesa's turns out loud.
+ *
+ * Only ever called from a deliberate press (Go live, Listen, unmute,
+ * Resume). The report above carries the same id, but it is a *refresh*: it
+ * keeps a claim this client already holds alive and can never take one, so a
+ * background tab polling away never pulls the voice away from the browser
+ * the person is talking to.
+ */
+export function claimLiveSpeaker(client: string): Promise<LiveSession> {
+  return request('/api/live/speaker', jsonInit('POST', { client }))
 }
 
 /**

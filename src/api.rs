@@ -50,7 +50,7 @@ use crate::core::{
     ScriptArg, ScriptPatch, ScriptRunEvent, Status, Store, SystemInfo, Task, TaskPatch,
     TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard, hooks,
     inbox_triage, library, listen, live, receipt, retro, script_runs, scripts, speech, supervisor,
-    system, version,
+    system, validate_live_client, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -1960,6 +1960,17 @@ fn router(state: AppState) -> Router {
         // from. An ordinary write like the utterance, and deduped by `Store`.
         .route("/api/live/notice", post(live_notice))
         .route("/api/live/route", post(live_route))
+        // Claiming the voice (mesa task 1267): which browser says this
+        // conversation's turns out loud. Its own route rather than a flag on
+        // the report above, because the two are opposites — a report is
+        // passive and constant and must never move the claim, while this is
+        // only ever sent from a deliberate press. `require_agent_access`
+        // rather than the utterance's plain gating: deciding which machine
+        // in the house starts talking is closer to the agent routes' posture
+        // than to a task edit, and like every other route wearing that gate
+        // it relaxes rather than refuses under `--lan`, so a page this server
+        // handed a phone can still ask to hear the conversation.
+        .route("/api/live/speaker", post(claim_live_speaker))
         .route("/api/live/turns/{id}/played", post(live_turn_played))
         // Speaking one turn: the same synthesiser, headers and gate pair as
         // the inbox's play button — see `speak_inbox` for why that pair, and
@@ -3627,6 +3638,23 @@ struct LiveRouteBody {
     /// on. An explicit `null` is still how a page says the box is gone.
     #[serde(default, deserialize_with = "double_option")]
     window: Option<Option<LiveWindow>>,
+    /// Which browser is reporting (mesa task 1267). Optional — every other
+    /// client of this route, mesa's own CLI included, says nothing — and it
+    /// is only ever a **refresh**: it keeps the speaker claim alive when this
+    /// client already holds it, and does nothing at all when it does not.
+    /// A poll must never be able to take the voice; `POST /api/live/speaker`
+    /// is the press that can.
+    #[serde(default)]
+    client: Option<String>,
+}
+
+/// The press that claims the voice (mesa task 1267).
+#[derive(Deserialize)]
+struct LiveSpeakerBody {
+    /// The claiming browser's own opaque id, generated once and kept in its
+    /// `localStorage` (`frontend/src/liveSpeaker.ts`). Bounded by `Store`;
+    /// mesa never shows it, speaks it or hands it to an agent.
+    client: String,
 }
 
 /// Every live write except `start` acts on **the** current session, so there is
@@ -4216,13 +4244,59 @@ async fn live_route(
     let Some(session) = store.current_live_session()? else {
         return Err(no_live_session());
     };
-    Ok(Json(store.set_live_route(
+    // Both halves of the report are judged before either is written. The
+    // refresh is a statement about a different column under a different rule
+    // — it applies only to the client that already holds the claim — but it
+    // must not outlive a report mesa refuses, and `set_live_route` validates
+    // everything else here before it touches the db.
+    let client = body
+        .client
+        .as_deref()
+        .map(validate_live_client)
+        .transpose()?;
+    let session = store.set_live_route(
         session.id,
         &body.route,
         body.context.as_ref().map(Option::as_ref),
         body.window.as_ref().map(Option::as_ref),
-    )?)
-    .into_response())
+    )?;
+    let Some(client) = client else {
+        return Ok(Json(session).into_response());
+    };
+    store.touch_live_speaker(session.id, &client)?;
+    // Read back once more: `speaker` is derived from `speaker_seen_at` on
+    // every read, so the session fetched a statement ago could still report a
+    // claim this very call just revived as stale.
+    Ok(Json(store.get_live_session(session.id)?).into_response())
+}
+
+/// The press that claims the **speaker** — the one browser that says this
+/// conversation's turns out loud (mesa task 1267).
+///
+/// Every page that has ever pressed Go live or Listen can speak, and before
+/// this route two tabs open on one session each spoke every reply, in an
+/// echo half a sentence apart. `played_at` could not stop it: it is stamped
+/// once a turn has finished sounding, so it records what was said rather
+/// than claiming what is about to be.
+///
+/// Deliberately a press and nothing else. `Listen` used to call no route at
+/// all — it existed purely to be the gesture a browser's autoplay policy
+/// weighs (CLAUDE.md said so outright) — and this is now the one call it
+/// makes; the passive route report refreshes an existing claim and can never
+/// take one.
+async fn claim_live_speaker(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<LiveSpeakerBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    let mut store = state.store.lock().unwrap();
+    let Some(session) = store.current_live_session()? else {
+        return Err(no_live_session());
+    };
+    Ok(Json(store.claim_live_speaker(session.id, &body.client)?).into_response())
 }
 
 /// Stamps one mesa turn as spoken, answering with the turn either way. The
@@ -14929,6 +15003,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 route: "#/live".into(),
                 context: None,
                 window: None,
+                client: None,
             })),
         )
         .await
@@ -14974,6 +15049,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                     width: 1600,
                     height: 1000,
                 })),
+                client: None,
             })),
         )
         .await
@@ -14999,6 +15075,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 route: "#/inbox".into(),
                 context: None,
                 window: None,
+                client: None,
             })),
         )
         .await
@@ -15022,6 +15099,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 route: "#/inbox".into(),
                 context: Some(None),
                 window: Some(None),
+                client: None,
             })),
         )
         .await

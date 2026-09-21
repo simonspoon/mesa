@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
+  actsOn,
   advanceCursor,
   mergeTurns,
   navigateTarget,
   nextUnplayed,
+  pendingTurns,
   releaseForReplay,
   sidebarsIntent,
   spokenText,
@@ -278,5 +280,47 @@ describe('turnLabel', () => {
   it('names a notice as one, not as mesa', () => {
     expect(turnLabel('mesa', true)).toBe('notice')
     expect(turnLabel('mesa', false)).toBe('mesa')
+  })
+})
+
+describe('pendingTurns', () => {
+  it('is every mesa turn nobody has played and this page has not taken in hand', () => {
+    const turns = [
+      turn(1, { role: 'user', text: 'what is on the board' }),
+      turn(2, { played_at: '2026-01-01 00:00:01' }),
+      turn(3),
+      turn(4),
+    ]
+    expect(pendingTurns(turns, new Set([3])).map((t) => t.id)).toEqual([4])
+    expect(pendingTurns(turns, new Set()).map((t) => t.id)).toEqual([3, 4])
+  })
+
+  it('leads with what nextUnplayed answers, so the two can never disagree', () => {
+    const turns = [turn(3), turn(4)]
+    expect(nextUnplayed(turns, new Set())?.id).toBe(pendingTurns(turns, new Set())[0].id)
+    expect(nextUnplayed(turns, new Set([3, 4]))).toBeNull()
+  })
+})
+
+describe('actsOn', () => {
+  const navigates = turn(5, { action: 'navigate', target: '#/inbox' })
+  const folds = turn(6, { action: 'collapse-sidebars', text: 'tidying up' })
+
+  it('is true for a turn that does something to the browser, once', () => {
+    const performed = new Set<number>()
+    expect(actsOn(navigates, performed)).toBe(true)
+    performed.add(navigates.id)
+    // The later polls, on a page that never spoke it: the action must not
+    // fire again (mesa task 1267 — this is why `performed` is its own set).
+    expect(actsOn(navigates, performed)).toBe(false)
+    expect(actsOn(navigates, performed)).toBe(false)
+  })
+
+  it('is true for a sidebar turn that also speaks', () => {
+    expect(actsOn(folds, new Set())).toBe(true)
+  })
+
+  it('is false for a turn that only speaks', () => {
+    expect(actsOn(turn(7), new Set())).toBe(false)
   })
 })

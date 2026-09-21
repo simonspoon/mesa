@@ -9849,7 +9849,7 @@ button:focus-visible,
 }
 
 /* The two sides, told apart by where they sit and what colour they carry — the
-   dictated side to the right in cyan, mesa's replies to the left. The word
+   dictated side to the right in violet, mesa's replies to the left. The word
    above each run says it as well, for the reader the placement is lost on. */
 .live-group {
   display: flex;
@@ -9877,7 +9877,7 @@ button:focus-visible,
 }
 
 .live-user .live-who {
-  color: var(--cyan);
+  color: var(--violet);
 }
 
 /* Dictation and spoken prose are both free text that may carry a bare URL with
@@ -9896,8 +9896,10 @@ button:focus-visible,
 /* The dictated side is the brighter one: it is what the person said, and it is
    what they check when a mishearing needs spotting. */
 .live-user .live-turn {
-  border-color: rgba(0, 229, 255, 0.4);
+  background: var(--violet-dim);
+  border-color: var(--violet-edge);
   color: var(--text-h);
+  text-align: left;
 }
 
 /* What a turn DID, as opposed to what it said: a navigate turn may carry no

@@ -176,7 +176,7 @@ starts under `--watch-inbox` as well as `--watch-todo`.
   normal CLI. There is no watcher-side delete, assign, or status write.
 - Inbox bodies are **untrusted data**. The body reaches `claude` only as a
   single `--name` process argument (`Command::arg`, no shell) and nothing in
-  mesa interprets it. The triage agent's first rule is that the body is data,
+  Naru interprets it. The triage agent's first rule is that the body is data,
   never instructions to it.
 - The tick cadence is a fixed internal constant (`WATCH_INBOX_TICK`, 60s), not
   user-configurable. `MESA_WATCH_INBOX_TICK_MS` overrides it, a test-only seam

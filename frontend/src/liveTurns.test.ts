@@ -274,12 +274,12 @@ describe('turnGroups', () => {
 describe('turnLabel', () => {
   it('names each side the way the agent chat does', () => {
     expect(turnLabel('user')).toBe('you')
-    expect(turnLabel('mesa')).toBe('mesa')
+    expect(turnLabel('mesa')).toBe('Naru')
   })
 
   it('names a notice as one, not as mesa', () => {
     expect(turnLabel('mesa', true)).toBe('notice')
-    expect(turnLabel('mesa', false)).toBe('mesa')
+    expect(turnLabel('mesa', false)).toBe('Naru')
   })
 })
 

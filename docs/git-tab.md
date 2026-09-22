@@ -17,7 +17,7 @@ nothing.
   worktrees: null}`; dead folder or non-repo → `{path, repo: null, worktrees:
   null}`; never an error. `worktrees` lists every worktree of the repo behind
   `local_path` (`GitWorktree { path, branch, head, is_current }`,
-  `is_current` = the worktree AT `local_path` — the one mesa is anchored to,
+  `is_current` = the worktree AT `local_path` — the one Naru is anchored to,
   regardless of `?worktree=`), always computed from `local_path` even when
   `?worktree=` selects a different one (`git worktree list` reports the same
   full set from any worktree). `?worktree=` re-points `repo` at that

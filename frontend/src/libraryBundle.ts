@@ -87,7 +87,7 @@ export function parseBundle(text: string): ParsedBundle {
   }
   if (obj.version !== BUNDLE_VERSION) {
     return {
-      error: `Unknown bundle version ${obj.version} — this mesa understands version ${BUNDLE_VERSION}.`,
+      error: `Unknown bundle version ${obj.version} — this Naru understands version ${BUNDLE_VERSION}.`,
     }
   }
   if (!Array.isArray(obj.items)) {

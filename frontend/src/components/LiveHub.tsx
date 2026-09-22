@@ -2934,7 +2934,7 @@ export function LiveHub({
                         <LiveElapsed startedAt={session.started_at} /> ·{' '}
                       </>
                     )}
-                    mesa
+                    Naru
                   </span>
                   <span className="live-head-chips">
                     {recognizes && (
@@ -3011,7 +3011,7 @@ export function LiveHub({
                   announced where a freshly mounted one often is not. */}
               <div
                 className={`live-status-pill${
-                  pill === 'mesa speaking'
+                  pill === 'Naru speaking'
                     ? ' live-status-mesa'
                     : pill !== null
                       ? ' live-status-hearing'
@@ -3050,12 +3050,12 @@ export function LiveHub({
                       !live
                         ? 'go live to start the conversation'
                         : paused
-                          ? 'paused — press Resume to talk to mesa'
+                          ? 'paused — press Resume to talk to Naru'
                           : recognizes
                             ? 'listening — or type here'
                             : 'dictate or type here…'
                     }
-                    aria-label="say something to mesa"
+                    aria-label="say something to Naru"
                     onChange={(e) => updateDraft(e.target.value)}
                     onBlur={(e) => {
                       // The arbiter: focus lost to somewhere a person types, on the

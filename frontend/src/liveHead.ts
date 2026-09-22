@@ -20,7 +20,7 @@ import type { LiveButton } from './liveSession'
 /** The word the head leads with. A closed vocabulary: the head is one line
  *  of ~14px display type, so every state has to fit in two words. */
 export type LiveHeadTitle =
-  'Live' | 'Hearing you' | 'mesa speaking' | 'Paused' | 'Reconnecting' | 'Disconnected'
+  'Live' | 'Hearing you' | 'Naru speaking' | 'Paused' | 'Reconnecting' | 'Disconnected'
 
 /**
  * What the head says, in the precedence the rest of the surface already uses.
@@ -60,7 +60,7 @@ export function liveHeadTitle(input: {
 }): LiveHeadTitle {
   if (input.error !== null) return 'Reconnecting'
   if (!input.live) return 'Disconnected'
-  if (input.speaking) return 'mesa speaking'
+  if (input.speaking) return 'Naru speaking'
   if (input.paused) return 'Paused'
   if (input.interim.trim() !== '' || input.draft.trim() !== '') return 'Hearing you'
   return 'Live'

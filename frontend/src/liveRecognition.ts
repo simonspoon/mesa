@@ -396,12 +396,12 @@ export function statusPill(input: {
   heard: boolean
   transcribing: boolean
 }):
-  | 'mesa speaking'
+  | 'Naru speaking'
   | 'agent blocked on a permission prompt'
   | 'transcribing…'
   | 'hearing'
   | null {
-  if (input.speaking) return 'mesa speaking'
+  if (input.speaking) return 'Naru speaking'
   if (input.blocked) return 'agent blocked on a permission prompt'
   if (!input.heard) return null
   return input.transcribing ? 'transcribing…' : 'hearing'
@@ -891,16 +891,16 @@ export function captureHint(input: {
   chord?: string
 }): string {
   if (input.paused) {
-    return 'Paused. Press Resume to talk to mesa again — the conversation is still running.'
+    return 'Paused. Press Resume to talk to Naru again — the conversation is still running.'
   }
   if (input.path === 'none') {
     return 'Neither auris nor this browser can listen here. Type here, or use your system dictation.'
   }
   if (input.blocked) {
-    return 'The microphone was refused, so mesa is not listening. Type here, or use your system dictation.'
+    return 'The microphone was refused, so Naru is not listening. Type here, or use your system dictation.'
   }
   if (!input.live) {
-    return 'Go live and mesa listens through this browser. You can also type here, or use your system dictation.'
+    return 'Go live and Naru listens through this browser. You can also type here, or use your system dictation.'
   }
   if (!input.joined) {
     // Live somewhere, but not here: the microphone cannot open until this
@@ -909,14 +909,14 @@ export function captureHint(input: {
     return 'Press Listen to join the conversation on this browser. You can also type here, or use your system dictation.'
   }
   if (input.muted) {
-    return `mesa is not listening. Press ${input.chord ?? LISTEN_CHORD} — or the microphone button — to have her listen, or just type here.`
+    return `Naru is not listening. Press ${input.chord ?? LISTEN_CHORD} — or the microphone button — to have her listen, or just type here.`
   }
   if (input.listening) {
     // Named (mesa task 957): the person can act on the difference — auris is
     // an install away, the browser recognizer is not — so the ladder saying
     // only "listening" would hide something worth knowing.
     const via = input.path === 'auris' ? 'auris' : 'this browser'
-    return `Listening through ${via} — everything you say is held here and sent to mesa once you go quiet, or right away if you press the switch. She stops listening while she is speaking. You can still type here.`
+    return `Listening through ${via} — everything you say is held here and sent to Naru once you go quiet, or right away if you press the switch. She stops listening while she is speaking. You can still type here.`
   }
   // Joined, unmuted, and still not the way in — nothing left that is worth a
   // line of its own; the box is the way in and says so.

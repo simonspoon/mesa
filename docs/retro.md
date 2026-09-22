@@ -6,7 +6,7 @@ background `claude` session as the **`mesa-retro` agent definition** with the
 prompt `Run mesa session retrospective <run-id>.`. The agent reviews the task
 sessions that finished since the last run for friction — permission denials,
 retry loops, a skill nobody had, a tool that keeps failing — and files each
-**new** finding into the mesa inbox as a `change-request`, where the
+**new** finding into the Naru inbox as a `change-request`, where the
 inbox-watcher (`docs/inbox-watcher.md`) triages it into a backlog task. That
 command is the default of the **`retro`** key in `~/.mesa/config.json` and is
 user-configurable, agent included (`docs/config.md`); `{id}` is the run id and
@@ -137,7 +137,7 @@ it, so triage's convert-to-task outcome no longer drops the pointer at all.) `me
 `retro_watcher_tick` in `src/api.rs`:
 
 - Reads `watchers.retro-interval-hours` from `~/.mesa/config.json` **fresh
-  every tick** (the `todo-concurrency` rule); a config mesa cannot parse
+  every tick** (the `todo-concurrency` rule); a config Naru cannot parse
   skips the tick with a line on stderr rather than running on a guessed
   cadence.
 - Asks the store whether a run is due — `Store::retro_status`: due when

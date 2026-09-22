@@ -89,7 +89,7 @@ paths** across the whole set (a file touched by two commits in the window
 counts once, not twice) rather than a per-commit sum.
 
 The `--since`/`--until` bounds are suffixed `" UTC"` before reaching git.
-Every mesa timestamp is SQLite `datetime('now')` text with no zone marker,
+Every Naru timestamp is SQLite `datetime('now')` text with no zone marker,
 always written in UTC; `git --since`/`--until` parse a bare timestamp in the
 **local** timezone of the machine running `git`. Without the suffix, git
 would read `claimed_at`/`closed_at` as local time and the window would be
@@ -109,7 +109,7 @@ warrants for now.
 ## The session link is best-effort (D5)
 
 `owner` is whatever opaque string the claimant supplied (`docs/claims.md`) —
-mesa enforces no format on it. `cc_sessions.session_id` keys on the Claude
+Naru enforces no format on it. `cc_sessions.session_id` keys on the Claude
 Code transcript's own UUID. This repo's own `execute-todo` skill claims tasks
 with an `--owner` of the shape `session_<claude-session-id>` (its own
 `session_` prefix convention) — that string is **not** the transcript UUID

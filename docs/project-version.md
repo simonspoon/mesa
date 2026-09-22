@@ -57,7 +57,7 @@ tooltip.
 There is no `version` field on `Project`, no DB column and no migration — the
 value is computed on every read, so editing a manifest is reflected on the
 next page load with no write anywhere. There is also no CLI command, no entry
-in the left sidebar or on board cards, and no `/api/git-status` field. mesa
+in the left sidebar or on board cards, and no `/api/git-status` field. Naru
 never writes a version.
 
 ## Frontend

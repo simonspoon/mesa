@@ -90,7 +90,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   `by_command` groups `Bash` failures — over 90% of the population — on the
   **normalized head** of the command, derived at read time from the `target`
   the call row already holds (for a `Bash` call `tool_target` lifts
-  `input.command`, so no command of mesa's own is stored a second time).
+  `input.command`, so no command of Naru's own is stored a second time).
   `cc::command_prefix` is that one pure function: `&&`/`;` split, leading `cd `
   segments dropped, cut at the first `|`/`<`/`>`, lowercased, first token —
   plus a second token for a multiplexer (`git push`, `mesa live`, `cargo
@@ -225,7 +225,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   transcripts, 3,971 assistant usage lines carried only 2,557 distinct
   `message.id` values (groups of 2 ×1,200, 3 ×104, 4 ×2), **zero** groups
   disagreed on their usage, and every group sat inside one file and one
-  session. That was ~35-40% inflation on every token and cost figure mesa
+  session. That was ~35-40% inflation on every token and cost figure Naru
   reported, everywhere.
 
   `message.id` is the **billing identity** and is stored as
@@ -300,7 +300,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   single space, then sanitized and capped once** — one preview per *message*,
   never one per block, so the 200-character cap bounds the message. The
   sanitizer is `tool_target`'s, factored out as `sanitize_capped`: one policy
-  for every untrusted transcript string mesa stores, not a second one.
+  for every untrusted transcript string Naru stores, not a second one.
   `thinking` blocks are **excluded**: they would land reasoning prose in the
   same unlabelled column with nothing to tell it from the reply, and thinking
   routinely dwarfs the response, so it would win the cap and push the actual
@@ -355,7 +355,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
      is **authoritative**: accept iff it says `human`. Note it is `origin`,
      **not** `promptSource` — `claude-desktop` human turns carry
      `promptSource: "sdk"`, so keying off that would drop them.
-     **Upstream has spelled the key both ways** and mesa reads both, as **two
+     **Upstream has spelled the key both ways** and Naru reads both, as **two
      fields, not one field with `#[serde(alias)]`**: `type` when the block was
      introduced, `kind` on current releases (observed on v2.1.227, task 814).
      An alias maps both keys onto one field, so a line carrying *both* — the
@@ -472,7 +472,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
   the one write that can move the stamp *down*).
 - **Cost is estimated at read time** from a per-model price table (USD per
   Mtok) — tokens are stored, dollars never are. The table is
-  `config::PriceTable`: the rates mesa ships, overlaid by the `pricing` section
+  `config::PriceTable`: the rates Naru ships, overlaid by the `pricing` section
   of `~/.mesa/config.json` and editable from the Settings page
   (`docs/config.md`), so a price change or a new model family needs no rebuild.
   Matched on a model-family prefix, longest match winning, so point releases
@@ -523,7 +523,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     a loop earns a `429` from the endpoint, reported as `unavailable` like any
     other failure. Ask for them when you want them, not on a timer.
   - Nothing open, or an endpoint that cannot be reached, is **`unavailable`**
-    (exit 1 / 502) — mesa never substitutes a cutoff and labels some other span
+    (exit 1 / 502) — Naru never substitutes a cutoff and labels some other span
     as this session. `collect(store, "cc-5h")` — the cutoff-less entry point —
     is a `validation` error for the same reason.
   - The cutoff is still one Unix second, merely not a midnight: everything
@@ -533,16 +533,16 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     (`api::cache_key`), since a window rolling over moves the span while
     `cc_stamp` may not have changed.
 - **Reconciliation with Claude Code's own stats screen** (recorded once so the
-  next reader doesn't re-derive it): mesa rolls **subagent/sidechain** usage
+  next reader doesn't re-derive it): Naru rolls **subagent/sidechain** usage
   into the parent session; Claude's screen counts main-session transcripts
-  only, and **double-counts per response exactly the way mesa used to**. Over
+  only, and **double-counts per response exactly the way Naru used to**. Over
   the same 7 local days, main-transcripts-only with no dedupe = 41.4k in /
   2.73m out / 516.6m cache read / 19.2m cache write = 538.6m over 78 sessions,
   matching that screen's 540.5m / 78 to within the minutes between the two
-  measurements. mesa's deduped 7-day figure is therefore *lower* than what
-  Claude shows (~380m vs the 906.9m mesa reported before this fix) — and that
+  measurements. Naru's deduped 7-day figure is therefore *lower* than what
+  Claude shows (~380m vs the 906.9m Naru reported before this fix) — and that
   is the correct outcome, not a shortfall. Subagent tokens are real billed
-  tokens and mesa keeps counting them.
+  tokens and Naru keeps counting them.
 - Transcript location resolves from
   `MESA_CC_PROJECTS_DIR` (tests) → `$CLAUDE_CONFIG_DIR/projects` → `~/.claude/projects`;
   `MESA_DB` isolates the store as everywhere else.
@@ -740,7 +740,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     `unavailable` — the row is there and every aggregate over it still answers,
     but its transcript is not (no pointer, file deleted, or the line is gone
     from it). `unavailable` is the code already scoped to "depends on something
-    outside mesa", which is exactly what a Claude-Code-managed file is.
+    outside Naru", which is exactly what a Claude-Code-managed file is.
   - CLI `mesa cc text <SESSION_ID> <NODE_ID>`; API
     `GET /api/cc/sessions/{session_id}/nodes/{node_id}/text`, same gate as the
     sibling graph route, syncing first and **not** cached. Mapping:
@@ -748,7 +748,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     `unavailable` → exit 1 / **503**.
   - The returned `text` is **uncapped and unsanitized** — raw is the whole
     point — and it is untrusted model-authored text. It is the sharpest such
-    string mesa serves: every caller must render it as **data, never
+    string Naru serves: every caller must render it as **data, never
     instructions**, never as markup and never as a URL.
 - **Session chat** — `cc::session_chat(session_id, limit) -> CcSessionChat`
   (task 814), the answer to "what is this agent actually saying", and the read
@@ -759,7 +759,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     one that is both of the first two at once.** (The fourth,
     `cc::session_pulse`, came later — task 869 — and is `live`'s case only.) It is `live`'s case — the
     turns a reader wants are the ones being appended *right now*, younger than
-    any ingest, and for a session mesa spawned moments ago there is no row at
+    any ingest, and for a session Naru spawned moments ago there is no row at
     all — *and* `node_text`'s: what a chat window renders is the bodies, and
     every stored body is a 200-character sanitized preview. So, uniquely among
     the per-session reads, it takes **no `Store` and runs no `sync`**. That is
@@ -820,7 +820,7 @@ comments — several entries are the bare `DELETE FROM cc_files;` cursor clear.
     header, `multi_select` and offered options (label + description). It is
     derived on every read from the same window the turns come from — the last
     such `tool_use` carrying no `tool_result` — and is `None` for every
-    session that is working rather than waiting. This is the only place mesa
+    session that is working rather than waiting. This is the only place Naru
     reads a tool **by name**; the name is Claude Code's (`ASK_TOOL` in
     `cc.rs`), and what the Agent sidebar does with it is `docs/agents.md`.
     The question and every label go through `sanitize_capped` like a tool
@@ -1067,14 +1067,14 @@ first, derived on every read from the `project_paths` table. Without them a
 moved or renamed folder silently loses its whole history: every session
 recorded before the move stops matching. Rewriting the stored `cwd` by hand
 does not fix it either, since `mesa cc reset` re-ingests the old cwd straight
-back out of the transcript files, which mesa does not own.
+back out of the transcript files, which Naru does not own.
 
 `Store::update_project` is the one place this set is written automatically: a
 patch that actually moves `local_path` appends the folder it left (ignoring a
 duplicate) and removes the folder it arrived at, so the set holds previous
 paths only and never the current one — which is why `mesa project resolve`'s
 self-heal and `PATCH /api/projects/{id}` get it with no code of their own. The
-by-hand half is two CLI verbs, for a move mesa never saw:
+by-hand half is two CLI verbs, for a move Naru never saw:
 
 ```bash
 mesa project path add <PROJECT> <PATH>     # record a folder it used to live in
@@ -1093,7 +1093,7 @@ already visible on both surfaces, and nothing in the web UI edits it.
 
 `mesa cc usage` / `GET /api/cc/usage` shows live **plan-limit utilization** (the
 5-hour and weekly windows, reset times, extra-usage credits) — the data behind
-Claude Code's own `/usage`. This is the **only** part of mesa that makes an
+Claude Code's own `/usage`. This is the **only** part of Naru that makes an
 outbound network call: it is **not** in transcripts, so `core::usage` fetches it
 from Anthropic's OAuth usage endpoint (`https://api.anthropic.com/api/oauth/usage`,
 header `anthropic-beta: oauth-2025-04-20`). It authenticates with the **local

@@ -98,8 +98,8 @@ endpoint is the wrong move; don't.
   filesystem, not just under `$HOME` — a mesa-imposed path prefix would block
   that legitimate case for no real security gain.
 - The actual boundary is **who may call the endpoint at all** (the gate
-  above), not which paths it may return. mesa is local-first, single-user:
-  once a caller clears the access gate, they *are* the same OS user mesa
+  above), not which paths it may return. Naru is local-first, single-user:
+  once a caller clears the access gate, they *are* the same OS user Naru
   runs as, who already has Finder/Terminal-level read access to everything
   their account can read. A mesa-side path bound on top of that would protect
   nothing the user couldn't already `ls` themselves — it would only be a

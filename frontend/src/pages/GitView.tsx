@@ -158,7 +158,7 @@ function NoLocalPathPlaceholder({ projectId }: { projectId: number }) {
   return (
     <div className="git-placeholder muted">
       <p>
-        This project has no linked folder, so mesa cannot see its git
+        This project has no linked folder, so Naru cannot see its git
         status. Run <code>mesa project resolve</code> inside the repo, or{' '}
         <code>mesa project update {projectId} --path &lt;dir&gt;</code>, to
         link one.

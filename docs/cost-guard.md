@@ -12,7 +12,7 @@ re-reading the same context forever. Every number in that sentence was already
 in `mesa cc` while it was happening. Nothing was *watching* them, so it was
 found the next morning, in a bill.
 
-## mesa stops the session (mesa task 1054)
+## Naru stops the session (mesa task 1054)
 
 The guard shipped reporting only, on the reasoning that a person should decide.
 Then a session ran `echo idle` **4,600 times in a row across eight hours and
@@ -33,7 +33,7 @@ Three things keep that proportionate:
   than a delete, which is what makes stopping-by-default defensible at all.
 - **Only a background session can be stopped.** The stop needs a short job id,
   and only `claude --bg` prints one. An interactive session in someone's own
-  terminal has none, so mesa reports that it found nothing to stop and leaves
+  terminal has none, so Naru reports that it found nothing to stop and leaves
   it running. It never guesses an id — the job id and the session uuid share a
   prefix on most rows and slicing one out of the other would eventually stop
   the wrong session.
@@ -62,7 +62,7 @@ Server** action relaunches with.
 
 1. **Read the thresholds**, fresh from `~/.mesa/config.json`'s `guard` section
    — the `todo-concurrency` rule (`docs/config.md`): a limit changed in
-   Settings takes effect without restarting `mesa serve`. A config mesa cannot
+   Settings takes effect without restarting `mesa serve`. A config Naru cannot
    parse **skips the tick** and logs, rather than guarding against guessed
    numbers.
 2. **Read the live sessions** — `cc::live(DEFAULT_GUARD_WINDOW_MINUTES)`, an
@@ -142,7 +142,7 @@ by `tool_use_id`, and only the result's **size** is ever read — the rule asks
 one question of a result and a length answers it without a second unbounded
 payload entering the process. The command reaches
 `CcLiveSession::repeat` through `cc::sanitize_capped`, like every other
-transcript-derived string mesa surfaces: it is untrusted model-authored text,
+transcript-derived string Naru surfaces: it is untrusted model-authored text,
 and it is data.
 
 Sidechain lines are skipped. A subagent's own loop is its own transcript, and
@@ -196,11 +196,11 @@ all. So `core::guard::resolve_task` asks two questions and accepts "no":
    unattributable runaway does not reprint that line every minute.
 
 Rung 3 is a real, documented dead end: a runaway started outside any project
-mesa knows produces no inbox item. `mesa cc guard` is the answer to that — it
+Naru knows produces no inbox item. `mesa cc guard` is the answer to that — it
 reports every breaching session with `task_id: null` where the ladder ran out,
 so the session is visible even when the alert is not filable. The alternatives
 were worse: a sentinel task is a lie in the task list, and a nullable
-`task_id` would re-open a column mesa deliberately closed.
+`task_id` would re-open a column Naru deliberately closed.
 
 ## The fire-once set
 
@@ -218,7 +218,7 @@ mesa-side row to claim with, so the stand-in is in-memory state.
 - Deliberately **not persisted**. A restart re-alerting on a session that is
   *still* burning money is the recoverable direction; a permanently silenced
   runaway is exactly the failure this feature exists to prevent. Persisting it
-  would also mean a migration to store state about an entity mesa does not own.
+  would also mean a migration to store state about an entity Naru does not own.
 
 ## The already-stopped set
 
@@ -230,7 +230,7 @@ on a session that is already stopped is either a no-op or an error, and neither
 is worth a second round trip.
 
 Only a **successful** stop is recorded, so a transient failure retries on the
-next tick that finds a fresh breach. A session mesa already stopped and then
+next tick that finds a fresh breach. A session Naru already stopped and then
 sees breach again — the transcript stays inside the hour-wide window long after
 the process is gone — gets an alert saying it was already stopped, not a second
 attempt.
@@ -250,17 +250,17 @@ One inbox item per session per tick, carrying every rule newly tripped.
   reads", not a markdown grid. It names the session (short and full id), the
   project or cwd if known, how long it has been running, the tokens, the
   estimated cost, the cache-read share, the output tokens, which rules tripped
-  and what each one means — and closes by saying **what mesa did about it**:
+  and what each one means — and closes by saying **what Naru did about it**:
   that it was stopped and how to resume it (`claude attach <job id>`), that the
   stop failed and why, that there was no background session to stop, that it
-  had already been stopped, or that mesa is configured to report only. Every
+  had already been stopped, or that Naru is configured to report only. Every
   branch says plainly whether the thing is still running, because that is the
   only thing a person woken by this alert has to decide about. Each then points
   at `mesa cc guard`.
 - Session ids, cwds, project names and the repeated command are **data**.
   Nothing on this path is built into a string a shell parses: the two commands
   the guard runs are fixed argv (`claude agents --json --all`, `claude stop
-  <job id>`) and the job id is one `Command::arg` mesa read out of `claude`'s
+  <job id>`) and the job id is one `Command::arg` Naru read out of `claude`'s
   own JSON, never out of a transcript.
 
 ## `mesa cc guard`
@@ -276,7 +276,7 @@ one of them — identity, `running_minutes`, the token split the rules read,
 `est_cost_usd`, `cache_read_share`, the `repeat` run it is in (or `null`), the
 `breaches` it tripped and the resolved `task_id` (or `null`).
 
-- Reads transcripts and the mesa db; **writes nothing**, files nothing, **stops
+- Reads transcripts and the Naru db; **writes nothing**, files nothing, **stops
   nothing** whatever `action` says, and does not touch the fire-once or
   already-stopped sets. Running it is not a substitute for the watcher and
   cannot silence one.
@@ -332,7 +332,7 @@ A value of the wrong *type* is an error on read, and the tick skips.
 (`MESA_CC_PROJECTS_DIR`, the seam `scripts/cc-check.sh` uses), a throwaway db
 and `HOME`, and a stub `claude` (`MESA_CLAUDE_BIN`) that answers
 `agents --json --all` from a fixture and records every `stop` call to a file.
-Five synthetic sessions: a runaway in a folder mesa knows, a healthy session
+Five synthetic sessions: a runaway in a folder Naru knows, a healthy session
 beside it, a runaway in a folder no project claims, a `looper` that is under
 every money threshold but 35 `echo idle` calls deep, and a sibling one call
 short of the count.

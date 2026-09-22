@@ -40,12 +40,12 @@ because someone ran `mesa serve`.
   so by default the name reaches `claude --bg` as `-n/--name` and the
   auto-dispatched session shows up identifiably (prompt box, `/resume` picker,
   terminal title, Agents sidebar) instead of generically, running as the
-  `supervisor` agent definition — the library built-in mesa seeds to
+  `supervisor` agent definition — the library built-in Naru seeds to
   `~/.claude/agents/supervisor.md` before the spawn (mesa task 1075,
   `docs/library.md`), which is where the supervising rules live. The agent is
   named literally, so an override that wants the generic `swe` persona edits
   the name in the template (`docs/config.md`). Deriving the
-  name is still mesa's job, not the template's: a template chooses whether to
+  name is still Naru's job, not the template's: a template chooses whether to
   pass it. Claiming the task before the spawn closes
   the race window between dispatch and the agent's own `/execute-mesa-task`
   pickup step, so a later tick can't double-dispatch the same task while the
@@ -122,7 +122,7 @@ because someone ran `mesa serve`.
   `agents::is_under` the agents endpoints use) that hold a live shell child or
   a live subagent — `pid.is_some() && liveShells + liveSubagents > 0`,
   `docs/agents.md`. Upstream buckets a session `done` as soon as its turn ends,
-  while the Bash call that turn started is still running; mesa believed it, and
+  while the Bash call that turn started is still running; Naru believed it, and
   filled the slot with a second agent in the same checkout. The session list is
   fetched **before** the store lock is taken — it is a `claude` shell-out, and
   holding the lock across it would freeze every other request.
@@ -210,7 +210,7 @@ because someone ran `mesa serve`.
     entry, set only once the filing succeeded, so a failed filing is retried
     on the next pass.
   - **Re-dispatching a task stops the session it supersedes**, at the moment
-    of the spawn rather than on a reaper pass: mesa starting a second agent on
+    of the spawn rather than on a reaper pass: Naru starting a second agent on
     a task says the first is finished with it, whatever the task's status
     reads a moment later. The old entry is *marked* superseded rather than
     dropped, and forgotten only once its stop succeeds — a job dropped on a
@@ -218,7 +218,7 @@ because someone ran `mesa serve`.
     entry is what the reaper reads as a closed task, since the task itself is
     `in_progress` again under the new session.
   - Every shell-out is best-effort and off the store lock. A failing listing
-    keeps every entry rather than forgetting sessions mesa can no longer see,
+    keeps every entry rather than forgetting sessions Naru can no longer see,
     and a failing stop keeps its entry so the next pass retries. A pass with
     an empty map returns before any lock and spawns no process at all.
   - The map is **in memory**, like `inbox_dispatched` and the cost guard's
@@ -229,7 +229,7 @@ because someone ran `mesa serve`.
     receipt records nothing and so leaves nothing to stop — the same
     limitation the attach pane already has. (A multi-line **script** template
     is not that case: its stdout is read exactly as an argv command's is, so
-    a script whose last line is `claude --bg …` still hands mesa the id.)
+    a script whose last line is `claude --bg …` still hands Naru the id.)
   - The reaper runs on its own `WATCH_TODO_REAP_TICK` (20s) interval loop,
     started alongside the dispatch loop under `--watch-todo` — and under
     `--watch-inbox`, since mesa task 1192, because the inbox-watcher's triage

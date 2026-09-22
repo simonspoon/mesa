@@ -5,7 +5,7 @@ starts new background ones in a selected project's `local_path`, and embeds
 terminals attached to running sessions. Like the CC Dashboard it reads
 **external** state — here by shelling out to the `claude` CLI
 (`src/core/agents.rs`; `MESA_CLAUDE_BIN` overrides the binary for tests) — and
-touches the mesa store only to read `local_path`. There is deliberately no
+touches the Naru store only to read `local_path`. There is deliberately no
 `mesa agent` CLI: an agent in a terminal would just use `claude` directly.
 
 **The spawn command is user-configurable** — `docs/config.md`.
@@ -14,11 +14,11 @@ route and `mesa live start` all go through it) and runs the template
 `~/.mesa/config.json` gives for that action; this route's key is
 **`agent-spawn`**, defaulting to `claude --bg --model opus --agent supervisor -- {prompt}`
 (mesa task 1188; the `supervisor` definition is seeded to disk first). The
-sections below describe that default. A replacement command owes mesa only its
+sections below describe that default. A replacement command owes Naru only its
 exit code; see the `POST` route below on the `id: null` case.
 
-**Every session mesa *starts* runs under an agent persona** by default:
-`--agent <name>`, **`swe`** — mesa auto-dispatches engineering work, and the
+**Every session Naru *starts* runs under an agent persona** by default:
+`--agent <name>`, **`swe`** — Naru auto-dispatches engineering work, and the
 generic assistant persona is the wrong front door for it. The name is a
 literal in the template (mesa task 1141, replacing the old `MESA_CLAUDE_AGENT`
 env var): to use another agent, or none — an unknown agent name is a hard
@@ -35,7 +35,7 @@ a different tool yields sessions the sidebar can't list or attach to.
   session's own `cwd`, not via `claude`'s `--cwd` flag — live QA on mesa task
   310 found a session whose cwd exactly equaled the filter dir missing from
   `--cwd`-filtered output while present unfiltered (task 313); the exact
-  trigger was never characterized, so mesa filters deterministically instead
+  trigger was never characterized, so Naru filters deterministically instead
   of trusting that black box. Cached 2s per folder in
   `AppState.agents_cache` (each list call costs ~0.5s of node startup; the UI
   polls every 3s). No `local_path` → `{path: null, agents: []}`, not an error.
@@ -44,13 +44,13 @@ a different tool yields sessions the sidebar can't list or attach to.
   `{id}` — the short job id parsed from the "backgrounded · <id>" receipt, or
   **`null`** when the command printed no such line, which a configured
   replacement is entitled to do. A null id is still `201`: the session exists
-  and the next list call shows it, mesa just has nothing to open an attach pane
+  and the next list call shows it, Naru just has nothing to open an attach pane
   with. Without a prompt the session starts idle.
   No/missing `local_path` is `validation`; a failing/missing `claude` CLI is
   **502 `unavailable`** on both endpoints. Both this route and the list route
   run their subprocess under `spawn_blocking` and hold no lock across it, so
   spawns do **not** serialize behind agent-list polls — a slow spawn observed
-  under a *stub* `claude` is a stub artifact, not a mesa lock: `output()`
+  under a *stub* `claude` is a stub artifact, not a Naru lock: `output()`
   waits for pipe EOF, so a stub that forks a fake long-lived session hangs
   the call for that child's lifetime (mesa task 468 — reproduced at 30s;
   the real CLI returns in ~1.0s, idle or with a prompt). Keep stub `--bg`
@@ -61,7 +61,7 @@ a different tool yields sessions the sidebar can't list or attach to.
   client→server binary frames are keystrokes, text frames are JSON control
   (`{"resize":{cols,rows}}`). Closing the socket kills only the attach client —
   the background session keeps running (claude's own attach/detach contract).
-  The attach client is given a stable cwd mesa owns, `~/.mesa/workspace`
+  The attach client is given a stable cwd Naru owns, `~/.mesa/workspace`
   (`config::workspace_dir()`, the folder every unbound spawn now uses) — the
   server's own cwd may be anywhere, and Claude Code never persists folder trust
   for the home directory, so a `$HOME` cwd re-prompted on every session.
@@ -80,8 +80,8 @@ a different tool yields sessions the sidebar can't list or attach to.
   rationale, just keyed once instead of per-folder.
 - `POST /api/agents/{id}/stop` → `claude stop <id>`, the other end of the
   spawn (mesa task 1289), answering `{id}`. The Agents sidebar's stop control
-  is its only caller. mesa never infers past a session's `state` — that was
-  twice a mesa bug (tasks 571, 858) and stays gone — but a **stopped** session
+  is its only caller. Naru never infers past a session's `state` — that was
+  twice a Naru bug (tasks 571, 858) and stays gone — but a **stopped** session
   leaves `claude agents --json`, which is the feed `GET /api/agents` reads, so
   a finished-but-misclassified row is gone from the next poll by that alone —
   no dismiss list, and nothing hidden client-side.
@@ -169,8 +169,8 @@ already use.
   project's folder shows its raw `cwd`.
 - **A session is active if it is on the list and not `done`** (mesa task 861).
   Those are the two halves: `claude agents --json` lists live processes, so a
-  session mesa can see there is still under way (task 858) — and upstream
-  reporting `state === "done"` is the one claim mesa takes at face value,
+  session Naru can see there is still under way (task 858) — and upstream
+  reporting `state === "done"` is the one claim Naru takes at face value,
   because it is the session saying its own work is finished. The list is
   therefore grouped into three collapsible sections — BLOCKED (`state ===
   "blocked"`, tested first), DONE (`state === "done"`) and ACTIVE (everything
@@ -182,8 +182,8 @@ already use.
   completion timestamp (`claude agents --json` reports only `startedAt`), so
   DONE keeps the list's own `startedAt` desc order as the closest available
   proxy for "most recently finished".
-- **Only `done` demotes; no other `state` does.** mesa used to derive
-  "finished" from `state` in two further ways, and both were mesa
+- **Only `done` demotes; no other `state` does.** Naru used to derive
+  "finished" from `state` in two further ways, and both were Naru
   second-guessing a field it does not own — they are gone (task 858) and stay
   gone:
   - `failed`/`stopped` are still ACTIVE. A terminal `state` never meant the
@@ -199,7 +199,7 @@ already use.
     `status: "idle"` + `state: "working"` for 90+ minutes after their final
     turn, while sessions with byte-identical transcript tails reported `done`.
     Age, process liveness and the daemon's `bg settled` sweep were all ruled
-    out as the mechanism (mesa task 571). mesa now reports that pair as what
+    out as the mechanism (mesa task 571). Naru now reports that pair as what
     upstream says it is — working — rather than inferring past it.
   - a false `blocked` is the third measured instance of the same lesson
     (mesa task 1289). Upstream persists its verdict to
@@ -212,15 +212,15 @@ already use.
     populated `output.result` instead. It is sticky and terminal — still
     `blocked` on a re-poll 12s later, that file 4.5 h stale — and the
     summary itself had already been written 5s before the verdict was
-    stamped. mesa reports it as-is for the reason it reports sticky
+    stamped. Naru reports it as-is for the reason it reports sticky
     `working` as-is, and here it could not do otherwise: across 188 rows of
     `claude agents --json --all` `waitingFor` was absent on every one, the
     blocked row was identical to the pid-carrying `done` rows in every key
     but `state`, and the two transcript tails are structurally identical
     (`end_turn`, no dangling `tool_use`, no permission request) — nothing
-    mesa reads separates a false `blocked` from a true one, and the fields
+    Naru reads separates a false `blocked` from a true one, and the fields
     that do differ (`output`, `firstTerminalAt`) live in that private jobs
-    file, which mesa neither reads nor owns, and separate terminal from
+    file, which Naru neither reads nor owns, and separate terminal from
     live rather than false from genuine. The cost is display plus two
     waits: the todo watcher's reaper (`reap_verdict` in `src/api.rs`) never
     reads `state` at all — only `pid`, `status` and the two counts below —
@@ -238,7 +238,7 @@ already use.
 - **Two mesa-derived counts report what a session is doing**
   (mesa task 802): `liveShells` and `liveSubagents` on every `AgentSession`.
   Upstream's `state` reaches `done` the moment a turn ends, while the work
-  that turn started is still running — mesa computes the liveness upstream
+  that turn started is still running — Naru computes the liveness upstream
   doesn't report. Since task 858 these no longer decide whether a session is
   running (list presence and `state` do, above), so in the sidebar they are
   the work-in-flight badge (`liveWorkLabel`, e.g. `2 shells · 1 subagent`) and
@@ -310,7 +310,7 @@ already use.
     lingering the live count already had, now visible. `liveSubagents` counts
     only the `running` ones.
   - A **shell** is named by its full command line (`ps -o args=`, capped by
-    `cc::sanitize_capped` like any other string mesa lifts out of a file it
+    `cc::sanitize_capped` like any other string Naru lifts out of a file it
     does not own), dated by `etime` counted back from the same `now` the
     counts use, and is always `running`: the process leaves the table the
     instant its Bash call returns. It has no `detail` and no context window.
@@ -362,7 +362,7 @@ already use.
     user line is the task its parent handed it, so it is labelled
     `<parent> → <subagent>` rather than `you`.
   - **A shell pane shows the command, an elapsed clock and its state, and no
-    output** — deliberately, because mesa has none to show. A shell child is
+    output** — deliberately, because Naru has none to show. A shell child is
     built from a `ps` probe whose row holds only `pid, ppid, etime, comm, args`
     and nothing transcript-derived, and whose `args` is Claude Code's own
     `zsh -c 'source …shell-snapshot && eval …'` wrapper rather than the command
@@ -421,7 +421,7 @@ already use.
   (`Sidebar.tsx`), and the board card's live marker
   (`boardView.ts::liveAgentCount`). Its two exclusions are `pid !== null` and
   `state !== "done"` — both upstream's own fields, rather than an inference
-  mesa draws on top of them. This bucketed list is the body of
+  Naru draws on top of them. This bucketed list is the body of
   the 'Agents' rail's own content (`AgentListContent`), rendered directly by
   `AgentSidebar` next to the tile area — not a member of the pane tree below.
 - **The 'Agents' list rail** (mesa task 414): a fixed sibling of the tile
@@ -568,7 +568,7 @@ already use.
   - **Data: `GET /api/cc/sessions/{sessionId}/chat`** (`docs/cc-dashboard.md`
     → *Session chat*), polled at 3s. That route reads the transcript file
     directly — no ingest, no store lock — which is what makes it pollable and
-    what lets a session mesa spawned seconds ago have a chat view at all.
+    what lets a session Naru spawned seconds ago have a chat view at all.
   - **Two ids, and this is the one place both are needed.** A pane is keyed by
     the short **background job id** (all `claude attach` takes), while a
     transcript is keyed by the **session id**. The session list is the only
@@ -667,13 +667,13 @@ already use.
       send API; the only channel into a live session is the pane's PTY. The
       chooser numbers its rows (`1. Alpha  2. Beta  3. Gamma`), so a click
       types that **digit** — never "down-arrow *n* times then Enter", because
-      the arrows are relative to a cursor mesa cannot see while the digit
+      the arrows are relative to a cursor Naru cannot see while the digit
       names the row. The rows the chooser appends itself ("Type something",
       "Chat about this") sort after every real option, so a number in range
       never hits one. `chatAnswerKeys` / `CHAT_COMMIT_KEYS` /
       `CHAT_SUBMIT_KEYS` in `frontend/src/agentChat.ts` are the one place
       that encoding lives, vitest-covered like `chatSendKeys`.
-    - **Mesa cannot see the chooser, so the card walks its steps.** The
+    - **Naru cannot see the chooser, so the card walks its steps.** The
       transcript records nothing about a call until the whole call is
       answered; what is known is that a fresh chooser opens on the first
       question and steps forward one question per answer. So the card answers
@@ -696,7 +696,7 @@ already use.
       next step along with this one, and does not try. Its steps are the
       chooser's steps, one click each. What it deliberately does *not* offer
       is the chooser's own extra rows: the free-text "Type something" (a
-      question mesa cannot render as a button — type it in the composer or the
+      question Naru cannot render as a button — type it in the composer or the
       terminal) and `Esc` to cancel.
     - It fails exactly as the composer does — `ptyPool.send` returning false
       says the socket is gone, and the card says so rather than pretending the

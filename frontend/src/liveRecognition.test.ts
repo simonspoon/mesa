@@ -723,14 +723,14 @@ describe('statusPill', () => {
   it('says mesa is speaking, over anything the microphone claims', () => {
     // The microphone is shut while she talks, so "hearing" would be
     // describing a microphone that is not open.
-    expect(statusPill({ ...idle, speaking: true })).toBe('mesa speaking')
+    expect(statusPill({ ...idle, speaking: true })).toBe('Naru speaking')
     expect(statusPill({ ...idle, speaking: true, heard: true, transcribing: true })).toBe(
-      'mesa speaking',
+      'Naru speaking',
     )
     // And over the report about the agent: a notice is spoken through this
     // same pill (mesa task 1157).
     expect(statusPill({ ...idle, speaking: true, blocked: true })).toBe(
-      'mesa speaking',
+      'Naru speaking',
     )
   })
 

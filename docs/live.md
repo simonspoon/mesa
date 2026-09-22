@@ -1,6 +1,6 @@
-# Mesa live (a spoken conversation with an agent)
+# Naru live (a spoken conversation with an agent)
 
-**Mesa live** is a conversation mode: a person talks to mesa, mesa talks back,
+**Naru live** is a conversation mode: a person talks to Naru, Naru talks back,
 and a dedicated Claude Code session does whatever they ask. Tables
 `live_sessions` and `live_turns` (migration index 43, plus the session's
 `context` column at index **44**, its `working_since` at **45** and its
@@ -14,22 +14,22 @@ live-memory pair `live_notebook` + `live_memory_fts` at **55** (mesa task
 (`LiveHub`).
 
 The two directions were deliberately asymmetric when this feature first
-shipped, and for a while that asymmetry *was* the design: mesa took
-person → mesa as text a browser's own engine had already produced, and kept
-audio to the one direction — mesa → person — where mesa itself controlled
+shipped, and for a while that asymmetry *was* the design: Naru took
+person → Naru as text a browser's own engine had already produced, and kept
+audio to the one direction — Naru → person — where Naru itself controlled
 what left the server. `auris` (mesa task 954 onward) ended that. Person →
-mesa is now audio too, captured in the page and posted to the server to be
-decoded by an external local binary, the same shape mesa → person already
+Naru is now audio too, captured in the page and posted to the server to be
+decoded by an external local binary, the same shape Naru → person already
 had: a whole payload handed to an external synthesiser (`kokoro-rs`) or
 decoder (`auris`), on the server, with nothing kept. The two directions are
 symmetric now — both audio, both server-mediated — and what carries over from
-the old design is not the asymmetry but the reason it existed: mesa runs
+the old design is not the asymmetry but the reason it existed: Naru runs
 neither engine in-process, and every payload that crosses this feature is
 transcribed or spoken and then let go. See `docs/listen.md` for the audio-in
 half's own contract — the route, the limits, and what auris is and is not
 handed — and "Speech, reused rather than rebuilt" (below) for audio-out's:
 
-- **Person → mesa is text, decoded from audio the page captures — through
+- **Person → Naru is text, decoded from audio the page captures — through
   whichever of two engines this browser actually has** (`listenPath`,
   `liveRecognition.ts`, mesa task 957). While a session is live and this
   browser has joined it, the microphone opens on its own (task 917 — before
@@ -42,7 +42,7 @@ handed — and "Speech, reused rather than rebuilt" (below) for audio-out's:
   it into a 16 kHz mono WAV (`liveAudio.ts`), and posts it to
   `POST /api/live/transcribe`, which hands it to `auris` and returns text.
   auris wins whenever it can be reached, even on a browser that also has a
-  recognizer of its own: it hears mesa's own vocabulary correctly and
+  recognizer of its own: it hears Naru's own vocabulary correctly and
   punctuates like a person, where a browser's own recognizer does neither —
   mesa task 922's phonetic correction pass (below) was built against exactly
   that recognizer's mishearings, and task 957 is the reason it was worth
@@ -65,22 +65,22 @@ handed — and "Speech, reused rather than rebuilt" (below) for audio-out's:
   key, or their fingers) types into it, exactly as before — and it remains
   the way in regardless of engine whenever the microphone itself is not:
   muted, this browser cannot capture audio at all, or the microphone was
-  refused. mesa still ships no speech-to-text engine of its own — `auris` is
+  refused. Naru still ships no speech-to-text engine of its own — `auris` is
   a separate external binary this hands a recording to and retains nothing
   of, in either direction, and a browser's own recognizer is the browser's,
-  not mesa's.
-- **mesa → person is speech.** A mesa turn is synthesised by `kokoro-rs` and
+  not Naru's.
+- **Naru → person is speech.** A mesa turn is synthesised by `kokoro-rs` and
   streamed back to the browser, through the same `speech::start` and the same
   browser-side player the Inbox's play button uses (`docs/inbox.md`). This
   half is unchanged since before `auris`: server to browser, synthesised on
   demand, nothing retained. What is no longer true is that it is the *only*
-  direction audio moves in this feature — person → mesa is audio reaching the
+  direction audio moves in this feature — person → Naru is audio reaching the
   server too now, on `POST /api/live/transcribe` (`docs/listen.md`), so
   "audio" is no longer a word that names one direction here.
 
 ## The loop, and why it pulls
 
-A live session is a loop the **agent** runs, not one mesa drives:
+A live session is a loop the **agent** runs, not one Naru drives:
 
 1. `mesa live listen --lease <n>` — the agent asks for the next thing the
    person said, and since mesa task 1156 it runs the command **in the
@@ -96,7 +96,7 @@ A live session is a loop the **agent** runs, not one mesa drives:
    once, so that turn would be lost. The rule the agent follows needs no
    bookkeeping: if the last thing it did with `listen` was start one and its
    output has not come back, one is already waiting.
-2. It does the work with the ordinary mesa CLI and its own tools.
+2. It does the work with the ordinary Naru CLI and its own tools.
 3. `mesa live look` — optionally, it photographs the person's browser window
    and opens the PNG, for the questions no report answers: what actually
    rendered.
@@ -106,17 +106,17 @@ A live session is a loop the **agent** runs, not one mesa drives:
    page the whole window, or hands the side panels back.
 6. `mesa live status` printing `null` (or an `ended` session) is how it stops.
 
-The agent **pulls**. That is not a style choice: mesa has no way to push at it.
+The agent **pulls**. That is not a style choice: Naru has no way to push at it.
 The only channel into a live Claude Code session is keystrokes over the attach
 PTY, and the only way to read its replies is to tail a transcript file — which
 is exactly why the Agents sidebar's chat composer types into the PTY rather
 than calling a send route (`docs/agents.md`). Building a second write path into
 a session for this feature would mean owning that PTY, and the whole
-conversation would then depend on a terminal nobody is watching. So mesa writes
+conversation would then depend on a terminal nobody is watching. So Naru writes
 the utterance to the database and lets the agent come and get it, over the CLI
 it already uses for everything else.
 
-The consequence at the other end is the same shape mesa already has everywhere:
+The consequence at the other end is the same shape Naru already has everywhere:
 **there is no push channel to the browser either**, so the hub polls
 `GET /api/live?after=<cursor>` at 2s through the ordinary `useFetch` polling,
 like every other view.
@@ -145,7 +145,7 @@ delegate again, because a fork inherits these very instructions and would
 otherwise begin driving the conversation; only the agent that spawned it
 speaks. Two hard rules ride with it: **nothing spawned from a conversation,
 and not the agent itself, ever edits code in a project** — a change the person
-wants becomes a mesa task (`backlog` for an idea, `todo` for work the
+wants becomes a Naru task (`backlog` for an idea, `todo` for work the
 todo-watcher's own agents pick up) — and two delegates never work in the same
 tree or repository at once (own worktree, own files, or one after another). A
 result that lands mid-discussion on another topic is held for a natural pause;
@@ -179,7 +179,7 @@ built-in otherwise), computes the target through the library's own
 `relative_path`/`scope_base`/`resolve` machinery — so `$HOME` is honoured and
 the traversal check holds — creates the parent directory and writes the body.
 It **never overwrites**: after the first seed the file belongs to the sync
-flow, where a difference between disk and mesa is a row the user resolves, and
+flow, where a difference between disk and Naru is a row the user resolves, and
 silently rewriting it on every start would make one side of that decision
 impossible to keep. A failure (no `HOME`, an unwritable `.claude`) is treated
 exactly like a failed spawn — `unavailable`, and the session that was just
@@ -266,7 +266,7 @@ so it was spoken on almost every turn and told the person nothing.
 
 ### The notice turn
 
-A **notice** is a `mesa`-role turn mesa itself writes *about* the agent,
+A **notice** is a `mesa`-role turn Naru itself writes *about* the agent,
 not the agent's own words: `LiveTurn.notice` names the kind — `permission`
 (the job is blocked on a prompt), the only one — and is null on every turn
 either side actually said. `text` is one fixed plain sentence per kind
@@ -341,7 +341,7 @@ view of a job, read on the API's poll.
 `frontend/src/liveWatchdog.ts` holds the decisions and `LiveHub` performs
 them on every poll it already makes, **only while this browser has joined**
 — the same condition under which it speaks turns — so a page that merely
-has mesa open never reports on a conversation it is not in. There is no tick
+has Naru open never reports on a conversation it is not in. There is no tick
 between polls: the notice is edge-triggered on `blocked`, which only a poll
 can change (the one-second tick went with `stalled`, whose clock it read).
 Each judgement sees **one poll's view** — the session and the transcript
@@ -361,11 +361,11 @@ The page also remembers what it has posted this span, keyed on kind and span
 start, so a post whose turn has not yet come back on the poll is not posted
 again two seconds later. While `blocked` is non-null the status pill above
 the composer reads `agent blocked on a permission prompt`, ranked under
-`mesa speaking` (the notice is spoken through that same pill) and above
+`Naru speaking` (the notice is spoken through that same pill) and above
 `hearing` (`statusPill`).
 
 The agent is told what these are (rule 8 of `AGENT_PROMPT`): a turn carrying
-`notice` is mesa's report about it, not something it said — carry on, do not
+`notice` is Naru's report about it, not something it said — carry on, do not
 repeat it, do not apologise for it.
 
 ## One session at a time
@@ -403,7 +403,7 @@ never has to know. `mesa live handoff "<note>"` is that replacement.
 ### What a handoff does
 
 The outgoing agent writes a short note — the current topic, what is
-pending, any promise it made — and runs `mesa live handoff "<note>"`. mesa
+pending, any promise it made — and runs `mesa live handoff "<note>"`. Naru
 then, in order:
 
 1. Spawns a **successor** on the same session through the same `live-agent`
@@ -568,7 +568,7 @@ turns (schema enforces none of it, per CLAUDE.md):
   the route's reason — a `label` is **spoken**), and a blank one folds to
   **absent** rather than `""`, so "nothing selected" is genuinely nothing and
   the agent never has to treat an empty string as a name. `kind` needs no rule
-  in `Store` at all: it is a closed enum, so serde is the gate and a page mesa
+  in `Store` at all: it is a closed enum, so serde is the gate and a page Naru
   does not have is refused before the handler ever runs. Both halves are
   validated **before either is written**, so a refused context leaves the
   stored route *and* the stored context exactly as they were rather than
@@ -580,14 +580,14 @@ turns (schema enforces none of it, per CLAUDE.md):
   something useful* about what is on screen without parsing anything — "you
   have store.rs open on the Files tab" comes straight out of `kind` and
   `label` — and a free-form payload would let every page invent its own shape,
-  so the agent would be reading a different schema per page and mesa would have
+  so the agent would be reading a different schema per page and Naru would have
   no bound on any of it. Four fields, one of them a closed word, is what makes
   the report readable by something that has never seen the page that wrote it.
 - **It is read back leniently.** The column is validated JSON on the way in and
   `serde_json::from_str(..).ok()` on the way out — the `waypoints` precedent
-  rather than the `tags` one. A value mesa itself could not have written (a
+  rather than the `tags` one. A value Naru itself could not have written (a
   hand-edited row, or a column left by a newer build that knows a page this one
-  does not) reads as *nothing selected*, because nothing mesa does depends on
+  does not) reads as *nothing selected*, because nothing Naru does depends on
   it and panicking a whole conversation over a decoration is the wrong trade.
 - **The window box** the page reports in that same body (mesa task 895) is
   four integers and one more thing that is bounded rather than free: extents
@@ -614,7 +614,7 @@ long before either stamps it. That is why the session also names a
 separate column rather than an earlier `played_at`, which would say a turn had
 been heard before anyone had heard it.
 
-`notice` (mesa task 1157) marks a `mesa` turn mesa itself wrote about the
+`notice` (mesa task 1157) marks a `mesa` turn Naru itself wrote about the
 agent — `permission` — rather than one the agent said; it is
 written only by `Store::add_live_notice`, never by `add_live_turn`, and is
 null everywhere else. See [Telling the person the agent is stuck or
@@ -678,7 +678,7 @@ migration backfills it from every turn and summary a db already holds. A pure
 action turn (a `navigate` with nothing said) has no words and is not indexed.
 FTS5 is compiled into the bundled SQLite (`libsqlite3-sys` sets
 `SQLITE_ENABLE_FTS5`); the system `sqlite3` binary on a Mac lacks it, so a
-by-hand check has to go through mesa.
+by-hand check has to go through Naru.
 
 Append-only is now literal: `set_live_summary`'s 20-row prune is gone, along
 with the `LIVE_SUMMARY_KEEP` constant and the retention-versus-recall
@@ -819,7 +819,7 @@ summariser's step 5 of the transcript it reads.
 
 ### Who writes the summary, and why it can't be the live agent
 
-Unchanged from 921: mesa has no LLM of its own, so the summary is written by
+Unchanged from 921: Naru has no LLM of its own, so the summary is written by
 a short-lived agent spawned through the fifth config template,
 `live-summary`, best-effort from both stop sites, only when the conversation
 had turns, and never able to fail the stop. It cannot be the live agent's own
@@ -1050,7 +1050,7 @@ gets its own throwaway `MESA_DB`, `MESA_CONFIG_FILE` and `mesa serve` port.
   the person spoke in count; `--sessions N` keeps the newest N) are replayed
   in order into each baseline: `live start` under a stub `claude` that
   records the prompt this branch injects, the person's turns over
-  `POST /api/live/utterance` (there is no CLI verb for them), mesa's over
+  `POST /api/live/utterance` (there is no CLI verb for them), Naru's over
   `live say`, then for `nodecay`/`full` an **agent step** — `claude -p` handed
   rule 9, that prompt and the transcript, allowed only `mesa live memory *` —
   then `live stop`, whose `live-summary` template is a **synchronous**
@@ -1141,7 +1141,7 @@ that record gives:
 - **`LiveAction` is deliberately narrow** — three values, all one idea, *what
   the person is looking at* (see [The action vocabulary](#the-action-vocabulary)).
   A board is not a change to what is on their screen the way a route is: it is
-  a thing mesa made, with a body, an identity and a lifetime of its own.
+  a thing Naru made, with a body, an identity and a lifetime of its own.
 
 A board is **ephemeral**, which is the other half of the design — and the word
 means *scoped to its conversation*, not *deleted when it ends*. Ending a
@@ -1279,7 +1279,7 @@ the group (with none live, `not_found` naming `mesa live start`).
   2 like every other `list`; `clear` accepts it and changes nothing, since a
   board summary has nothing unbounded to drop.
 - **`clear` echoes the boards it destroyed** — the delete-echo safety floor
-  mesa has instead of a confirmation prompt — bodiless, like every other board
+  Naru has instead of a confirmation prompt — bodiless, like every other board
   listing: an echo is a recovery *transcript*, and a megabyte of markup printed
   to a terminal is not one.
 - **`keep` is how a board outlives its conversation.** `--project` writes an
@@ -1313,12 +1313,12 @@ The render route is the **artifact render route's posture, for the artifact
 render route's reason**: a plain guard, no per-route gate, and headers that are
 **identical in default mode and under `--lan`**. What makes agent-written
 markup safe to render is the Content-Security-Policy, not the identity of
-whoever asked for it — so the defense must not vary with the mode mesa happens
+whoever asked for it — so the defense must not vary with the mode Naru happens
 to be running in. The policy itself is `RENDER_CSP` in `src/api.rs`, one
 constant now shared by both routes rather than two copies of one string:
 `sandbox allow-scripts` with **no** `allow-same-origin`, which forces the
-response into an opaque origin that cannot read mesa's storage or call back
-into any mesa route (`docs/artifacts.md` has the full reasoning). Every kind is
+response into an opaque origin that cannot read Naru's storage or call back
+into any Naru route (`docs/artifacts.md` has the full reasoning). Every kind is
 served `nosniff` and `inline`; the two document kinds carry the CSP, and so
 does markdown, which is never framed as a document at all — one answer for
 "what does this route serve markup under" is worth more than a saved header.
@@ -1346,18 +1346,18 @@ Three values, and they are all one idea: **what the person is looking at.**
 `#/inbox`, `#/cc`, `#/scripts`, `#/library`, `#/settings`, `#/terminal`, `#/projects/<id>`
 and that project's `tasks/<id>`, `diagrams`, `git`, `files`, `terminal`,
 `dashboard` and `settings`. The list is in `AGENT_PROMPT` so the agent knows
-what it may say; the *rule* mesa enforces is only the `#/` shape, since the
+what it may say; the *rule* Naru enforces is only the `#/` shape, since the
 route inventory is the frontend's business and pinning a second copy of it in
 `Store` would be a copy to go stale.
 
 `LiveContextKind` (task 888) **does** pin a page vocabulary in Rust, and that
 is not the paragraph above being quietly broken — the two are different things.
 A route is a *string the frontend owns*: it carries ids, it is built by the
-router, it changes shape whenever a page gains a tab, and mesa's only interest
+router, it changes shape whenever a page gains a tab, and Naru's only interest
 in one is that it can be handed back to `window.location.hash`. A context
 `kind` is a *word the agent reads*, and the whole value of it is that the same
 word means the same page everywhere — an enum is what makes `"files"` something
-the agent can say out loud, key a sentence on, and rely on mesa having refused
+the agent can say out loud, key a sentence on, and rely on Naru having refused
 if the page got it wrong. So the route stays a shape rule and the kind stays a
 closed list, and the cost of the list is exactly the one the doc-comment on the
 type names: a new page means adding a value, deliberately, in the same commit.
@@ -1377,7 +1377,7 @@ plus a state argument stuffed into a column that otherwise means a route.
 
 There is nothing beyond that. Moving the browser and giving it room are things
 a conversation genuinely needs; anything more — click this, fill that — is a
-remote-control vocabulary, and the agent already has the whole mesa CLI for
+remote-control vocabulary, and the agent already has the whole Naru CLI for
 actually changing things.
 
 ## Seeing the screen (`mesa live look`, task 895)
@@ -1395,7 +1395,7 @@ conversation is being held in, writes a PNG and prints where it landed:
 {"path":"/var/folders/…/mesa-live-12-1755702312.png","window_id":40041,"width":1600,"height":1000}
 ```
 
-The agent opens that path with its own image tool. Nothing else in mesa reads
+The agent opens that path with its own image tool. Nothing else in Naru reads
 it, which is why `LiveShot` is the one type on this surface that is **not**
 ts-exported: it has no HTTP route and therefore no TypeScript consumer, and a
 generated `.ts` nobody imports is rot `build.sh`'s dirty check would then hold
@@ -1406,7 +1406,7 @@ everyone to.
 A screenshot tool needs to be told which window to shoot, and the obvious
 answer — the one titled `mesa` — is wrong on exactly the machine this feature
 is developed on. khora launches **headless** Chromes to drive the web UI, and a
-headless Chrome running mesa reports a window titled `mesa` like any other; on
+headless Chrome running Naru reports a window titled `mesa` like any other; on
 the machine where this was written there was one sitting there while the work
 was being done. A title match photographs whichever of them the window server
 lists first, which is to say: something the person did not ask to be seen.
@@ -1418,29 +1418,29 @@ same screen coordinates, so the two can simply be compared: page 22,22
 1600×1000; loki frame `x:22 y:22 w:1600 h:1000`. Rounding is what makes those
 one statement rather than two — the page reports integers and the window server
 reports a float `CGRect` — and it is why `windowBox()` rounds on the way out
-rather than mesa forgiving a half-pixel on the way in.
+rather than Naru forgiving a half-pixel on the way in.
 
 Two properties come free with that choice, and both are the reason it is the
 right one:
 
-- **Only a browser with mesa open ever reports a box**, so the window is
+- **Only a browser with Naru open ever reports a box**, so the window is
   never *guessed* at — it is named, by the one page that knows. Nothing else on
   the desktop can be picked: not the person's mail client, not a headless
   Chrome sitting on some other page, not any of the windows a title match would
   have had to choose between. The lookalike problem is not solved by a better
   heuristic; it is solved by asking the browser where it is.
 
-  The honest edge of that: a khora-driven browser that is *itself* showing mesa
+  The honest edge of that: a khora-driven browser that is *itself* showing Naru
   posts a report like any other page, and the last report wins — which is
   already true of `route` and `context` (task 888) and is why the second
   property below matters more than this one. What it cannot do is hand back the
   wrong picture: a headless window has no backing store, so the window server
   refuses to capture it and `look` comes back `unavailable`. The failure mode
   is "no shot", never "someone else's screen".
-- **The window mesa photographs is the window that reported the page the agent
+- **The window Naru photographs is the window that reported the page the agent
   was told about.** The box rides in the *existing* route report as a third
   member beside `route` and `context`, so a browser that reports at all reports
-  all three in one request and they cannot disagree. And several mesa **tabs**
+  all three in one request and they cannot disagree. And several Naru **tabs**
   share one window box, so two tabs of the same browser are not two answers.
 
   Since mesa task 1016 a client may report a route and *omit* the box rather
@@ -1496,18 +1496,18 @@ match fail against a box of zeroes.
 tools), invoked exactly as every other shell-out in `core` is — as **argv**,
 never through a shell — and `MESA_LOKI_BIN` overrides the path, the same test
 seam as `MESA_CLAUDE_BIN` and `MESA_KOKORO_BIN`. Nothing on this path is built
-out of mesa data anyway: a window id mesa just parsed and a path mesa itself
+out of Naru data anyway: a window id Naru just parsed and a path Naru itself
 chose.
 
 It is not a dependency in the sense that `sqlite` is. A machine with no loki
 installed holds perfectly ordinary conversations, one command short: a missing
-binary, a failing one, and output mesa cannot parse are all **`unavailable`**,
-the code reserved for something outside mesa not being arranged for this — and
+binary, a failing one, and output Naru cannot parse are all **`unavailable`**,
+the code reserved for something outside Naru not being arranged for this — and
 `AGENT_PROMPT` tells the agent that in as many words, *"if it says it is
 unavailable, carry on without it"*. loki drives macOS's own window server, so a
 non-Mac is `unavailable` **before** the binary is looked for, with a message
 saying loki is a Mac tool: "not installed" would send someone off to install
-something that could never have worked. mesa also confirms the file exists
+something that could never have worked. Naru also confirms the file exists
 after a successful `screenshot`, because loki can exit 0 having written nothing
 (a window that vanished between the two calls) and a path the agent then fails
 to open is a worse answer than saying so here.
@@ -1616,7 +1616,7 @@ takes exactly one value.
   conversation reads the same in the Agents sidebar however it was started.
 - **A failed spawn ends the session it just opened**, on both surfaces —
   `live start` exits **1** with code **`unavailable`** (the code reserved for
-  something outside mesa, here the `claude` binary, not being startable), and
+  something outside Naru, here the `claude` binary, not being startable), and
   the store is back where it was. The alternative — leaving a live session with
   a null `agent_id` — is a conversation nothing is listening to and that will
   therefore never answer, and because at most one session may be live it would
@@ -1629,11 +1629,11 @@ takes exactly one value.
   the short job id the spawn receipt carried. The agent does notice on its own
   (its loop checks `mesa live status`), but noticing only ends its *turn*: the
   background session stays listed, idle, one per conversation, and the person
-  who hung up reads that as mesa never letting go. So ending the conversation
+  who hung up reads that as Naru never letting go. So ending the conversation
   finishes the session it started — the same binary either way
   (`agents::claude_bin`), because `claude stop` takes the id `claude --bg`
   printed, and deliberately **not** a fifth command template: a template
-  chooses what starts a session, and mesa must be able to stop exactly the
+  chooses what starts a session, and Naru must be able to stop exactly the
   session it started.
 - **Stopping the agent is best-effort, and never the answer.** The store write
   is what ended the conversation. A session with `agent_id` null (`--no-agent`,
@@ -1646,7 +1646,7 @@ takes exactly one value.
   the gate script — and a person driving both halves by hand — use it.
 - **Every command but `start` and `status` is `not_found` with no session
   live**, and the hint names how to get one. `status` prints `null` and exits
-  **0**: "nobody is talking to mesa" is an answer, not a failure, and it is
+  **0**: "nobody is talking to Naru" is an answer, not a failure, and it is
   what the agent's loop reads as "stop looping".
 - **`--quiet`** per CLAUDE.md's contract: accepted on the mutations, on
   `listen` and on `status`, rejected with exit 2 on `turns`, on `look` and on
@@ -1720,7 +1720,7 @@ route, erased both — and nothing put them back for the life of the session, so
 phone. Omission is silence now, not a denial. A page that has opened nothing
 still says so, and says it the way it always meant to: by sending `null`.
 
-mesa's own web client is unaffected by the change, because it already sends all
+Naru's own web client is unaffected by the change, because it already sends all
 three keys explicitly — `frontend/src/api.ts::reportLiveRoute` takes a
 `LiveContext | null` and a `LiveWindow | null`, and `JSON.stringify` keeps an
 explicit `null` — so it still clears exactly what it means to clear.
@@ -1736,7 +1736,7 @@ rule inside `mesa live look` for two clients claiming different boxes: new
 state and a new failure mode, to disambiguate something that does not happen.
 
 An unknown `kind` is a **422 `validation`**, refused by serde before the
-handler runs (`JsonRejection` maps to mesa's validation body), which is the
+handler runs (`JsonRejection` maps to Naru's validation body), which is the
 same code an over-long field gets from `Store` — an unknown page is a client
 bug either way. The gate is unchanged: an ordinary write.
 
@@ -1752,7 +1752,7 @@ Why each gate is what it is:
   mode-dependent stack (`docs/agents.md`). Stop is gated with it as a pair: the
   thing that can start the agent is the thing that can stop it.
 - **Utterance, route and played are ordinary writes.** They write rows to the
-  mesa store and nothing else — the same class as creating a task — so they get
+  Naru store and nothing else — the same class as creating a task — so they get
   the standard `guard`, which under `--lan` is what lets the person hold the
   conversation from their phone.
 - **Speak is exactly `speak_inbox`'s pair**, and both halves are load-bearing.
@@ -1760,7 +1760,7 @@ Why each gate is what it is:
   external binary; `require_same_site_fetch` because every `Origin` check in
   `api.rs` passes a request carrying no Origin, and a no-cors `<audio src>`
   never carries one — so without it any page on the internet could point an
-  `<img src>` at a loopback mesa and burn a core per hit. The full reasoning,
+  `<img src>` at a loopback Naru and burn a core per hit. The full reasoning,
   including the `--lan` Host consequence a phone sees as a 403 on play alone,
   is in `docs/inbox.md`.
 - The **Content-Type gate** applies to the mutating methods in both serve
@@ -1781,7 +1781,7 @@ to the page exactly like a synthesiser that died mid-render.
 
 ## Speech, reused rather than rebuilt
 
-Nothing about how mesa speaks is new here. `GET /api/live/turns/{id}/speak` is
+Nothing about how Naru speaks is new here. `GET /api/live/turns/{id}/speak` is
 the inbox speak route with the body coming off a turn instead of an item: the
 same `config::speech_voice()` read **fresh on every press**, the same
 `spawn_blocking(speech::start)`, the same text on the child's **stdin** (not an
@@ -1843,7 +1843,7 @@ the same reason.
 
 ### Which browser speaks (mesa task 1267)
 
-Everything above is per-browser, which is the bug: two mesa tabs open on one
+Everything above is per-browser, which is the bug: two Naru tabs open on one
 conversation each have a press behind them, each satisfy the run's predicate,
 and each speak every reply — the same sentence twice, half a beat apart, most
 often a laptop and whatever else was left open. Nothing already in the session
@@ -1881,7 +1881,7 @@ So a live session names at most one **speaker**:
 The page's half is one pure predicate, `liveSpeaker.ts::maySpeak(speaker,
 client)` — `speaker === null || speaker === client` — with both escape hatches
 folded into that first disjunct. An **unclaimed** conversation may be spoken by
-every unlocked client, which is exactly what mesa did before this existed, so a
+every unlocked client, which is exactly what Naru did before this existed, so a
 client on an older build, or one that never sends a claim, is never silenced by
 a rule it does not know. And a **stale** claim arrives as `null` already, so
 the page needs no clock of its own.
@@ -1943,16 +1943,16 @@ conversation") working with no backend change.
   for the drawing, `components/LiveBand.tsx` for the one rAF loop that paints
   it, tasks 874, 882, 894 and 973) — the only sign of the conversation while
   the panel is closed, so it answers for *both* sides of it rather than only
-  for mesa. The drawing is a single **aperture** — a ring, or a few, around a
+  for Naru. The drawing is a single **aperture** — a ring, or a few, around a
   lit centre — rather than the five bars of a level meter it replaced (task
   973): three of the five states are not about how loud anything is (paused
   and listening are about *whether* something is happening at all), and one
   shape family turns out to draw all five without switching metaphors partway
   through:
-  - **mesa speaking** (cyan) — rings travelling outward from a glowing core,
+  - **Naru speaking** (cyan) — rings travelling outward from a glowing core,
     faster and brighter the louder the (simulated) voice. Outward motion reads
-    as mesa's voice going out. The amplitude driving it is not tapped from
-    real playback — mesa's audio runs through two different code paths (a
+    as Naru's voice going out. The amplitude driving it is not tapped from
+    real playback — Naru's audio runs through two different code paths (a
     plain `<audio>` element and, on browsers whose media stack refuses a
     range-less stream, a Web Audio decode-and-schedule fallback), and wiring a
     real `AnalyserNode` to both to get one true signal was out of scope for
@@ -2070,7 +2070,7 @@ conversation") working with no backend change.
   is shut.
 - **While joined and unmuted, the browser listens** (`liveRecognition.ts`, the
   tested module for the gating rules — task 873, and still where they live
-  after mesa task 956 moved *how* mesa hears into `liveAudio.ts`/`liveVad.ts`).
+  after mesa task 956 moved *how* Naru hears into `liveAudio.ts`/`liveVad.ts`).
   Two questions, deliberately not one:
   - `recognizesSpeech` — is the microphone the way in *at all*: the session is
     live, *this* browser has had its press (`unlocked` — the gesture that
@@ -2080,7 +2080,7 @@ conversation") working with no backend change.
     so unlike a reply it belongs to this question rather than to the one
     below), and they have not **muted** it (task 887 — likewise something only
     they undo).
-  - `shouldListen` — that, **and mesa is not speaking**. The microphone would
+  - `shouldListen` — that, **and Naru is not speaking**. The microphone would
     otherwise hear her own reply out of the speakers and answer it, so speech
     gates the capture stream's lifecycle from below rather than sitting beside
     the person's own switch above it, and the microphone reopens when she
@@ -2089,7 +2089,7 @@ conversation") working with no backend change.
   Everything *about the person's input method* reads the first — the capture
   box's focus rule, the composer's hint — and only the capture stream's own
   lifecycle reads the second. Keying the former on the latter is the bug that
-  looks like a shortcut: mesa speaks for most of the conversation's wall time,
+  looks like a shortcut: Naru speaks for most of the conversation's wall time,
   so a focus fight that re-arms itself while she talks is decided by playback
   timing rather than by any rule — the recording's own silence clock avoids
   exactly this by being measured on `shouldListen` rather than
@@ -2128,8 +2128,8 @@ conversation") working with no backend change.
 
     Like pause, it is **browser-side and this browser's alone**: no route, no
     column, no CLI verb, and the agent is never told. Unlike pause, the
-    conversation carries on — mesa keeps speaking, `navigate` still moves the
-    page, the typed box still works — because muting stops mesa hearing *this
+    conversation carries on — Naru keeps speaking, `navigate` still moves the
+    page, the typed box still works — because muting stops Naru hearing *this
     room*, where pausing stops this page's whole part in the run. Since task
     889 the same press is also what **sends** the recording (below), so it is
     the one control that both ends listening and delivers what was heard.
@@ -2151,7 +2151,7 @@ conversation") working with no backend change.
     *feels*: a level meter driven off the same audio (a microphone with no
     visible response reads as broken), and a "transcribing…" note while a
     posted segment is in flight. A streaming partial transcript was the
-    alternative and was rejected — it needs a streaming decoder mesa does not
+    alternative and was rejected — it needs a streaming decoder Naru does not
     have, and `auris` answers a whole request at once. `utteranceFrom` still
     drops a transcript with no words in it (a cough, a door, a segment
     `auris` heard as silence). Where a page instead falls back to its own
@@ -2161,11 +2161,11 @@ conversation") working with no backend change.
     on either path, are gone from the panel (below), and the level meter and
     "transcribing…" note stay `auris`-specific rather than a property of
     listening itself.
-  - **The transcript is corrected against mesa's own vocabulary before
+  - **The transcript is corrected against Naru's own vocabulary before
     anything else touches it** (`liveRecognition.ts`, mesa task 922), exactly
     as it was when the browser did the listening — the correction runs
     against whatever produced the text, and now that is `auris`'s answer
-    rather than the recognizer's. `auris` has no idea what mesa's words are,
+    rather than the recognizer's. `auris` has no idea what Naru's words are,
     and mishears them for ordinary ones that sound similar — "khora" comes
     back as "chorus", "helios" as "helius" — so this still runs *after*
     transcription has already settled on the wrong word. With no interim
@@ -2182,7 +2182,7 @@ conversation") working with no backend change.
     apart, which is enough to land `kokoro` on `khora`'s key and cancel both); plain soundex will not do here, since it keeps the first
     *letter* rather than the first *sound* and so never lines up "chorus" with
     "khora" in the first place. `buildVocabulary` turns a list of names —
-    mesa's own tools and model families, plus this install's project names —
+    Naru's own tools and model families, plus this install's project names —
     into a key-to-spelling table, built once when a conversation opens rather
     than on every result, since the set of things worth correcting *to* does
     not change mid-conversation; a project list the page could not fetch just
@@ -2215,7 +2215,7 @@ conversation") working with no backend change.
     That wait is **configurable** (mesa task
     886): `live.auto-send-ms` in `~/.mesa/config.json`, edited on the
     **Settings** page in the *Live conversation* section — 250..=60000 ms,
-    absent/blank meaning the 2000 ms mesa ships (`AUTO_SEND_IDLE_MS`), because
+    absent/blank meaning the 2000 ms Naru ships (`AUTO_SEND_IDLE_MS`), because
     how long a pause means "finished" is the person's own cadence. `LiveHub`
     reads the section once per conversation it joins, so an edit lands on the
     next conversation with no restart, and a read that fails is the built-in
@@ -2225,7 +2225,7 @@ conversation") working with no backend change.
     the speaker drew breath (`liveVad.ts`'s hangover), so posting each one as
     its own turn made the agent answer a half-thought and then answer the
     rest of it, and the person had to talk to the pauses the detector chose
-    rather than to mesa; silence after the whole thought is the pause that
+    rather than to Naru; silence after the whole thought is the pause that
     means something. The silence timer is measured on `shouldListen`, not
     `recognizesSpeech`, and on the auris path is driven by **transcribed
     speech**, not by audible frames (mesa task 1189): a segment that comes
@@ -2242,7 +2242,7 @@ conversation") working with no backend change.
     segment therefore delays the flush only until it resolves empty, bounded
     by the VAD's maximum segment plus one transcription. The
     browser-recognizer path is unchanged: `markHeard` fires on every
-    `onresult`, interim included. While mesa is talking there is no pause of
+    `onresult`, interim included. While Naru is talking there is no pause of
     the person's to read, and a mid-sentence pause they fill back in must not
     be mistaken for the end of the thought. The switch remains an explicit early
     send for whenever the wait would be too slow or too fast for what was just
@@ -2259,7 +2259,7 @@ conversation") working with no backend change.
       `heldFlush(recording, interim)` is byte-identical to what it always
       did, it is simply never handed anything in that second argument any
       more. The press first cuts the utterance the VAD has not yet ended
-      (`vadCut`, through `cutRef`, exactly the windowing task 961 gave mesa
+      (`vadCut`, through `cutRef`, exactly the windowing task 961 gave Naru
       starting to speak) onto the chain, then **closes** it: with nothing
       outstanding the flush happens at once, as it always did; with a segment
       still on its way back from `auris` or a cut just queued, nothing is
@@ -2270,12 +2270,12 @@ conversation") working with no backend change.
       The delivery-time guard is `mayHold` (`liveDrain.ts`): a segment that
       settles after the conversation ended or after a pause is dropped, and
       one that settles after a mute is dropped too *unless* that mute is
-      still draining, since then it was heard before the press. Mesa starting
+      still draining, since then it was heard before the press. Naru starting
       to speak is the other teardown that keeps its cut (mesa task 961): the
       effect's cleanup windows and posts whatever utterance was still in
       progress before the microphone closes, the same way the
       browser-recognizer engine's `stop()` used to deliver a pending final —
-      that sentence was heard before mesa's own audio started, so it is the
+      that sentence was heard before Naru's own audio started, so it is the
       person's, not an echo. Switching the microphone back **on** before a
       drain finishes loses nothing and reorders nothing: the held recording
       is not cleared while a flush is pending, and the new run's segments are
@@ -2317,9 +2317,9 @@ conversation") working with no backend change.
   - **The capture stream opens and closes around each turn, not once for the
     whole conversation.** It is held for as long as the microphone is wanted,
     reused across VAD segments the way the old recognizer reused it across
-    engine restarts — but it is deliberately **not** held across mesa
+    engine restarts — but it is deliberately **not** held across Naru
     speaking: `shouldListen` goes false for the length of every reply, so the
-    stream closes and reopens once a turn, which is the promise "mesa stops
+    stream closes and reopens once a turn, which is the promise "Naru stops
     listening while she speaks" made visible. An indicator still lit through a
     reply would say the opposite, and that is worth one `getUserMedia` per
     turn against a permission already granted.
@@ -2333,8 +2333,8 @@ conversation") working with no backend change.
     lives. The chooser's own logic (`chosenInput`, `sameInputs`,
     `offersInputChoice`'s device-count half) is unchanged, but what the two
     choices *mean* has shifted: capture always opens a stream now, so
-    "Default mic" no longer means "no stream of mesa's own" — it means
-    "whatever device the browser would pick" — and mesa needs its own
+    "Default mic" no longer means "no stream of Naru's own" — it means
+    "whatever device the browser would pick" — and Naru needs its own
     microphone permission on every path rather than only when a specific
     device is chosen. The gate that used to decide whether the chooser was
     offered at all — proving, not probing, that this browser's
@@ -2369,7 +2369,7 @@ conversation") working with no backend change.
     disabled while paused, so every other line would be inviting the person to
     type into a field that will not take it. The **muted** line ranks under
     refused and above listening (task 887): a microphone the browser will not
-    give mesa is not one the person can un-mute, so saying that first is the
+    give Naru is not one the person can un-mute, so saying that first is the
     only line naming something they can act on — and the muted line names both
     ways back, the chord and the button. It ranks **under `live`** and under
     joined too, and has to: the switch starts muted, so without that input the muted line is
@@ -2385,24 +2385,24 @@ conversation") working with no backend change.
   `listening`, and the box becomes a plain fallback the person may click into
   and type. The rest holds unchanged wherever recognition is not running.
   The person does not aim their dictation;
-  mesa does: while a session is live *and* this browser has had its press,
+  Naru does: while a session is live *and* this browser has had its press,
   the box takes focus — so when a `navigate` turn opens a page with a text
   field, the words that follow still land in the conversation, not in the
-  field, and the person can ask mesa to create something there without their
+  field, and the person can ask Naru to create something there without their
   speech typing into it. The referee (`userTookFocus`, `shouldReclaimFocus`):
   a focus loss to an element a person types into (`isEditableTarget`), on
   the heels of a pointer/key gesture, is the person deliberately clicking
   into a form — capture **stands down** and the form wins; every other loss
   (a page's autofocus after a navigate, a press on a button, a click on
   nothing) is taken back, because none of it means "stop listening". While
-  stood down, only mesa acting again — going live, a `navigate` turn, a press
-  on the hub's own controls (`hub-press`) — re-arms capture, and mesa acting
+  stood down, only Naru acting again — going live, a `navigate` turn, a press
+  on the hub's own controls (`hub-press`) — re-arms capture, and Naru acting
   also spends the gesture on the clock, so a keystroke that happened to
   precede a navigate cannot make its autofocus read as deliberate.
   Nothing grabs the keyboard before the press: an un-joined browser has no
   business stealing focus.
 - **The typed box is sent by Enter alone** (mesa task 977). It used to be
-  sent on mesa's clock after `live.auto-send-ms` of idle, on the reasoning
+  sent on Naru's clock after `live.auto-send-ms` of idle, on the reasoning
   that dictation never presses Enter — but the box is the surface a person
   reaches for when they are *typing*, and a timer that fires mid-sentence
   posts a half-thought. `live.auto-send-ms` survives as the *listening*
@@ -2479,7 +2479,7 @@ conversation") working with no backend change.
   on `live` at delivery time, so a stale phrase can never leave the *next*
   conversation starting paused.
 
-  While mesa is **speaking**, the ordinary microphone is shut (`shouldListen`)
+  While Naru is **speaking**, the ordinary microphone is shut (`shouldListen`)
   so she never hears her own reply — which also meant nothing said over her
   could be heard, and "hold on" is exactly what a person says over her. So
   the auris path runs a second, contained **barge-in** capture effect gated
@@ -2495,7 +2495,7 @@ conversation") working with no backend change.
   phrase pauses; anything else is dropped — never held, never sent, never
   `markHeard`, never the level meter or the silence clock. A segment that
   runs into the cap is dropped without transcribing. The echo posture is
-  those explicit constraints plus the whole-short-utterance rule: mesa's own
+  those explicit constraints plus the whole-short-utterance rule: Naru's own
   sentences are long, so a fragment that leaks past cancellation is not one
   of these phrases. The pause itself is what ends the effect (`silence()`
   clears `speaking`), and `paused` keeps the main microphone from reopening
@@ -2509,7 +2509,7 @@ conversation") working with no backend change.
   whatever the conversation has already said. Two ordinary situations produce a
   live session with no gesture behind it: one started from `mesa live start`,
   and a page reloaded mid-conversation. Before this button the only control on
-  offer there was `End`, so mesa talked and nobody heard a word, and the one
+  offer there was `End`, so Naru talked and nobody heard a word, and the one
   press available destroyed the conversation. `End` moves aside to make room
   for `Listen` rather than being taken away.
 - **Joining does not replay from the top.** Turns already heard carry the
@@ -2587,7 +2587,7 @@ conversation") working with no backend change.
   would run a wire through the whole tree for a value nothing in the tree reads.
   So the channel is a plain module-level value plus a subscriber list, and the
   hub stays the **only** thing that talks to `/api/live/route` — the same rule
-  as everywhere else on this surface: mesa does not open a second write path.
+  as everywhere else on this surface: Naru does not open a second write path.
   The page clamps each field to 200 characters rather than letting `Store`
   refuse it, because a deeply nested file path is a perfectly ordinary focus and
   a 422'd report tells the agent *nothing*, where a truncated one still names
@@ -2640,7 +2640,7 @@ conversation") working with no backend change.
   whether a keystroke is the listen chord and how the chord is written, what a
   settled segment is worth sending (`heldWith`, `heldFlush`, `utteranceFrom`),
   the composer's hint, and — mesa task 922 — the phonetic fold that keys
-  mesa's vocabulary, the vocabulary table built from it and the correction
+  Naru's vocabulary, the vocabulary table built from it and the correction
   that rewrites transcribed text against it, and — mesa task 957 —
   `listenPath`, which of the two engines a conversation actually uses;
   `recognitionCtor`, `readResults`, `isBlockingError` and
@@ -2677,8 +2677,8 @@ conversation") working with no backend change.
 
 The spawn is the fourth configurable command: **`live-agent`**, defaulting to
 `claude --bg --agent mesa-live --name {name} -- {prompt}` — the union of the two
-existing shapes, since a live session is a mesa record (so it has an `{id}` and
-a `{name}`) *and* carries a prompt mesa supplies. That prompt is
+existing shapes, since a live session is a Naru record (so it has an `{id}` and
+a `{name}`) *and* carries a prompt Naru supplies. That prompt is
 `live::agent_prompt`, so the feature works with **no user configuration**. The
 agent is named **literally** here (mesa task 1068): the conversation runs as
 the `mesa-live` agent definition, which is where its instructions live, and a
@@ -2712,7 +2712,7 @@ CLAUDE.md requires: **data, never instructions.**
 - The route an utterance can cause is bounded by `validate_live_route`
   regardless of what the agent was talked into: a `navigate` target is a `#/`
   hash path of at most 200 characters, so the worst case is the browser landing
-  on a mesa page the person could have clicked to.
+  on a Naru page the person could have clicked to.
 
 ## What is deliberately absent
 
@@ -2720,40 +2720,40 @@ CLAUDE.md requires: **data, never instructions.**
   whole segment at a time — there is no interim guess to show while it
   thinks. A level meter and a "transcribing…" note stand in for it instead
   (above); a streaming decoder that could offer a running partial would close
-  this gap, but mesa has none and building one is out of scope here. Where a
+  this gap, but Naru has none and building one is out of scope here. Where a
   page instead falls back to its own recognizer (mesa task 957, below), that
   engine's interim results still drive the send boundaries and the header
   band exactly as they did before task 956, though nothing displays them any
   more (mesa task 1153, below) — the gap is `auris`-specific, not a property
   of listening in general.
 - **A preview of the words in flight.** Task 1069 put what was being said
-  right now — the recording the microphone was holding, or the line mesa was
+  right now — the recording the microphone was holding, or the line Naru was
   speaking — in a panel of its own between the transcript and the capture
   box. It was capped in height with its own scrollbar and did not follow its
   bottom, so the end of what was being heard or spoken, the part that was
   news, was the part it hid. Mesa task 1153 replaced it with a one-line
   status pill in the same place (`liveRecognition.ts::statusPill`) that says
-  only *what* is happening — "mesa speaking", "transcribing…" while a segment
+  only *what* is happening — "Naru speaking", "transcribing…" while a segment
   is on its way back from `auris`, or "hearing" — on the same visibility rule
   the panel had, `showsHearing` and its hold (mesa task 1073) included, and
-  the same ranking the header band uses (mesa above the person, since the
+  the same ranking the header band uses (Naru above the person, since the
   microphone is shut while she talks). The row is rendered at a fixed height
   whether or not it has a word in it, so the composer never jumps, and it is
   the one `aria-live` region that stays mounted so the change is announced.
-  mesa's words are in the transcript as she says them, and the person's
+  Naru's words are in the transcript as she says them, and the person's
   reach it as one turn when the recording is sent; a preview of either was
   answering "what" where the pill answers "whether".
-- **A speech-to-text engine of mesa's own.** mesa still runs no recognizer
+- **A speech-to-text engine of Naru's own.** Naru still runs no recognizer
   in-process — `POST /api/live/transcribe` hands a whole recording to the
   external `auris` binary and keeps nothing, the same shape `kokoro-rs`
   already had on the way out. This bullet used to describe that as pure
   absence; it no longer is, because accepting audio on a route at all is a
   trade, not a subtraction. What it costs: a payload now reaches the server
-  process that never used to, a new external binary mesa depends on to hear
+  process that never used to, a new external binary Naru depends on to hear
   at all, and a route that must not exist under `--lan` — "transcribe
   whatever this stranger recorded" is not a request an unauthenticated LAN
   peer should be able to make of a decoder running as the machine's owner.
-  What it buys: mesa's own vocabulary heard correctly (mesa task 922, above
+  What it buys: Naru's own vocabulary heard correctly (mesa task 922, above
   — the correction runs the same way regardless of which engine produced the
   text), punctuation a person would actually write, and the only microphone
   Firefox gets here at all (`listenPath`, above) — and the decode itself
@@ -2763,11 +2763,11 @@ CLAUDE.md requires: **data, never instructions.**
   availability probe, the JSON Lines protocol `auris` speaks on the wire,
   and exactly what is and is not retained. Before mesa task 956, listening
   ran entirely through the browser's own `SpeechRecognition`/
-  `webkitSpeechRecognition` (task 873): mesa received only the text it
+  `webkitSpeechRecognition` (task 873): Naru received only the text it
   produced, and the recognition quality, the language and the privacy
   question were the browser's — for Chrome and Safari, that means the speech
   could be sent to *their* service, a thing worth knowing and not something
-  mesa could answer for, which is exactly the gap `auris` exists to close.
+  Naru could answer for, which is exactly the gap `auris` exists to close.
   `auris` is therefore the preferred engine wherever it can be reached
   (`listenPath`, above), but it is deliberately not the *only* one: mesa
   task 957 kept the browser recognizer as the fallback for a machine with no
@@ -2775,7 +2775,7 @@ CLAUDE.md requires: **data, never instructions.**
 - **An HTTP route for `mesa live look`** (task 895). Capturing the person's
   screen is a CLI-only capability on purpose: `--lan` serves the API to the
   whole network with no auth, and no gate here makes "photograph the owner's
-  desktop" an acceptable thing to answer over a socket. mesa also never
+  desktop" an acceptable thing to answer over a socket. Naru also never
   *stores* a shot, never puts one in a turn, and never shows one in the web UI:
   the PNG is a file on the person's own disk that the agent reads and nothing
   else ever sees.
@@ -2792,7 +2792,7 @@ CLAUDE.md requires: **data, never instructions.**
   waiter, so an agent killed mid-work leaves the band lit until the
   conversation is ended — which is the harmless direction, and the one that
   needs no clock: an agent that dies while *waiting* leaves the span closed,
-  and ending the conversation clears it either way. mesa does not poll the
+  and ending the conversation clears it either way. Naru does not poll the
   agent to ask whether it is still alive.
 - **A server-side pause.** Pausing is one browser stepping out (task 882), not
   a state of the conversation: there is no `paused` column, no route and no CLI
@@ -2860,7 +2860,7 @@ under `--lan`, plus `GET /api/live` carrying no notebook.
 
 `mesa live look` has a section of its own (task 895), driven through a **stub**
 `MESA_LOKI_BIN` — a gate cannot have a screen, a browser or a window server,
-and the half that is mesa's needs none of the three. The stub answers
+and the half that is Naru's needs none of the three. The stub answers
 `-f json windows` from a file the section rewrites per case and writes a PNG at
 whatever `--output` names, so what is under test is which window the reported
 box picks: the **khora lookalike** (a second window titled `mesa` at a

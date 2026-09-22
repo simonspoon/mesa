@@ -131,11 +131,11 @@ describe('headerIndicator', () => {
 
 describe('indicatorLabel', () => {
   it('names who is talking, in each state', () => {
-    expect(indicatorLabel('speaking')).toBe('mesa is speaking')
-    expect(indicatorLabel('paused')).toBe('mesa is paused')
-    expect(indicatorLabel('hearing')).toBe('mesa is hearing you')
-    expect(indicatorLabel('resting')).toBe('mesa is resting')
-    expect(indicatorLabel('working')).toBe('mesa is working on it')
-    expect(indicatorLabel('listening')).toBe('mesa is listening')
+    expect(indicatorLabel('speaking')).toBe('Naru is speaking')
+    expect(indicatorLabel('paused')).toBe('Naru is paused')
+    expect(indicatorLabel('hearing')).toBe('Naru is hearing you')
+    expect(indicatorLabel('resting')).toBe('Naru is resting')
+    expect(indicatorLabel('working')).toBe('Naru is working on it')
+    expect(indicatorLabel('listening')).toBe('Naru is listening')
   })
 })

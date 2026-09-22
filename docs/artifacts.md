@@ -37,7 +37,7 @@ CREATE INDEX idx_artifacts_project ON artifacts(project_id);
 `list_artifacts(project_id: Option<i64>)` orders by
 `name COLLATE NOCASE, id`, so the CLI, the API and the page can never
 disagree about ordering. `delete_artifact` returns the destroyed record —
-the recoverable echo that stands in for the confirmation prompt mesa
+the recoverable echo that stands in for the confirmation prompt Naru
 deliberately does not have. There is no history table: an artifact is
 replaced in place by `update`, not versioned.
 
@@ -206,7 +206,7 @@ reasoning rather than just the rule:
   A mode-dependent gate here would recreate exactly the drift the warning is
   about, and it would buy nothing: a LAN peer who can already `POST` a task
   description (unauthenticated, in both modes, today) can already put
-  arbitrary text in front of the person using mesa. This route adds a
+  arbitrary text in front of the person using Naru. This route adds a
   render path for text that was already reachable, not a new way to inject
   it.
 
@@ -222,13 +222,13 @@ this one different?
 Because the two bodies sit in different **capability classes**, and it is
 *who executes them* that decides which class a body is in, not the fact that
 both happen to be called `body`. A library row's body is executed **by
-Claude or by the shell** — mesa hands those exact bytes to a spawned agent,
+Claude or by the shell** — Naru hands those exact bytes to a spawned agent,
 or writes them to `.claude/` where a hook will later run them; a script's
 body is executed **by `bash -c`** on this machine, directly. Handing either
 of those out to anyone who can reach the LAN port is handing out code that
 runs with this machine's privileges. An artifact's body, by contrast, is
 executed **by nobody**: it is rendered into a frame the CSP has stripped of
-its origin, so nothing inside it can reach mesa's API, read mesa's storage,
+its origin, so nothing inside it can reach Naru's API, read Naru's storage,
 or call out to the network at all. It sits in the *content* class — the same
 class a task `description` or a diagram frame `body` already occupy, and
 every serve mode already hands both of those out unauthenticated.
@@ -269,16 +269,16 @@ scripts may run — while leaving the opaque-origin restriction in force,
 because `allow-same-origin` is never named. An **opaque origin** is the whole
 point: even when this URL is navigated to directly, in a top-level tab, with
 no `<iframe>` involved at all, a script running inside the document cannot
-read mesa's cookies or `localStorage`, and any request it tries to make is
-treated as cross-origin by the browser rather than same-origin to mesa. That
+read Naru's cookies or `localStorage`, and any request it tries to make is
+treated as cross-origin by the browser rather than same-origin to Naru. That
 is what makes it safe for a script inside an artifact to exist at all: the
-document mesa just rendered has no identity in common with the app that
+document Naru just rendered has no identity in common with the app that
 rendered it.
 
 The rest of the policy closes what an opaque origin alone would still leave
 open. `default-src 'none'` with no `connect-src` entry blocks `fetch`, `XHR`
 and `WebSocket` outright — the opaque origin already stops those requests
-from reading mesa's data, but banning them outright also stops the document
+from reading Naru's data, but banning them outright also stops the document
 from reaching a *third-party* endpoint, which an opaque origin does nothing
 about. `img-src data:`, `font-src data:` and `media-src data:` are the
 concession that lets a self-contained mockup embed its own images and fonts
@@ -302,21 +302,21 @@ host is out of scope by design, not by oversight.
 holds firmly: **no route may ever return `text/html`.** That rule exists
 because `/files/raw` serves arbitrary **repo files** — bytes a browser would
 treat as an ordinary same-origin document the instant it saw that content
-type, with mesa's own origin, cookies and API reachable from inside it. There
+type, with Naru's own origin, cookies and API reachable from inside it. There
 is no way to make that safe for arbitrary file content, so the route simply
 never emits the type.
 
 This route is the one deliberate exception, and the reason it is sound here
 and would still be wrong there is the same distinction in one sentence: the
-render route serves a **record mesa itself created and validated**, not
+render route serves a **record Naru itself created and validated**, not
 arbitrary repo bytes, and the response is stamped with a CSP that strips the
 document's origin before a browser ever executes anything in it. The
 exception is the CSP, not the content type. If `/files/raw` ever grew this
 same CSP for `.html` files, it would still be the wrong move there — a repo's
-`.html` file is not a record mesa wrote, its content is arbitrary and
+`.html` file is not a record Naru wrote, its content is arbitrary and
 unbounded (25 MiB via `/files/download`, not a 2 MiB validated `body`), and
 serving it same-origin-but-sandboxed would still hand a hostile page in a
-git checkout a route to render itself through mesa. The two routes will
+git checkout a route to render itself through Naru. The two routes will
 never converge: one refuses `text/html` categorically, the other only ever
 serves it stripped of everything that would make it dangerous.
 
@@ -335,10 +335,10 @@ alone, nothing else in play:
 - `fetch('/api/terminal', {method: 'POST'})` → throws `TypeError`
 - `top.location = 'https://example.com'` → throws `SecurityError` **when
   framed** — but **succeeds** when the render URL is the top-level document
-  itself, and Chrome left mesa for the redirect target.
+  itself, and Chrome left Naru for the redirect target.
 
 The first five hold in both configurations: the opaque origin, and the
-inability to read cookies/storage or reach any mesa API, do not depend on
+inability to read cookies/storage or reach any Naru API, do not depend on
 whether the document is framed. The sixth is the one place the two
 configurations diverge, and it is a real, accepted residual rather than an
 oversight: CSP's `sandbox` directive restricts top-level navigation *out of
@@ -354,7 +354,7 @@ ordinary use of the tab.
 
 **The severity of what's left is a phishing-style redirect, not an origin
 escape.** An artifact opened directly can send the browser to an arbitrary
-site; it still cannot read mesa's cookies, storage, or any API route in
+site; it still cannot read Naru's cookies, storage, or any API route in
 either serve mode — every capability the sandbox exists to deny stays
 denied. What leaks is exactly one bit: "the browser is now looking at a page
 this artifact chose," nothing more.
@@ -364,7 +364,7 @@ feature.** Serving the render route as `Content-Disposition: attachment`
 would stop a direct navigation from rendering at all — but the render route
 exists specifically so `mesa live navigate` can put a hosted page in front
 of the person as a page, not a download. Refusing direct top-level
-navigation outright would require distinguishing "framed by mesa" from
+navigation outright would require distinguishing "framed by Naru" from
 "navigated to directly," which a response header cannot do (a request looks
 identical either way) without adding origin-checking machinery this route
 has otherwise had no reason to grow. Either mitigation closes a narrow

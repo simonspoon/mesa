@@ -1,7 +1,7 @@
 # System monitor
 
-A live reading of the **host the mesa server is running on** — memory, CPU,
-disk, GPU, uptime — read on every request and never stored. mesa is often
+A live reading of the **host the Naru server is running on** — memory, CPU,
+disk, GPU, uptime — read on every request and never stored. Naru is often
 served from a machine nobody is sitting at, so this is the one place that
 machine describes itself.
 
@@ -46,10 +46,10 @@ Two smaller judgements worth knowing:
   of three keys, and is simply absent on Apple silicon, where the GPU shares
   system memory: `vram_bytes: null` there.
 - `gpu.usage_pct` is **always `null`** today. Real utilisation on macOS needs
-  privileged `powermetrics`; mesa reports nothing rather than a number it
+  privileged `powermetrics`; Naru reports nothing rather than a number it
   cannot stand behind.
-- `disk_*` is the volume holding **mesa's own database** (`default_db_path()`),
-  not the whole machine's storage — that is the one disk a mesa user can fill.
+- `disk_*` is the volume holding **Naru's own database** (`default_db_path()`),
+  not the whole machine's storage — that is the one disk a Naru user can fill.
   The `sysinfo::Disks` entry chosen is the mount point that is the **longest**
   prefix of that path, since `/` is a prefix of everything.
 - `load_average` is `None` on Windows, which has no such idea; `sysinfo`

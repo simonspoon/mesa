@@ -629,7 +629,7 @@ path's lowercased final extension to one of exactly eight types — `image/png`,
 turns into 422 before it reads a single byte. There is no sniff, no
 fallback type and no `text/html` anywhere on this API: an extension not on
 that list cannot come back from this route *at all*, so "which content types
-can mesa emit for repo bytes" is answerable by reading one `match`. Only the
+can Naru emit for repo bytes" is answerable by reading one `match`. Only the
 final extension counts, so `foo.png.html` is an `.html` file and is refused.
 
 The allowlist is checked **after** `safe_path` and before the read, so the two
@@ -665,10 +665,10 @@ raw is about how it is *rendered*, not about reclassifying it.
 **This is also why raw never grows a `text/html` entry, and why a different
 route (`docs/artifacts.md`) is allowed to serve exactly that content type.**
 Raw serves arbitrary **repo files** — bytes a browser would treat as an
-ordinary same-origin document the moment it saw `text/html`, with mesa's own
+ordinary same-origin document the moment it saw `text/html`, with Naru's own
 origin and cookies reachable from inside them, and there is no CSP that makes
 that safe for content this unbounded and this uncontrolled. The artifacts
-render route serves a **record mesa itself created and validated**, capped
+render route serves a **record Naru itself created and validated**, capped
 and content-type-checked at write time, stamped with a CSP
 (`sandbox allow-scripts`, no `allow-same-origin`) that strips the document's
 origin before anything in it can run. Same content type, opposite trust
@@ -683,7 +683,7 @@ result is served through the raw route. `null` — rendered as inert muted alt
 text (`.markdown-img-missing`), never a broken-image icon — covers `http:`/
 `https:`/`data:`/any other scheme, protocol-relative `//host/…`, a bare
 `#anchor`, and any `..` chain that walks above the repo root, so the browser
-never issues a request mesa would have to refuse. `Markdown.tsx` gained one
+never issues a request Naru would have to refuse. `Markdown.tsx` gained one
 optional `resolveImageSrc` prop for this; every other caller omits it and
 keeps react-markdown's own `img` untouched. `frontend/src/fileImage.ts` holds
 the client's mirror of the server allowlist (same relationship
@@ -882,7 +882,7 @@ and `shouldIgnoreFilesShortcut` in `keyboardScope.ts`.
     Scripts page, where this editor is one field of a form whose other controls
     sit below it and nothing binds Escape at all (`docs/scripts.md`).
   - **The indent unit is the file's, not this repo's** (`detectIndentUnit`).
-    This editor browses arbitrary repos — mesa's own `src/*.rs` is four spaces
+    This editor browses arbitrary repos — Naru's own `src/*.rs` is four spaces
     and `scripts/*.sh` is tabs — and a hardcoded two spaces indented both
     wrongly, the second one *mixedly*: `autoIndent` carries the line's existing
     tabs (correctly, it is whitespace-agnostic) and then appended two spaces
@@ -1422,7 +1422,7 @@ Three more decisions:
   of any kind — is `fs::remove_file`, so a link is unlinked as the *name* it is.
 - **The echo is captured BEFORE the removal.** That is CLAUDE.md's
   delete-echo-as-recovery-transcript precedent, the thing that substitutes for
-  the confirmation prompt mesa deliberately does not have anywhere else; the
+  the confirmation prompt Naru deliberately does not have anywhere else; the
   bytes are gone, but the transcript still names exactly what was destroyed and
   whether it was a folder.
 
@@ -1624,7 +1624,7 @@ image, and like both of those it is a *rendering* decision only: no route, no
 tags, `csv` and `tsv` — two rather than one precisely so the character that
 separates the fields comes from the same extension table that already decides
 every other thing about how a file is displayed, and `frontend/src/fileCsv.ts`'s
-`delimiterFor` maps the tag onto `,` or a tab. A file mesa tags neither way is
+`delimiterFor` maps the tag onto `,` or a tab. A file Naru tags neither way is
 never tabulated, whatever its content looks like.
 
 The parsing lives in that module, with `fileCsv.test.ts` beside it (CLAUDE.md's
@@ -1718,7 +1718,7 @@ no `allow-scripts`, no `allow-same-origin`, no `allow-top-navigation`. That is
 deliberately stricter than the artifact render route (`docs/artifacts.md`),
 which grants `allow-scripts` because an artifact is a mockup an agent wrote in
 order to be run; a repo file is opened to be read, and an empty sandbox also
-leaves the frame's origin opaque, so the page cannot reach mesa's DOM, storage
+leaves the frame's origin opaque, so the page cannot reach Naru's DOM, storage
 or cookies. Relative asset paths (`img`, `link`) therefore do not resolve —
 the frame has no base URL and nothing rewrites them the way `markdownAssets.ts`
 rewrites a markdown image src.

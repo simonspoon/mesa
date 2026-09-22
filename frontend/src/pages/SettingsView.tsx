@@ -183,7 +183,7 @@ async function waitForServer(timeoutMs = 15000, intervalMs = 500): Promise<void>
     }
   }
   throw new Error(
-    'server did not come back within 15s — check the terminal mesa is running in',
+    'server did not come back within 15s — check the terminal Naru is running in',
   )
 }
 
@@ -206,7 +206,7 @@ function SettingsHeader() {
       <h1>Settings</h1>
       <ConfirmDelete
         label="Restart server"
-        message="Relaunches mesa (picks up a rebuilt binary); reloads when it's back."
+        message="Relaunches Naru (picks up a rebuilt binary); reloads when it's back."
         onDelete={handleRestart}
       />
     </div>
@@ -284,7 +284,7 @@ export function SettingsView({ tab }: { tab: SettingsTab }) {
         <SettingsHeader />
         <p className="error">{error}</p>
         <p className="muted">
-          mesa found a config file it could not read. Fix{' '}
+          Naru found a config file it could not read. Fix{' '}
           <code>~/.mesa/config.json</code> by hand — editing it from here would
           overwrite whatever is in there.
         </p>
@@ -330,7 +330,7 @@ export function SettingsView({ tab }: { tab: SettingsTab }) {
       <div hidden={tab !== 'hooks'}>
         <h2>Hooks</h2>
         <p className="muted">
-          The hook mesa runs to start a coding agent. Leave a box empty to use
+          The hook Naru runs to start a coding agent. Leave a box empty to use
           the built-in default. Every hook is a bash script, one line or many,
           run as <code>bash -c</code> in the project folder — so <code>cd</code>,{' '}
           <code>export</code>, a pipe or a conditional binary all work. Each{' '}
@@ -1022,7 +1022,7 @@ function LivePromptSection() {
           <code className="settings-command-key">live.auto-send-ms</code>
         </label>
         <p className="muted settings-command-blurb">
-          How long the person may fall silent, while mesa is listening,
+          How long the person may fall silent, while Naru is listening,
           before the transcribed recording so far is sent as one turn —
           dictation never presses Enter, so this pause is what ends a spoken
           thought. Blank = {live.auto_send_ms_default} ms (the default). It
@@ -1216,7 +1216,7 @@ function SpeechSection() {
         </div>
         {!canPick(speech) && (
           <p className="muted settings-command-blurb">
-            mesa could not ask <code>kokoro-rs</code> which voices it has — type
+            Naru could not ask <code>kokoro-rs</code> which voices it has — type
             a name, or run <code>kokoro-rs --list-voices</code> to see them.
           </p>
         )}
@@ -1402,7 +1402,7 @@ function ListenSection() {
         </div>
         {!canPickModel(listen) && (
           <p className="muted settings-command-blurb">
-            mesa could not ask <code>auris</code> which models it has — type a
+            Naru could not ask <code>auris</code> which models it has — type a
             name, or run <code>auris --list-models</code> to see them.
           </p>
         )}
@@ -1908,7 +1908,7 @@ function SystemSection() {
           })}
         </div>
         <Meter
-          label="Disk (mesa database volume)"
+          label="Disk (Naru database volume)"
           pct={
             info.disk_total_bytes !== null && info.disk_free_bytes !== null
               ? usedPct(
@@ -1955,7 +1955,7 @@ function SystemSection() {
           </dd>
           <dt>Uptime</dt>
           <dd>{formatUptime(info.uptime_secs)}</dd>
-          <dt>mesa process</dt>
+          <dt>Naru process</dt>
           <dd>{formatBytes(info.process_rss_bytes)}</dd>
         </dl>
       </section>

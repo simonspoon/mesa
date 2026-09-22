@@ -364,7 +364,7 @@ export function ProjectTasksPage({
           // call here to read it from.
           <div className="files-placeholder muted">
             <p>
-              This project has no linked folder, so mesa cannot open a shell in
+              This project has no linked folder, so Naru cannot open a shell in
               it. Run <code>mesa project resolve</code> inside the repo, or{' '}
               <code>mesa project update {projectId} --path &lt;dir&gt;</code>, to
               link one.

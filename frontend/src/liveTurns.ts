@@ -227,5 +227,5 @@ export function turnGroups(turns: readonly LiveTurn[]): TurnGroup[] {
  */
 export function turnLabel(role: LiveTurn['role'], notice = false): string {
   if (notice) return 'notice'
-  return role === 'user' ? 'you' : 'mesa'
+  return role === 'user' ? 'you' : 'Naru'
 }

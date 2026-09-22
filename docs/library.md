@@ -1,10 +1,10 @@
 # Library (agents, skills, hooks, prompts, CLAUDE.md)
 
-mesa stores Claude Code's agent definitions, skills, hooks and CLAUDE.md
+Naru stores Claude Code's agent definitions, skills, hooks and CLAUDE.md
 files as first-class records — the library — and syncs them file-by-file
 against `.claude` (and a project's root `CLAUDE.md`), with the user picking a
 winner per file (mesa task 919). It also holds a fifth kind, **prompts**:
-text mesa itself reads — the live-conversation summariser's prompt, which used
+text Naru itself reads — the live-conversation summariser's prompt, which used
 to be a `~/.mesa/config.json` key (`docs/config.md`), and anything a hook
 template splices in as `{prompt:<name>}` (mesa task 1138) — each of which may
 *also* be exported to `.claude/commands/<name>.md` as a slash command (mesa
@@ -26,7 +26,7 @@ Table `library_items` (migration index 47, resulting `user_version` 48):
 | `project_id` | INTEGER NULL | FK `ON DELETE CASCADE`; required iff `scope = project`, must be NULL iff `scope = user` |
 | `body` | TEXT NOT NULL | the file's contents; may be empty |
 | `builtin_id` | TEXT NULL, UNIQUE | the built-in this row forked from, or NULL for a purely user-authored row |
-| `synced_body` | TEXT NULL | the last body mesa and the disk agreed on — the sync baseline |
+| `synced_body` | TEXT NULL | the last body Naru and the disk agreed on — the sync baseline |
 | `synced_at` | TEXT NULL | when that agreement was recorded |
 | `export_command` | INTEGER NOT NULL DEFAULT 0 | a prompt's "also a slash command" flag (migration index 54, mesa task 1139); `validation` when set on any other kind |
 | `created_at` / `updated_at` | TEXT NOT NULL | |
@@ -85,7 +85,7 @@ CLI's `library list [PROJECT]` and `GET /api/library?project=<id>` expose.
 
 `core::library::BUILTINS` is a `&[Builtin]` static — `id`, `name`, `kind`,
 `scope`, `body` — the same shape `config.rs` already used for "blank means
-the block mesa ships." A built-in is **never inserted at migration time**.
+the block Naru ships." A built-in is **never inserted at migration time**.
 `core::library::effective_items` (what `list`/`GET /api/library` actually
 return) is `Store::list_library_items` plus every `BUILTINS` entry **not**
 shadowed by a db row carrying its `builtin_id`; an unshadowed built-in is
@@ -97,7 +97,7 @@ That split is the whole point:
 - **Editing a built-in forks it.** The API's `POST /api/library/builtins/{id}/fork`
   and the CLI's edit path both go through `Store::create_library_item` with
   `builtin_id: Some(id)` — a real db row appears, carrying the new body, and
-  from then on mesa **never updates it**. An mesa upgrade that improves a
+  from then on Naru **never updates it**. A Naru upgrade that improves a
   built-in's shipped text changes only the *unshadowed* ones; a user's fork is
   theirs to keep, forever, until they choose to sync it back.
 - **Deleting the fork restores the built-in.** `Store::delete_library_item`
@@ -120,7 +120,7 @@ The starter set is deliberately tiny — seven rows:
 | `live-summary-prompt` | `prompt` | `user` | The instructions for the short-lived agent that writes a live conversation's memory once it ends (mesa task 921) — literally `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it belongs beside |
 | `starter-claude-md` | `claude-md` | `user` | A short starting-point CLAUDE.md |
 | `stop-notify` | `hook` | `user` | A minimal shell hook that echoes when Claude Code stops — its *name* is `stop-notify.sh`, since a hook's name carries its own extension |
-| `task-stop-guard` | `hook` | `user` | A `Stop` hook that keeps a task agent from ending its turn before its mesa task is handled — literally `core::stop_guard::STOP_GUARD_HOOK` (mesa task 1190, "The task-stop-guard hook" below); name `task-stop-guard.sh` |
+| `task-stop-guard` | `hook` | `user` | A `Stop` hook that keeps a task agent from ending its turn before its Naru task is handled — literally `core::stop_guard::STOP_GUARD_HOOK` (mesa task 1190, "The task-stop-guard hook" below); name `task-stop-guard.sh` |
 
 `mesa-live`'s body being the literal `AGENT_DEFINITION` constant (and
 `live-summary-prompt`'s the literal `SUMMARY_PROMPT`) is what lets
@@ -195,7 +195,7 @@ whatever script the user drops in — `poll-guard.py` as readily as
 filename** and the extension travels with the item, which is what lets an
 imported hook land back on disk as the file it came from. `scan_disk` lists
 every regular file in `.claude/hooks/` regardless of extension, silently
-skipping any whose filename `Store`'s name rule would reject (a file mesa
+skipping any whose filename `Store`'s name rule would reject (a file Naru
 cannot name is one it could not round-trip) — dotfiles included, since that
 rule requires an alphanumeric first character. Migration index 52 appended
 `.sh` to every pre-existing hook row's name, which is exactly the path it
@@ -205,11 +205,11 @@ already had.
 
 Until mesa task 1139 there were two kinds for what is one thing: a `command`
 (text under `.claude/commands/`, reachable only by typing `/<name>` at
-Claude) and a `prompt` (text mesa reads — the summariser's instructions, and
+Claude) and a `prompt` (text Naru reads — the summariser's instructions, and
 since mesa task 1138 anything a hook template names as `{prompt:<name>}`).
 The same paragraph could not be both. Now there is **one kind, `prompt`**,
 and a per-row flag, **`export_command`**, saying whether it is *also* written
-to Claude's commands folder: one source of truth in mesa, two consumption
+to Claude's commands folder: one source of truth in Naru, two consumption
 paths. A prompt with the flag off is mesa-internal exactly as before — no
 path, invisible to `scan_disk` and `sync_status` by construction — and one
 with it on owns `.claude/commands/<name>.md` and syncs like an agent or a
@@ -239,10 +239,10 @@ the sync flow, made by `core::library::update_item`, the wrapper both `mesa
 library update` and `PATCH /api/library/{id}` go through instead of
 `Store::update_library_item` directly (the store never opens the
 filesystem). A file left behind would still be a slash command Claude Code
-offers while mesa no longer knew about it. It is removed **only while it is
-still mesa's own**: its bytes equal the row's body as it was before the
-patch, or the sync baseline (an edit made in mesa but not yet pushed leaves
-the disk file equal to the baseline, and that file is still mesa's). A file
+offers while Naru no longer knew about it. It is removed **only while it is
+still Naru's own**: its bytes equal the row's body as it was before the
+patch, or the sync baseline (an edit made in Naru but not yet pushed leaves
+the disk file equal to the baseline, and that file is still Naru's). A file
 the user hand-edited since is left where it is, and the next `sync status`
 reports it `disk-new` — the row the user resolves. Either way
 `synced_body`/`synced_at` are cleared (`Store::clear_library_synced`): the
@@ -341,14 +341,14 @@ project's `local_path`. A project-scope hook whose project has no
 through `core::library::resolve`, the same traversal chokepoint the bodies
 take; nothing here opens a second path-joining route.
 
-**The command mesa writes** is `$CLAUDE_PROJECT_DIR/.claude/hooks/<name>` for
+**The command Naru writes** is `$CLAUDE_PROJECT_DIR/.claude/hooks/<name>` for
 a `project`-scope hook — Claude Code's own variable for the repo it is
 running in, so the registration stays portable across clones and worktrees —
 and the absolute `<home>/.claude/hooks/<name>` for a `user`-scope one, which
 has no such anchor.
 
 **The matching rule.** A command in settings.json is arbitrary shell, so
-"is this hook registered" cannot be string equality against what mesa would
+"is this hook registered" cannot be string equality against what Naru would
 have written: `bash $CLAUDE_PROJECT_DIR/.claude/hooks/stop-notify.sh --quiet`
 is plainly the same hook. A command counts as this hook's iff it is exactly
 the absolute path, **or** it contains the relative path
@@ -357,7 +357,7 @@ before and after the match may not itself be a filename character
 (`[A-Za-z0-9._-]`). The boundary is the whole of the rule's safety: it is
 what keeps `.claude/hooks/foo.sh` from reading as the hook named `oo.sh`,
 and `…/foo.sh.bak` from reading as `foo.sh`. It errs toward *not* claiming a
-command mesa is unsure about, since the cost of a false positive is
+command Naru is unsure about, since the cost of a false positive is
 unregistering someone else's line.
 
 **Enabling** ensures a group under the chosen event whose command list holds
@@ -384,7 +384,7 @@ there first, creating the parent directory and setting the executable bit
 overwrites**: this is deliberately `core::live::ensure_agent_definition`'s
 posture, for the same reason — a spawn there and a registration here may not
 depend on something the user has to run first, but after the first seed the
-file belongs to the sync flow, where a difference between disk and mesa is a
+file belongs to the sync flow, where a difference between disk and Naru is a
 row the user resolves.
 
 **Disabling** removes every command matching this hook, then cleans up
@@ -395,7 +395,7 @@ and/or one `matcher`; with neither, every registration of that hook goes.
 Disabling something that was never registered is a no-op success, the mirror
 of enabling's idempotence — including on a file whose `hooks` is `null`,
 which both the parser and both splices read as an empty one rather than as
-something mesa refuses to touch.
+something Naru refuses to touch.
 
 The matcher rules above are **input** rules, and a disable's matcher is not
 an input: it is a filter naming which existing registrations to cut, and
@@ -408,9 +408,9 @@ reading would make that button permanently broken for such a row.)
 
 ### The write is a splice, not a round trip
 
-mesa does not own `.claude/settings.json` — the user's model, environment,
+Naru does not own `.claude/settings.json` — the user's model, environment,
 permissions and everything else live beside the `hooks` key — so a
-parse-and-reserialize round trip would silently reformat a file mesa merely
+parse-and-reserialize round trip would silently reformat a file Naru merely
 edits one key of. Instead `splice_register` and `splice_unregister` navigate the raw text with
 a small hand-written scanner (it walks an object or array tracking string
 state, escapes and brace/bracket depth, and only ever runs on text
@@ -428,9 +428,9 @@ would empty is cut instead of its commands, an event whose group list would
 empty is cut instead of its groups, and a `hooks` key that would empty is cut
 from the file rather than left behind as `{}`.
 
-**Every byte mesa did not semantically change comes through byte-identical** —
+**Every byte Naru did not semantically change comes through byte-identical** —
 a sibling command, another group, another event, key order, indentation,
-blank lines and every setting mesa knows nothing about. Directly unit-tested
+blank lines and every setting Naru knows nothing about. Directly unit-tested
 at each depth an entry can be introduced or removed, including a removal from
 the first, middle or last position (taking exactly one separating comma with
 it and leaving its neighbours' indentation intact).
@@ -439,7 +439,7 @@ Two consequences worth stating:
 
 - Inside **the newly-introduced fragment alone** — never in anything that was
   already there — keys come out **alphabetical**. `serde_json::Map` is a
-  `BTreeMap`, and mesa deliberately does not enable the `preserve_order`
+  `BTreeMap`, and Naru deliberately does not enable the `preserve_order`
   feature: its reach is the whole product, and the CLI's documented `--quiet`
   contract (`CLAUDE.md`) says a rebuilt `serde_json::Value` payload has
   alphabetical keys. One settings key's ordering is not worth changing that.
@@ -448,11 +448,11 @@ Two consequences worth stating:
   preserve, so a fresh pretty-printed document is written (and the parent
   directory created if needed).
 
-**A settings file mesa cannot understand is refused, never rewritten.**
+**A settings file Naru cannot understand is refused, never rewritten.**
 Invalid JSON, a top level that is not an object, a `hooks` that is not an
 object, an event whose value is not an array — each is `validation` naming
 the file, with the file left exactly as it was. A best-effort repair would
-destroy configuration mesa did not write and cannot reconstruct.
+destroy configuration Naru did not write and cannot reconstruct.
 
 ### The task-stop-guard hook
 
@@ -467,9 +467,9 @@ mesa library hook enable task-stop-guard --event Stop
 
 which seeds `~/.claude/hooks/task-stop-guard.sh` and names it under `Stop`
 in `~/.claude/settings.json`. It needs only `bash`, `jq` and `mesa` on PATH
-(`MESA_DB` is honoured, since mesa reads it itself) and **never wedges a
+(`MESA_DB` is honoured, since Naru reads it itself) and **never wedges a
 session**: a missing tool, an unreadable transcript, an unknown task or any
-mesa error is an allow — exit 0, nothing printed — and `stop_hook_active`
+Naru error is an allow — exit 0, nothing printed — and `stop_hook_active`
 is the loop guard.
 
 It reads the Stop payload's `transcript_path` once. The task id is the
@@ -508,7 +508,7 @@ transcripts and a throwaway `MESA_DB`/`HOME`.
 
 A settings.json command may name a script anywhere — `bash
 ~/.claude/helios-warm.sh`, `/Users/x/bin/warm.py` — and the library, which
-only ever looks at `.claude/hooks/`, cannot see it (mesa task 1128). mesa
+only ever looks at `.claude/hooks/`, cannot see it (mesa task 1128). Naru
 does **not** model such a script as a library item: that would need a stored
 absolute path on the row, breaking "path is derived, never stored", and a
 second containment story beside `resolve`. Instead it **discovers** them and
@@ -529,7 +529,7 @@ session, so such a command is left alone). A `…/env` first token
 (`/usr/bin/env python3 ~/x.py`) is passed over as the interpreter shim. It
 is the *first* such token whatever its role, so `mytool --config
 /etc/x.conf` picks `/etc/x.conf` — read the path before pressing adopt. A
-command with no path token (`npm run lint`) is arbitrary shell mesa does not
+command with no path token (`npm run lint`) is arbitrary shell Naru does not
 try to read and is skipped. The expanded path is canonicalised (symlinks in
 its existing prefix followed, `resolve`'s own rule) and, if it lands inside
 `<scope_base>/.claude/hooks/`, it is the library's already — a registration,
@@ -568,7 +568,7 @@ is a row whose script is not on disk, and a row carrying a `conflict` is
    the write goes through the same re-parse self-check and tmp+rename;
 3. removes the original — the path **as the command spells it**, expanded
    but not resolved, so when that is a symlink the link itself goes and its
-   target (not mesa's to delete) stays, while the body was read through the
+   target (not Naru's to delete) stays, while the body was read through the
    resolved path;
 4. creates the `hook` library row with its sync baseline set, so `sync
    status` reads `in-sync` at once, and answers its `LibraryHookStatus`.
@@ -585,7 +585,7 @@ overwritten: it is a `conflict` on the read and on the press.
 Both surfaces print JSON; neither takes `--quiet` (exit 2, like the trio).
 On `#/library` the rows sit in their own section, "Hooks outside
 .claude/hooks", read for the user scope and every project with a
-`local_path` (`libraryHooks.ts::orphanScopesFor`; a scope whose file mesa
+`local_path` (`libraryHooks.ts::orphanScopesFor`; a scope whose file Naru
 refuses to parse is dropped rather than failing the rest), each with its
 scope, path, registrations, a "missing on disk" badge and an **adopt**
 button disabled with the reason (`orphanAdoptDisabledReason`). A successful
@@ -596,7 +596,7 @@ since all three change at once.
 
 Sync compares three strings per path: the **mesa body** (M, from the item's
 `body`), the **disk body** (D, the file's current contents, or absent), and
-the **baseline** (B, the item's `synced_body` — the body mesa and the disk
+the **baseline** (B, the item's `synced_body` — the body Naru and the disk
 last agreed on, or absent if never synced). `core::library::classify` is the
 pure, total function deciding a status from the three:
 
@@ -640,7 +640,7 @@ every read, nothing stored:
 
 | field | value |
 | --- | --- |
-| `disk_mtime` | the file's mtime, in mesa's own `YYYY-MM-DD HH:MM:SS` UTC text (the shape SQLite's `datetime('now')` writes), read off the metadata `read_bounded_with_mtime` already has rather than a second stat. `null` when there is no file, or when the filesystem reports no mtime — a value mesa could not determine is null, never a zero |
+| `disk_mtime` | the file's mtime, in Naru's own `YYYY-MM-DD HH:MM:SS` UTC text (the shape SQLite's `datetime('now')` writes), read off the metadata `read_bounded_with_mtime` already has rather than a second stat. `null` when there is no file, or when the filesystem reports no mtime — a value Naru could not determine is null, never a zero |
 | `mesa_updated_at` | the newest `library_versions.created_at` for the item, else its `updated_at` — versions first because `updated_at` also moves on a rename. `null` for an unshadowed built-in (there is no row) and for a `disk-new` row (there is no mesa side) |
 | `diff` | a `LibraryDiffLine[]`, `null` unless **both** sides exist *and* differ — so `in-sync` and every one-sided status carry none, and the whole body of the side that exists is the whole story there |
 
@@ -681,12 +681,12 @@ the radio. The `diff vs built-in` panel and the version history pass no
 orientation and keep their fixed reading.
 
 **There is deliberately no automatic merging and no three-way merge.** The
-common case — Claude edited a skill on disk, or the user edited it in mesa —
+common case — Claude edited a skill on disk, or the user edited it in Naru —
 is one-sided (`mesa-changed`/`disk-changed`), and the baseline is exactly what
 makes that classification possible: without it, every difference between M
 and D would look identical, whether one side changed or both did. A
 `both-changed` row shows the mesa-vs-disk diff (with both whole bodies one
-click away) and the user takes a side; mesa never
+click away) and the user takes a side; Naru never
 guesses which half of two independently-changed texts to keep. That is a
 deliberate, permanent property of this feature, not a v1 gap.
 
@@ -719,13 +719,13 @@ uses).
 
 `Store::set_library_synced` (stamps `synced_body`/`synced_at`) deliberately
 **does not** move `updated_at` — the `claimed_at` asymmetry held a second
-time: recording that mesa and the disk agree is not an edit to what mesa
+time: recording that Naru and the disk agree is not an edit to what Naru
 holds. `Store::pull_library_body` (the `disk` choice's write) does move
 `updated_at`, because it *does* change the body.
 
 ## Import / export
 
-A library can travel between mesa instances as one downloadable **bundle** —
+A library can travel between Naru instances as one downloadable **bundle** —
 a JSON document holding the library's *contents*, not its identity. Three new
 ts-rs types carry it: `LibraryBundleItem` (`name`, `kind`, `scope`, an
 optional `project` **name** — present iff `scope` is `project` — `body`, an
@@ -808,7 +808,7 @@ item is matched again by `resolve_existing` at apply time, so a `replace`
 resolves against the local body **as it is then**, not as it was previewed —
 if a concurrent CLI write or another browser tab changed that row in
 between, the body overwritten is one the person never saw in the diff. That
-is accepted rather than fixed: mesa is a single-user local tool, the exposure
+is accepted rather than fixed: Naru is a single-user local tool, the exposure
 is no worse than the batch-wide `on_conflict: replace` this replaced (which
 overwrote without showing anything at all), and a subtly wrong optimistic
 concurrency check would cost more than the race does. The same goes for a row
@@ -839,7 +839,7 @@ read rather than to type, so `--preview` reports and the web flow decides.
 do, and nothing more — no file is written, no baseline is stamped. A freshly
 imported row therefore has a null `synced_body`, so the very next `sync
 status` reports it honestly: `mesa-new` if nothing sits at its path yet, or
-`both-changed` if a file already does. That is correct, not a gap — mesa and
+`both-changed` if a file already does. That is correct, not a gap — Naru and
 this machine's disk have never actually agreed on that row's contents, and
 the sync model must not pretend otherwise just because the row arrived from
 somewhere else.
@@ -966,7 +966,7 @@ or a name — a built-in resolves by name too, since its name and its
   carrying its `builtin_id`, with the flag as given.
 
 - `delete ITEM` has no confirmation and echoes the destroyed record — the
-  recoverable transcript that stands in for the prompt mesa doesn't have.
+  recoverable transcript that stands in for the prompt Naru doesn't have.
   Deleting the fork of a built-in restores it unshadowed; deleting an
   unshadowed built-in (there is no row) is `validation`.
 - `list [PROJECT] [--kind KIND]` and `versions ITEM` print bare JSON arrays —
@@ -1049,7 +1049,7 @@ holds exactly as it does on the sync path, creates the parent directory, and
 writes the body.
 
 It **never overwrites an existing file**. After the first seed the file belongs
-to the sync flow, where a difference between disk and mesa is a row the user
+to the sync flow, where a difference between disk and Naru is a row the user
 resolves; rewriting it on every start would make one side of that decision
 impossible to keep. A failure (no `HOME`, an unwritable `.claude`) is returned
 as an error and both spawn sites treat it exactly like a failed spawn —
@@ -1063,7 +1063,7 @@ config key followed, just moved: what the forked row holds is the whole of what
 the agent is.
 
 `config.rs`'s `LiveSection` now holds one key, `auto-send-ms`
-(`docs/config.md`); a `live.prompt` key left behind by an older mesa, or
+(`docs/config.md`); a `live.prompt` key left behind by an older Naru, or
 hand-edited into the file, is **silently ignored** — never an error, and never
 read from — because the struct simply has no field for it any more.
 
@@ -1109,7 +1109,7 @@ API:
   unchanged append none, and an unshadowed built-in's history is an empty
   array (no row, no history).
 - **The full sync loop**: every status in the table above, reached by
-  actually manipulating the file and the mesa row (a fresh item with no file
+  actually manipulating the file and the Naru row (a fresh item with no file
   is `mesa-new`; applying `mesa` writes it and the next scan reports
   `in-sync`; editing the file reports `disk-changed`, and applying `disk`
   pulls it in and appends a `sync-pull` version; editing the body reports
@@ -1191,7 +1191,7 @@ API:
   prompt's file is **byte-identical** to its body (`cmp`) and `sync status`
   reads `in-sync` on the very next scan; a prompt with the flag off has no
   path and is absent from the scan; `--no-export-command` removes the file
-  mesa wrote and clears the baseline, but leaves a hand-edited one for the
+  Naru wrote and clears the baseline, but leaves a hand-edited one for the
   scan to report `disk-new`; `--quiet` keeps the flag; `PATCH` carries it;
   and a bundle still saying `"kind": "command"` imports as an exporting
   prompt while a fresh export carries the flag.

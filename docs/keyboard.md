@@ -63,11 +63,11 @@ divergent second suppression check the chokepoint exists to prevent.
 
 ## The keymap (task 1079)
 
-`frontend/src/keymap.ts` is the one table of what mesa binds, and the one place
+`frontend/src/keymap.ts` is the one table of what Naru binds, and the one place
 a keystroke is read against it. Before it, each listener compared `e.key`
 inline — the palette in `App.tsx`, the spatial nav's `KEY_DIRECTION`, the `a`
 shortcut in `ProjectTasksPage`, the listen chord's `isListenChord` — so there
-was nowhere to *state* what mesa binds and nothing to rebind.
+was nowhere to *state* what Naru binds and nothing to rebind.
 
 - **Seven actions**, exactly the four global `window` keydown listeners:
   `command-palette`, the four `focus-*` directions, `create-task` and
@@ -294,7 +294,7 @@ Two consequences worth knowing:
   all. It now carries `role="button"`, `tabIndex={0}`, and an Enter handler.
 
 Candidates must also pass a **visibility** test: a non-zero rect *plus* a
-computed `visibility` check. mesa keeps live-resource panes mounted-but-hidden
+computed `visibility` check. Naru keeps live-resource panes mounted-but-hidden
 via `visibility: hidden` rather than unmounting them (the inactive
 main/Terminal pane, the collapsed AgentSidebar body) so their WebSockets
 survive navigation. Those still report a positive-area rect, and `focus()` on

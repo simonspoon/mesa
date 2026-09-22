@@ -4,7 +4,7 @@ A task may carry **attachments** — arbitrary files (screenshots, PDFs, notes)
 uploaded and attached directly to one task. Table `attachments` (migration
 index 12): `task_id` (`ON DELETE CASCADE`), `filename`, `content_type`
 (extension-guessed, nullable), `size_bytes`, `author`, `created_at`. Bytes
-live **outside the DB and outside the tracked repo**, in mesa's own data
+live **outside the DB and outside the tracked repo**, in Naru's own data
 directory (`MESA_ATTACHMENTS_DIR` if set, else `attachments/` beside the
 resolved db — mirrors `hooks.json`'s convention), one subfolder per task id,
 filed as `{attachment_id}-{sanitized basename}` (`src/core/attachments.rs`;

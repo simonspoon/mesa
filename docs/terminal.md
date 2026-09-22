@@ -23,7 +23,7 @@ navigating to another page and back never disturbs an open pane.
 - **cwd is `~/.mesa/workspace`, or a project's folder with `?project=<id>`**
   (the project Terminal tab, below). The workspace is `config::workspace_dir()`,
   created on demand: Claude Code never persists folder trust for the home
-  directory, so mesa owns one folder instead. The path is never
+  directory, so Naru owns one folder instead. The path is never
   client-supplied: the id is resolved
   through the store to that project's `local_path`, and rejected exactly as
   `spawn_project_agent` rejects its own spawn folder — unknown id is

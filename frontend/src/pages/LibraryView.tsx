@@ -160,7 +160,7 @@ function LibraryForm({
       </h2>
       {item?.builtin && (
         <p className="muted">
-          Editing a built-in forks it into your own copy — mesa never touches
+          Editing a built-in forks it into your own copy — Naru never touches
           this row again, even if a future built-in body changes.
         </p>
       )}
@@ -1263,7 +1263,7 @@ export function LibraryView() {
       <h1>Library</h1>
       <p className="muted">
         Agents, skills, hooks, prompts and CLAUDE.md files, stored here and
-        synced against your <code>.claude</code> directory file by file. mesa
+        synced against your <code>.claude</code> directory file by file. Naru
         never merges automatically — a sync always shows both sides and asks
         you to pick. A prompt is reachable from a hook template as{' '}
         <code>{'{prompt:<name>}'}</code>, and can also be a slash command.

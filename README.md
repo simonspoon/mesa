@@ -1,10 +1,14 @@
-<img src="frontend/public/favicon.svg" width="72" height="72" alt="mesa logo" />
+<img src="frontend/public/favicon.svg" width="72" height="72" alt="Naru logo" />
 
-# mesa
+# Naru
 
 **Local-first project & task management for humans and agents.**
 
-mesa is a single-binary task manager backed by one SQLite database, exposing two
+> Naru was formerly called mesa. The CLI binary (`mesa`), the `MESA_*`
+> environment variables, data paths and `mesa task N` references still use
+> `mesa` until the later rename phases.
+
+Naru is a single-binary task manager backed by one SQLite database, exposing two
 surfaces over the same store:
 
 - a **machine-first JSON CLI** — the primary surface for AI agents and scripts;
@@ -14,7 +18,7 @@ surfaces over the same store:
 There is no cloud, no account, and no daemon required for the CLI: each command
 opens the database directly. Your data is a file on your disk.
 
-## Why mesa
+## Why Naru
 
 - **Agent-native.** The CLI emits JSON only (no human tables), with stable error
   codes and exit codes, so an agent can drive it without parsing prose.
@@ -40,7 +44,7 @@ brew install simonspoon/tap/mesa
 
 ### Build from source
 
-mesa is a Rust binary with an embedded frontend. Building a release binary
+Naru is a Rust binary with an embedded frontend. Building a release binary
 requires Rust (edition 2024), Node.js, and npm.
 
 ```bash
@@ -102,7 +106,7 @@ Every command prints JSON to stdout. By default mutations and `show` print the
 full object; `list` prints a bare JSON array; `delete` prints the full deleted
 record(s). Pass `--quiet` to get the compact projection instead — the record
 minus its unbounded free-text fields, the same bounded shape `list` already
-emits — when you are driving mesa in a loop and only need the ids and status
+emits — when you are driving Naru in a loop and only need the ids and status
 back.
 
 ```bash
@@ -166,7 +170,7 @@ mesa backup /tmp/mesa-snap.db
   group, so a loop caller fails loudly instead of silently no-opping.
 - **`--quiet` on a `delete` is an explicit opt-out of the safety floor.**
   Deletes cascade with no confirmation and no `--force`; the full-record echo
-  *is* mesa's recovery transcript, standing in for the prompt that isn't
+  *is* Naru's recovery transcript, standing in for the prompt that isn't
   there. `--quiet` waives it for that call — allowed because the caller asked
   for it, never a default. Want a net → `mesa backup <path>` first.
 - **Errors are JSON on stderr:**
@@ -174,7 +178,7 @@ mesa backup /tmp/mesa-snap.db
   {"error": {"code": "not_found|validation|cycle|conflict|usage|unavailable", "message": "..."}}
   ```
   (`unavailable` is scoped to the surfaces that depend on something outside
-  mesa: live subscription usage, the agents endpoints, and `cc text` — the
+  Naru: live subscription usage, the agents endpoints, and `cc text` — the
   transcript file a node's body lives in may have been deleted.)
 - **Exit codes are load-bearing:** `0` success, `1` domain/runtime error,
   `2` usage error.
@@ -298,12 +302,12 @@ UI does not live-sync; it refetches on window focus.
   `mesa serve --watch-inbox` triages the change requests for you, spawning the
   `inbox-triage` agent per pending item; off by default.
 - **Attachment** — an arbitrary file (screenshot, PDF, notes) hung off one
-  task. The bytes live *outside* the database, in mesa's own data directory,
+  task. The bytes live *outside* the database, in Naru's own data directory,
   with a 25 MiB per-file cap; deleting the task (or an ancestor of it) removes
   the rows and unlinks the files. `mesa attachment {add,list,show,fetch,delete}`;
   in the web UI a task's detail panel uploads and previews them, and the
   new-task form also takes a pasted clipboard image. See `docs/attachments.md`.
-- **Script** — a piece of shell *you* write and keep in mesa, together with an
+- **Script** — a piece of shell *you* write and keep in Naru, together with an
   explicitly declared argument list (`text | number | bool | choice`) that the
   web form is generated from. Arguments are declared, never parsed out of the
   body: `bash -c` receives the body verbatim and the values positionally *and*
@@ -397,25 +401,25 @@ start locations in the global Agents sidebar.
   finding log in the db (`mesa retro finding …`) keyed by fingerprint means a
   repeat bumps a count and adds evidence instead of filing twice. See
   `docs/retro.md`.
-- **Mesa live** (`mesa live`, the **Live** page in the web UI): a spoken
+- **Naru live** (`mesa live`, the **Live** page in the web UI): a spoken
   conversation with an agent. The microphone opens on its own once you join,
-  a dedicated Claude Code session does the work with the ordinary mesa CLI,
+  a dedicated Claude Code session does the work with the ordinary Naru CLI,
   and every reply is read back to you by `kokoro-rs` — the same synthesis the
   Inbox's play button uses. The agent runs the loop itself (`mesa live
   listen` → work → `mesa live say`, plus `mesa live navigate` to move your
   browser), pulling turns out of the database rather than being pushed at,
   because the CLI never talks to the server. One conversation at a time. What
   the agent is told to do is the config file's `live.prompt`, editable on the
-  **Settings** page: blank is the block mesa ships, and anything you write
+  **Settings** page: blank is the block Naru ships, and anything you write
   there replaces it. Listening prefers `auris`, an optional external
-  speech-to-text binary — install it and mesa hears your own vocabulary and
+  speech-to-text binary — install it and Naru hears your own vocabulary and
   real punctuation; without it, listening falls back to the browser's own
   recognizer where one exists, and to your own system dictation typed into
-  the box where neither does. Either way the decode stays local: mesa runs
+  the box where neither does. Either way the decode stays local: Naru runs
   no speech-to-text of its own, and nothing you say is kept once it becomes
   text. See `docs/live.md`, and `docs/listen.md` for the `auris` route's own
   contract.
-- **Configurable spawn commands**: the four places mesa starts an agent — the
+- **Configurable spawn commands**: the four places Naru starts an agent — the
   todo-watcher's dispatch, the inbox-watcher's triage, the sidebar's *add
   agent*, and a live conversation — each read a command template from
   `~/.mesa/config.json`
@@ -428,7 +432,7 @@ start locations in the global Agents sidebar.
   default names its agent `mesa-live`, the definition it runs as). A multi-line value opts that
   one command into a `bash -c` script instead, whose values arrive as `MESA_*`
   environment variables rather than being substituted into the body — either
-  way, no mesa data is ever spliced into a string a shell parses. The same file
+  way, no Naru data is ever spliced into a string a shell parses. The same file
   holds two other independent sections: `pricing` (per-model-family rates for
   the CC Dashboard's cost estimates, longest prefix wins) and `watchers`
   (the todo watcher's per-project concurrency and the retrospective's
@@ -440,7 +444,7 @@ start locations in the global Agents sidebar.
   <id>` or `POST /api/tasks/{id}/execute`, with the full task JSON on stdin and
   the project's `local_path` as cwd. The hook's exit code and output come back
   as data.
-- **Claude Code plugins**: mesa hosts plugins of its own under `plugins/`,
+- **Claude Code plugins**: Naru hosts plugins of its own under `plugins/`,
   listed by relative path in the marketplace manifest at
   `.claude-plugin/marketplace.json`. Add the repo as a marketplace once, then
   install from it:
@@ -465,8 +469,8 @@ start locations in the global Agents sidebar.
 - **CC Dashboard** (`mesa cc`, sidebar entry in the web UI): analytics over
   Claude Code's own session transcripts — tokens, estimated cost, and
   model/skill/agent/project/tool breakdowns — plus live subscription-limit
-  usage (`mesa cc usage`, the one outbound network call in mesa). Transcripts
-  are ingested into the mesa database (`mesa cc sync`, also run automatically
+  usage (`mesa cc usage`, the one outbound network call in Naru). Transcripts
+  are ingested into the Naru database (`mesa cc sync`, also run automatically
   before every dashboard read), so your usage history survives Claude Code
   cleaning up old transcripts.
 

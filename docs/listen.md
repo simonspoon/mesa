@@ -1,6 +1,6 @@
-# Mesa listen (the `auris` speech-to-text contract)
+# Naru listen (the `auris` speech-to-text contract)
 
-This is the mechanism doc for person → mesa's audio path: everything between
+This is the mechanism doc for person → Naru's audio path: everything between
 a page deciding it can hear someone and `POST /api/live/transcribe` handing
 back text. `docs/live.md` keeps the conversation-shaped story — why listening
 exists, what a turn is, the loop the agent runs — and links here for the
@@ -25,7 +25,7 @@ names it rather than leaving the person to guess from transcript quality
 
 `auris` wins whenever it can be reached, **even on a browser that also has a
 recognizer of its own** — the ordering is the whole point of mesa task 957.
-It hears mesa's own vocabulary correctly and punctuates like a person, where
+It hears Naru's own vocabulary correctly and punctuates like a person, where
 a browser's `SpeechRecognition` does neither (the correction pass mesa task
 922 built against exactly that recognizer's mishearings is documented in
 `docs/live.md`, and runs identically on whichever engine produced the text).
@@ -39,7 +39,7 @@ The page's one ask, at the moment it joins a conversation, of whether
 `auris` is worth trying at all (mesa task 957, `transcribe_available` in
 `src/api.rs`). Answers `{"available": !listen::models().is_empty()}`.
 
-An empty model list is [`listen::models`]'s **"mesa could not ask"**
+An empty model list is [`listen::models`]'s **"Naru could not ask"**
 signal — the binary missing, failing, or answering with something that
 isn't a list of names — never "auris says it has no models installed";
 there is no way to tell those apart from here, and the caller only needs to
@@ -64,7 +64,7 @@ loopback+Host+Origin check for `require_lan_page_access`, which any device
 already on the network passes by design. This route used to refuse
 structurally instead, on the reasoning that posting text a person already
 reviewed on their own screen is one thing and handing an unauthenticated LAN
-peer a way to make mesa's own machine decode whatever audio it recorded is
+peer a way to make Naru's own machine decode whatever audio it recorded is
 another. That reasoning did not survive contact with what `--lan` already
 is: the flag hands every device on the network full read/write on all data
 plus the Agents and Terminal tabs — arbitrary code execution on this
@@ -84,23 +84,23 @@ multipart, not a raw `audio/wav` body — which keeps this route inside the
 existing Content-Type gate with no carve-out (the same reasoning
 `create_attachment` states for attachments). Invalid or empty base64 is 422
 `validation`; a decoded body over `LIVE_AUDIO_MAX` (25 MB) is **413**, not
-422 — 422 says "I read your input and it is invalid," fitting a body mesa
+422 — 422 says "I read your input and it is invalid," fitting a body Naru
 actually parsed and measured, where 413 names a body too large to accept,
 refused at the boundary before it is read. Valid base64 that decodes to
-something that isn't actually a WAV is not mesa's to reject: it reaches
+something that isn't actually a WAV is not Naru's to reject: it reaches
 `auris` unexamined, the same way a bad file reaches any other decoder.
 
 Body size is layered twice. `TRANSCRIBE_BODY_LIMIT` (`src/api.rs`, ~34 MiB)
 is an axum `DefaultBodyLimit` on the wire — base64 costs 33% plus JSON
 framing over the raw 25 MB, and axum's own 2 MiB default would otherwise
 reject an at-cap recording with a bare non-JSON 413 that names no limit,
-before mesa's own `LIVE_AUDIO_MAX` check ever runs. The handler's own check
+before Naru's own `LIVE_AUDIO_MAX` check ever runs. The handler's own check
 is what produces the named, JSON-shaped 413 a caller can act on.
 
 Gated by the exact pair `speak_inbox`/`speak_live_turn` carry:
 `require_agent_access` (decoding a recording as the machine's owner is
 code-execution-adjacent the same way starting a synthesis is) plus
-`require_same_site_fetch`. Both gate calls run before mesa decodes base64 or
+`require_same_site_fetch`. Both gate calls run before Naru decodes base64 or
 spawns `auris` in program order, but axum runs every extractor to completion
 before the handler body executes at all — so by the time either gate runs,
 the whole request body is already buffered (up to `TRANSCRIBE_BODY_LIMIT`)
@@ -165,7 +165,7 @@ are written to `listen::transcribe`'s child's stdin — never to `live_turns`
 (which has no column for audio), never to disk, and never logged. The
 resulting text is not retained by this route either: it is returned to the
 caller, which is the existing held-recording path (`docs/live.md`, "Person →
-mesa"), the same "transcribed and dropped" shape the speak routes already
+Naru"), the same "transcribed and dropped" shape the speak routes already
 have on the way out, with the arrow reversed.
 
 ## Gate

@@ -1,7 +1,7 @@
 # Moving to a new computer (mesa task 1206)
 
 `mesa migrate` carries everything mesa-related from one machine to another in
-one archive: the mesa database, `~/.mesa/config.json`, and the parts of the
+one archive: the Naru database, `~/.mesa/config.json`, and the parts of the
 Claude Code home directory (`~/.claude`) a person built by hand — agents,
 hooks, skills, commands, the global `CLAUDE.md`, settings and the
 per-project memories. It is **CLI only**: there is no HTTP route, because it
@@ -107,7 +107,7 @@ The mappings are applied to:
    carries a literal hyphen — `/Users/sim-two` — encodes to `-Users-sim-two`,
    exactly what `/Users/sim/two` encodes to, so it reads as *under*
    `/Users/sim` and is renamed along with the home
-   (`-Users-new-two`). mesa cannot know which it was; nothing short of Claude
+   (`-Users-new-two`). Naru cannot know which it was; nothing short of Claude
    Code's own records could tell them apart, so this is documented rather
    than guessed at. Such a dir is rare (a path outside your home), and a
    rename it did not need is visible in import's `renamed` list.

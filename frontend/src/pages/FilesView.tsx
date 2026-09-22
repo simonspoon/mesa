@@ -321,7 +321,7 @@ function NoLocalPathPlaceholder({ projectId }: { projectId: number }) {
   return (
     <div className="files-placeholder muted">
       <p>
-        This project has no linked folder, so mesa cannot browse its files.
+        This project has no linked folder, so Naru cannot browse its files.
         Run <code>mesa project resolve</code> inside the repo, or{' '}
         <code>mesa project update {projectId} --path &lt;dir&gt;</code>, to
         link one.

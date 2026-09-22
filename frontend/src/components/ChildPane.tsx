@@ -90,7 +90,7 @@ export function ChildPane({
         </pre>
         <p className="agent-chat-hint">
           A Bash call in flight. Claude Code does not stream a shell's output into the transcript,
-          so mesa has none to show — only that it is still running.
+          so Naru has none to show — only that it is still running.
         </p>
       </Shell>
     )
@@ -100,7 +100,7 @@ export function ChildPane({
       <Shell meta={meta} empty>
         <p>This subagent's session is no longer listed.</p>
         <p className="agent-chat-hint">
-          A subagent's transcript is filed under its session, so mesa has nothing to read it by.
+          A subagent's transcript is filed under its session, so Naru has nothing to read it by.
         </p>
       </Shell>
     )

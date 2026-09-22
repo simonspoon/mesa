@@ -1,6 +1,6 @@
 # Scripts (user-authored shell, run from a generated form)
 
-A **script** is a piece of shell the user writes and keeps in mesa, together
+A **script** is a piece of shell the user writes and keeps in Naru, together
 with an explicitly declared list of arguments. Table `scripts` (migration index
 32): `project_id`, `name`, `description`, `body`, `args`, timestamps. The FK is
 **`ON DELETE SET NULL`** (as the inbox's is, deliberately not cascade): a
@@ -43,7 +43,7 @@ that outlives the connection that started it. Three shapes, one executor.
   because an update is the other way a bad record could get in. `list_scripts`
   orders by name (`COLLATE NOCASE`, `id` breaking ties) so the CLI, the API and
   the page can never disagree. `delete_script` returns the destroyed record —
-  the recoverable echo that stands in for the confirmation prompt mesa
+  the recoverable echo that stands in for the confirmation prompt Naru
   deliberately does not have. There is no history table.
 - **Execution lives in `src/core/scripts.rs`, not in `Store`** — running a
   process is not storage. Two functions: `validate_values` (pure; the CLI and
@@ -66,7 +66,7 @@ that outlives the connection that started it. Three shapes, one executor.
   every variable the script's arg list could ever produce, *then* sets only the
   ones this call resolved — copied from `agents.rs::spawn_script`. That sweep is
   what lets a body under `set -u` fail loudly instead of reading a stale value
-  inherited from mesa's own environment, and what makes
+  inherited from Naru's own environment, and what makes
   `${MESA_ARG_X-UNSET}` a meaningful test. (Positions cannot express absence
   without shifting every later `$n`, so an unsupplied argument still occupies
   its position as an empty string; the environment is where absence lives.)
@@ -150,7 +150,7 @@ that outlives the connection that started it. Three shapes, one executor.
     nothing yet), because two `serve`s on one db is a real configuration and a
     blanket flip would have one declare the other's live runs dead. The honest
     limit, which the note states: the script is in its own process group and
-    survives the server, mesa holds no handle across the restart and does not
+    survives the server, Naru holds no handle across the restart and does not
     pretend to. `failed` is true; `running` would not be.
   - Five routes, all on `require_agent_access` like the rest of this surface:
     `POST /api/scripts/{id}/run/detach` (201, the record, same 404/422/502
@@ -176,7 +176,7 @@ that outlives the connection that started it. Three shapes, one executor.
   path that is not a directory on this machine, is `validation` (422). An
   unbound script runs in `~/.mesa/workspace` (`config::workspace_dir()`,
   created on demand — Claude Code never persists folder trust for the home
-  directory, so mesa owns one folder instead).
+  directory, so Naru owns one folder instead).
 - CLI: `mesa script {create,list,show,get,update,delete,run}`. A script
   argument takes an **id or a name** everywhere, and every project argument
   resolves by id or name as usual. `create <NAME> <BODY>` takes both
@@ -216,7 +216,7 @@ that outlives the connection that started it. Three shapes, one executor.
 
   **All seven routes share one gate** (mesa task 1022, the reversal tasks 1004
   and 1021 already made for the library and Settings). Authoring a script is
-  *choosing a program mesa will execute* and running one is *triggering*
+  *choosing a program Naru will execute* and running one is *triggering*
   execution of something already stored — both are the agents' capability
   class, so both take `require_agent_access`. In **default** mode that is
   strictly stronger than the loopback-only check the three mutations used to

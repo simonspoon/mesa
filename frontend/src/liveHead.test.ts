@@ -36,9 +36,9 @@ describe('liveHeadTitle', () => {
 
   it('lets mesa speaking outrank the person, and paused outrank a stale draft', () => {
     expect(liveHeadTitle(input({ speaking: true, draft: 'over her' }))).toBe(
-      'mesa speaking',
+      'Naru speaking',
     )
-    expect(liveHeadTitle(input({ speaking: true, paused: true }))).toBe('mesa speaking')
+    expect(liveHeadTitle(input({ speaking: true, paused: true }))).toBe('Naru speaking')
     expect(liveHeadTitle(input({ paused: true, draft: 'left in the box' }))).toBe(
       'Paused',
     )

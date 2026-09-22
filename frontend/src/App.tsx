@@ -607,7 +607,7 @@ function App() {
             <polygon points="26,52 26,34 74,34 74,52" fill="#00e5ff" />
           </svg>
           <span className="brand-text">
-            mesa
+            Naru
             {mesaVersion && (
               <span className="brand-version">v{mesaVersion.version}</span>
             )}

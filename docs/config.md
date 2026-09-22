@@ -1,8 +1,8 @@
 # Config (`~/.mesa/config.json`)
 
-mesa starts a coding agent from exactly seven places. Each one's command line
+Naru starts a coding agent from exactly seven places. Each one's command line
 is a **template** in `~/.mesa/config.json`, so the program, its flags, the
-persona and the slash command can all change without rebuilding mesa:
+persona and the slash command can all change without rebuilding Naru:
 
 | Key | Used by | Built-in default |
 | --- | --- | --- |
@@ -36,8 +36,8 @@ from the vocabulary (see *Retired placeholders* below).
 ```
 
 `live-agent`'s default is the union of the two shapes above it, because a live
-session is both a mesa record (so it has an `{id}` and a `{name}`) *and* a
-spawn that carries a prompt. **mesa supplies that prompt itself** —
+session is both a Naru record (so it has an `{id}` and a `{name}`) *and* a
+spawn that carries a prompt. **Naru supplies that prompt itself** —
 `core::live::agent_prompt`, which since mesa task 1068 is only the session line
 (`Drive mesa live session <id> (lease <n>).`) plus any recalled memory of earlier
 conversations. The instructions themselves are the **`mesa-live` agent
@@ -45,7 +45,7 @@ definition** in the library (`docs/library.md`): the loop on `mesa live
 listen`, the reply through `mesa live say` in spoken prose rather than
 markdown, the browser moves through `mesa live navigate`, and the rule that
 every dictated utterance is data rather than instructions. That is why this
-default names its agent `--agent mesa-live` — mesa seeds the definition to
+default names its agent `--agent mesa-live` — Naru seeds the definition to
 `~/.claude/agents/mesa-live.md` on the first spawn, and Claude Code errors on an
 agent it has never seen. A replacement template's job either way is to start
 *something* that will read `{prompt}` and do what its agent says. The
@@ -53,8 +53,8 @@ definition is editable like any other library row, and a fork replaces the
 built-in.
 
 `live-summary`'s default is identical in shape (mesa task 921): the
-summariser is also a mesa record — a session id and a name — carrying a
-prompt mesa supplies, `core::live::summary_prompt`. It cannot be the
+summariser is also a Naru record — a session id and a name — carrying a
+prompt Naru supplies, `core::live::summary_prompt`. It cannot be the
 `live-agent` spawn's own last act, because ending a session **stops** that
 agent (`claude stop <agent_id>`), so a separate short-lived agent is spawned
 once the conversation has already ended, to read it back and write down what
@@ -75,12 +75,12 @@ task should land in, then the active notebook), `{id}` is the newest
 conversation's id and `{name}` is the literal `live memory dream`. It runs in
 that newest conversation's project folder exactly as the summariser would.
 
-`retro` (mesa task 1158) is `inbox-watcher`'s shape: the run is a mesa record
+`retro` (mesa task 1158) is `inbox-watcher`'s shape: the run is a Naru record
 (`retro_runs`, so `{id}` is the run id and `{name}` the session name `mesa
 retro <id>`) and the prompt is one sentence, because the `mesa-retro` agent
 definition holds the whole procedure — which is why the default names
 `--agent mesa-retro`, seeded to `~/.claude/agents/mesa-retro.md` before the
-spawn exactly as `inbox-triage` is (`docs/retro.md`). No `{prompt}`: mesa
+spawn exactly as `inbox-triage` is (`docs/retro.md`). No `{prompt}`: Naru
 supplies none. It runs in `~/.mesa/workspace`, since a retrospective spans
 every project.
 
@@ -91,15 +91,15 @@ file itself instead of a directory — both are accepted, since "a config in
 silent no-op.
 
 `~/.mesa` holds one other thing: **`workspace/`**, the working directory for
-every agent or shell mesa runs that is not bound to a project (the live agent
+every agent or shell Naru runs that is not bound to a project (the live agent
 and its summariser, an inbox-watcher dispatch, an unbound script, the global
 Terminal page, the `claude attach` client). It exists because Claude Code
 never persists folder trust for the home directory — trust accepted there is
 held for the current session only and is never written to disk, with no
-setting to change that — so anything interactive mesa started in `$HOME`
+setting to change that — so anything interactive Naru started in `$HOME`
 re-prompted forever. `config::workspace_dir()` creates it on demand and is
 deliberately **independent of `MESA_CONFIG_FILE`**: that override moves the
-config *file*, not mesa's home.
+config *file*, not Naru's home.
 
 ## One mode: every hook is a bash script
 
@@ -132,7 +132,7 @@ This *is* a shell, unlike the argv mode it replaces, and the untrusted-input
 line CLAUDE.md draws is held by **quoting, at the slot**: every `{placeholder}`
 is replaced by its value shell-quoted for the context it sits in, so what bash
 reads there is a string literal and never syntax. The invariant was never
-"mesa runs no shell" — it is **no value mesa holds ever reaches a shell
+"Naru runs no shell" — it is **no value Naru holds ever reaches a shell
 unquoted**.
 
 ## Placeholders
@@ -143,18 +143,18 @@ knows about:
 | Placeholder | Where | Value |
 | --- | --- | --- |
 | `{id}` | watchers, `retro`, `live-agent`, `live-summary`, `live-dream` | the task id / inbox item id / retro run id / live session id (for `live-dream`, the newest session's; empty on an install that has never held one) |
-| `{name}` | watchers, `retro`, `live-agent`, `live-summary`, `live-dream` | the session name mesa derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), `mesa retro <id>`, the live session's own name, or the literal `live memory dream` |
+| `{name}` | watchers, `retro`, `live-agent`, `live-summary`, `live-dream` | the session name Naru derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), `mesa retro <id>`, the live session's own name, or the literal `live memory dream` |
 | `{prompt}` | `agent-spawn`, `live-agent`, `live-summary`, `live-dream` | the POST body's `prompt` (`agent-spawn`; absent when omitted) / the live agent's, summariser's or dream pass's instruction block, always present |
 
 ### Quoted for where it sits
 
-What mesa splices in is the **value**, quoted so that bash reads it as exactly
+What Naru splices in is the **value**, quoted so that bash reads it as exactly
 that string (`config::substitute_script`, `Ctx::quoted`):
 
 | You write | Value `it's "a" $b` becomes | Why |
 | --- | --- | --- |
 | `--name {name}` | `--name 'it'\''s "a" $b'` | a word position is single-quoted — nothing is special inside `'…'` but `'` itself, spelled `'\''`; a value with spaces stays one word and a `*` never globs |
-| `-- "task {name}"` | `-- "task it's \"a\" \$b"` | already inside `"…"`, so the four characters that mean anything there — `\`, `"`, `$`, `` ` `` — are escaped in place; no quotes of mesa's own, so yours still close where they did |
+| `-- "task {name}"` | `-- "task it's \"a\" \$b"` | already inside `"…"`, so the four characters that mean anything there — `\`, `"`, `$`, `` ` `` — are escaped in place; no quotes of Naru's own, so yours still close where they did |
 | `cd $(dirname {name})` | `cd $(dirname 'it'\''s "a" $b')` | `$(…)` is a fresh word position, even inside `"…"` |
 | `cat <<EOF` … `{name}` … | `it's "a" \$b` | an unquoted heredoc body expands `$`, `` ` `` and `\` and nothing else; a `"` is literal text there |
 | `# see {name}` | `# see 'it'\''s "a" $b'` | never read; its newlines are folded so no second line can leave the comment |
@@ -178,10 +178,10 @@ name.
 > `let "…"`, `[[ x -gt y ]]` and an array subscript all *re-read* what they
 > are given, and an array subscript inside arithmetic is itself expanded — so a
 > value of `a[$(cmd)]` runs the command however it was quoted on the way in.
-> mesa **refuses** a placeholder in the two spellings it can see (`$((…))` and
+> Naru **refuses** a placeholder in the two spellings it can see (`$((…))` and
 > `((…))`, including inside a heredoc body and however deeply nested inside
 > them) at save time; `[[ … ]]`, `let "…"` and `${x[…]}` are not lexically
-> bracketed in any way mesa's deliberately coarse lexer should model, and are
+> bracketed in any way Naru's deliberately coarse lexer should model, and are
 > yours to avoid — POSIX `[ x -gt y ]` does **no** arithmetic evaluation and is
 > safe, `[[ x -gt y ]]` is not. `eval "{name}"` and `bash -c "{name}"` are the
 > same category and equally yours: they ask bash to parse the value as a
@@ -194,13 +194,13 @@ name.
 | `'…'` | a `'` in the value would end the run |
 | `$'…'` | ANSI-C quoting: the same, **and** a `\n` or `\x41` in the value would be *interpreted* |
 | `<<'EOF'` body | a quoted delimiter means nothing expands and nothing escapes, so there is no way to put a value there |
-| `` `…` `` | write `$(…)`, whose rules mesa does model |
+| `` `…` `` | write `$(…)`, whose rules Naru does model |
 | `cat <<{name}` | a delimiter is a label bash matches the closing line against, not text it expands |
 | `$((…))`, `((…))` | arithmetic re-parses what it is given — see the box above |
 
 The code that classifies a slot's context (`config::scan_script`) is a coarse
 lexer over bash's quoting forms, and since it now decides the bytes bash sees
-it is worth saying exactly what a wrong classification costs. Every form mesa
+it is worth saying exactly what a wrong classification costs. Every form Naru
 emits is inert in every context that expands anything, so a mis-lex costs a
 **mangled value** — a single-quoted string read where bash wanted double-quote
 escaping has stray quote characters in it; an escaped one read as a bare word
@@ -217,7 +217,7 @@ are what make the remaining lexer mistakes cheap.)
 - **A placeholder the hook isn't offered is an error**, named in the message
   (`{id}` in `agent-spawn`, `{prompt}` in a watcher, a typo like `{tsak}`) —
   raised at save time and again before anything runs. A brace holding only
-  name characters (`[A-Za-z0-9_-]`) is a placeholder as far as mesa is
+  name characters (`[A-Za-z0-9_-]`) is a placeholder as far as Naru is
   concerned, since bash has no use for `{tsak}` either. Every other brace —
   `cp a{,.bak}`, `{ …; }`, jq's `{id: 1}`, `{1..3}` — is bash text and passes
   through **literally**, and a `{` preceded by `$` is bash's own parameter
@@ -250,7 +250,7 @@ gone, and the defaults name `claude` and their agent literally.
   them. The Settings page never shows those tokens, so from the editor this
   path is unreachable.
 - **`MESA_CLAUDE_BIN` is a test seam, not a user lever.** It still names the
-  `claude` mesa uses for everything that is *not* a template — listing
+  `claude` Naru uses for everything that is *not* a template — listing
   sessions, `claude stop`, the attach bridge, the terminal pane — and on the
   spawn path it stands in for the leading `claude` of a **built-in default**
   only (single-quoted into the script, so a stub path with a space in it is
@@ -264,7 +264,7 @@ gone, and the defaults name `claude` and their agent literally.
 Until mesa task 1143 a multi-line value read its values as environment
 variables — `MESA_ID`, `MESA_NAME`, `MESA_PROMPT`, and `MESA_PROMPT_<NAME>` for
 a library prompt — and a `{placeholder}` in a script was rewritten to a
-reference to one (`"${MESA_NAME-}"`). mesa sets none of them now; a value is
+reference to one (`"${MESA_NAME-}"`). Naru sets none of them now; a value is
 quoted straight into the script.
 
 - **A saved hook that still reads them is migrated on read**, the same way as
@@ -341,7 +341,7 @@ so `{prompt: see below}` in a script body is the literal prose it looks like.
   nothing — over the script *with the placeholders already replaced by sample
   values*, so it sees the shape bash will really be handed; an unterminated
   quote is caught here. A machine with no `bash` on PATH skips the check
-  rather than failing the save; mesa can't prove a script is wrong there, and
+  rather than failing the save; Naru can't prove a script is wrong there, and
   such a machine can't run it either.
 
   Unlike the refusals above, this one is **save-time only** — the spawn path
@@ -364,18 +364,18 @@ so `{prompt: see below}` in a script body is the literal prose it looks like.
   seam, which stands in for a **default's** leading `claude` only (see *Retired
   placeholders*); a configured template runs exactly as written.
 
-## What a replacement command owes mesa
+## What a replacement command owes Naru
 
 Only its **exit code**. Nonzero is a failed spawn (the todo-watcher reverts the
 task to `todo`; the inbox-watcher drops the id from its
 in-memory dispatched set, so a later tick retries). The script runs with stdin
 closed and nothing set in its environment beyond what `mesa serve` inherited.
 
-Printing `backgrounded · <id>` is optional. mesa parses that line when it is
+Printing `backgrounded · <id>` is optional. Naru parses that line when it is
 there and `POST /api/projects/{id}/agents` returns the id; with no such line
 the response is still `201` with **`id: null`**, and clients must read that as
 "created, find it in the session list" — the Agents sidebar just can't
-pre-open an attach pane for it. Nothing in mesa treats a missing receipt as
+pre-open an attach pane for it. Nothing in Naru treats a missing receipt as
 failure.
 
 Two surfaces stay bound to `claude` regardless of these templates, because
@@ -436,7 +436,7 @@ Behind it, `GET /api/config` and `PUT /api/config` (`core::config::settings` /
   save would then write over the wreckage.
 - `PUT` takes `{"commands": {<action>: <template>}}` and touches **only** the
   keys present; other keys, and any other top-level section of the file, are
-  preserved verbatim (this file is meant to grow sections mesa doesn't know
+  preserved verbatim (this file is meant to grow sections Naru doesn't know
   about). It echoes the settings re-read from disk. A rejected template is
   **422 `validation`**; an unreadable/unwritable file is **502 `unavailable`**.
   The write is a temp-file rename, since the config is read on every spawn with
@@ -479,15 +479,15 @@ estimated $0.
 - Keys are model-family **prefixes**, matched against a transcript's model id
   with `starts_with` — the same rule the hardcoded table used, so a point
   release prices correctly with no edit. All four rates are USD per **1M
-  tokens** and all four are required; mesa never derives a cache rate from the
+  tokens** and all four are required; Naru never derives a cache rate from the
   input rate.
-- mesa ships defaults for `claude-fable`, `claude-mythos`, `claude-opus`,
+- Naru ships defaults for `claude-fable`, `claude-mythos`, `claude-opus`,
   `claude-sonnet` and `claude-haiku` (`config::DEFAULT_PRICES`). An **absent
   key uses the built-in**; the config only ever overlays.
 - **Longest matching prefix wins** over the merged table, so a variant can be
   priced beside its family. A model no prefix matches estimates **$0** — no
   cost rather than a wrong one.
-- A prefix mesa has never heard of is allowed. That is the point.
+- A prefix Naru has never heard of is allowed. That is the point.
 - Removing a key (`PUT` value `null`) restores the built-in for a shipped
   family and deletes a user-added prefix outright.
 - A malformed config is `unavailable`, never a silent fall back to the
@@ -499,7 +499,7 @@ all-or-nothing: a prefix must be non-empty after trimming, whitespace-free and
 the file byte-identical.
 
 `pricing` is a sibling of `commands` (and, below, `watchers`) over one
-document: saving one preserves the others (and any section mesa doesn't
+document: saving one preserves the others (and any section Naru doesn't
 know). Nothing is
 cached — the table is loaded **once per dashboard request** and a save applies
 to the next read, past sessions included, with no restart. Cost is derived on
@@ -507,7 +507,7 @@ every read, so there is no stored figure to migrate.
 
 In the Settings editor a row's four boxes show the built-in rate as their
 **placeholder**, so a box left blank on a part-filled row means "keep that
-rate": mesa fills the untouched boxes from the default before the PUT, which
+rate": Naru fills the untouched boxes from the default before the PUT, which
 sends all four numbers as the server requires (mesa task 1020). A blank box is
 only an error on a prefix the user added, which has no default to fall back on;
 a row whose boxes are *all* blank is still the reset, not four copies of the
@@ -602,7 +602,7 @@ todo-watcher's per-project concurrency limit (mesa task 777,
   in is not the distinction that matters.
 
 The sections are siblings over one document: saving `watchers` preserves
-`commands`, `pricing`, `speech`, `guard`, `keymap` and any section mesa doesn't
+`commands`, `pricing`, `speech`, `guard`, `keymap` and any section Naru doesn't
 know about, and vice versa.
 
 ## Speech
@@ -618,18 +618,18 @@ reads an item in (mesa task 822, `docs/inbox.md`).
 }
 ```
 
-- **Absent or blank ⇒ no `-v` at all.** mesa names no default
+- **Absent or blank ⇒ no `-v` at all.** Naru names no default
   voice of its own: with nothing configured the argv is byte-for-byte the one
   it ran before this key existed, and which voice that means is
   `kokoro-rs`'s business. That is why `ConfigSpeech` has no `voice_default`
   twin to `todo_concurrency_default` — there is no mesa-side default to
   report.
-- **The list of voices comes from the binary**, not from mesa:
+- **The list of voices comes from the binary**, not from Naru:
   `kokoro-rs --list-voices`, filtered to bounded identifiers and cached for
-  the life of the process (`core::speech::voices`). An **empty list means mesa
+  the life of the process (`core::speech::voices`). An **empty list means Naru
   could not ask** — no binary, or an answer that wasn't a list of names —
   never "there are no voices", so the editor falls back to a plain text box
-  and the save-time membership check is skipped. mesa never ships a voice list
+  and the save-time membership check is skipped. Naru never ships a voice list
   a model update could silently make wrong. The cache is per process, so
   installing the synthesiser (or a model that adds a voice) while `mesa serve`
   is already running needs a **Restart server** before the picker sees it —
@@ -656,13 +656,13 @@ reads an item in (mesa task 822, `docs/inbox.md`).
 
 - `GET /api/config/speech` → `ConfigSpeech`: `{voice, voices}`, `voice` being
   the override (`null` when unset) and `voices` what the installed binary
-  offers (`[]` when mesa couldn't ask — **not** an error, since the setting
+  offers (`[]` when Naru couldn't ask — **not** an error, since the setting
   must stay visible on a machine where the synthesiser isn't installed yet).
   Gated like the other config getters (`require_agent_access`); a malformed
   config is **502 `unavailable`**.
 - `PUT /api/config/speech`, body `{"voice": "<name>" | null}` → echoes the
   getter. `null` **and** blank both remove the key, restoring the binary's own
-  voice. A name that isn't a voice — or, when mesa has a list, isn't on it —
+  voice. A name that isn't a voice — or, when Naru has a list, isn't on it —
   is **422 `validation`**, writing nothing. Gated with
   `require_agent_access`, the same posture as every other config write (mesa
   task 1021).
@@ -675,7 +675,7 @@ has something to talk to, and so the gate can drive the validation.
   which is how a voice is heard *before* it is saved. Two things make it a
   preview rather than a second way to play the stored setting: the voice comes
   off the **query string**, and the config file is neither read nor written.
-  The spoken text is a mesa constant (`core::speech::SAMPLE`), so the voice is
+  The spoken text is a Naru constant (`core::speech::SAMPLE`), so the voice is
   the only caller-supplied value on the path — and it must pass the same shape
   rule (`422 validation` otherwise, before anything is spawned). A blank or
   absent voice adds no `-v`, so the dropdown's *default* entry is auditionable
@@ -706,13 +706,13 @@ someone edits it, and edited on `#/library` rather than in this file. This secti
 }
 ```
 
-**A `live.prompt` key left behind by an older mesa, or hand-edited into the
+**A `live.prompt` key left behind by an older Naru, or hand-edited into the
 file, is silently ignored** — never an error, and never read from — since
 `LiveSection` simply has no field for it any more. Everything the prompt used
 to be is unchanged in spirit, it has just moved: a configured prompt still
 **replaces** the built-in rather than extending it (forking a built-in starts
 from its text, the same "start from the built-in" idea the old editor offered
-as a button), mesa still appends only the session line —
+as a button), Naru still appends only the session line —
 `You are driving mesa live session <id>.` — and the text is still never
 parsed by a shell, quoted into the `live-agent` hook as one value
 ([Placeholders](#placeholders)). Rewriting it is how a live
@@ -737,7 +737,7 @@ conversation starting).
   unconfigured install waits exactly as long as it always did.
 - **A whole number of milliseconds, 250..=60000** (`MIN_LIVE_AUTO_SEND_MS` /
   `MAX_LIVE_AUTO_SEND_MS`) — sanity bounds, not policy: below the gap between
-  two spoken words mesa would post half a sentence, and a minute of silence is
+  two spoken words Naru would post half a sentence, and a minute of silence is
   a conversation that has stopped. Outside them, or the wrong shape (a string,
   a fraction), is **422 `validation`** writing nothing.
 - **A hand-edited value outside the bounds is not rejected on read.**
@@ -759,7 +759,7 @@ conversation starting).
 ### Routes
 
 - `GET /api/config/live` → `ConfigLive`: `{auto_send_ms, auto_send_ms_default}`
-  — the override (`null` when unset) beside the value mesa ships, sent by the
+  — the override (`null` when unset) beside the value Naru ships, sent by the
   server so the editor can show what blank means without a second copy of it
   in TypeScript. `prompt`/`default_prompt` are gone from this route entirely
   (mesa task 919) — not null, absent, since the prompt is a library item now
@@ -791,16 +791,16 @@ mirror of Speech, above.
 }
 ```
 
-- **Absent or blank ⇒ no `-m` at all.** mesa names no default model of its
+- **Absent or blank ⇒ no `-m` at all.** Naru names no default model of its
   own: with nothing configured the argv is byte-for-byte the one it ran
   before this key existed, and which model that means is `auris`'s business.
   There is deliberately **no `language` key** — `auris` has no `--language`
   flag, so one would drive no argv — and vocabulary is **not** a config key
   either: it is derived per request, not stored here.
-- **The list of models comes from the binary**, not from mesa:
+- **The list of models comes from the binary**, not from Naru:
   `auris --no-download --list-models`, filtered to bounded identifiers and
   cached for the life of the process (`core::listen::models`). An **empty
-  list means mesa could not ask** — no binary, or an answer that wasn't a
+  list means Naru could not ask** — no binary, or an answer that wasn't a
   list of names — never "there are no models", so the editor falls back to a
   plain text box and the save-time membership check is skipped. The cache is
   per process, so installing `auris` (or a model that adds one) while `mesa
@@ -828,13 +828,13 @@ mirror of Speech, above.
 
 - `GET /api/config/listen` → `ConfigListen`: `{model, models}`, `model` being
   the override (`null` when unset) and `models` what the installed binary
-  offers (`[]` when mesa couldn't ask — **not** an error, since the setting
+  offers (`[]` when Naru couldn't ask — **not** an error, since the setting
   must stay visible on a machine where `auris` isn't installed yet). Gated
   like the other config getters (`require_agent_access`); a malformed config
   is **502 `unavailable`**.
 - `PUT /api/config/listen`, body `{"model": "<name>" | null}` → echoes the
   getter. `null` **and** blank both remove the key, restoring the binary's own
-  model. A name that isn't a model — or, when mesa has a list, isn't on it —
+  model. A name that isn't a model — or, when Naru has a list, isn't on it —
   is **422 `validation`**, writing nothing. Gated with
   `require_agent_access`, the same posture as every other config write (mesa
   task 1021).
@@ -920,7 +920,7 @@ against, and what the watcher does about a session that crosses one (mesa tasks
 
 An eighth, independent section rebinds the web UI's **global** keyboard
 shortcuts (mesa task 1079, `docs/keyboard.md`) — and the only one edited from
-Settings that mesa's own Rust reads nothing from.
+Settings that Naru's own Rust reads nothing from.
 
 ```json
 {
@@ -939,7 +939,7 @@ Settings that mesa's own Rust reads nothing from.
   Cmd/Ctrl+S and a modal's Escape are deliberately **not** here — each belongs
   to one panel that is on screen and owns the keyboard while it is, which is a
   different thing from a binding the whole app answers to.
-- **An absent action ⇒ the chords mesa ships**, so defaults are never written:
+- **An absent action ⇒ the chords Naru ships**, so defaults are never written:
   only overrides live in the file, and `PUT null` removes an entry rather than
   storing the default back. The shipped table is
   `config::KEYMAP_ACTIONS` — `Mod+Shift+P`; `h`/`ArrowLeft`, `j`/`ArrowDown`,
@@ -951,17 +951,17 @@ Settings that mesa's own Rust reads nothing from.
   meta-**or**-ctrl: one name for both platforms, because a keymap saved on a
   Mac has to mean the same thing on the Linux box reading the same file. The
   key itself is whatever `KeyboardEvent.key` reports (`ArrowLeft`, `Enter`,
-  `/`, `a`) — mesa invents no key names, so what the editor records from a real
+  `/`, `a`) — Naru invents no key names, so what the editor records from a real
   keystroke is exactly what is stored.
 - **A collision between two actions is refused**, which is the one rule no
   other section has: a keymap is not a set of independent values but a
   partition of the keyboard, so an override is judged against the whole map the
   save would leave behind — including the actions the user never touched. The
   server refuses exactly what the editor refuses.
-- **Nothing in Rust reads this section.** The shortcuts are the page's; mesa's
+- **Nothing in Rust reads this section.** The shortcuts are the page's; Naru's
   job is to store them and to refuse what the editor refuses.
 - The read path is **forgiving** where the write path is strict, the
-  `todo-concurrency` clamp posture: a hand-edited entry mesa cannot use — a
+  `todo-concurrency` clamp posture: a hand-edited entry Naru cannot use — a
   non-list, an empty list, a malformed chord, an action it does not bind — is
   dropped, costing **that action** its override and nothing else. The page then
   falls back to that one action's shipped chords.
@@ -975,7 +975,7 @@ Settings that mesa's own Rust reads nothing from.
 
 - `GET /api/config/keymap` → `ConfigKeymap`: `{actions: [{action, value,
   default}]}` in the shipped order, where `value` is the override (`null` when
-  unset) and `default` is the chords mesa ships. Gated like the other config
+  unset) and `default` is the chords Naru ships. Gated like the other config
   getters (`require_agent_access`); a malformed config is **502
   `unavailable`**.
 - `PUT /api/config/keymap`, body a **flat map of action id to chords** —
@@ -1023,7 +1023,7 @@ binary never offered both 422 writing nothing, 502 on a malformed file, each
 of the other four savers preserving `speech` and vice versa, and both verbs
 refused to a request that isn't from this machine's own page. The **preview**
 route is `scripts/api-check.sh`'s, beside the speak route whose contract and
-gate it shares (5c): mesa's own sentence on stdin, the query's voice as one
+gate it shares (5c): Naru's own sentence on stdin, the query's voice as one
 argv after `-v`, no `-v` for a blank one, and an option-shaped name refused
 before anything is spawned. Its "reads no config" half is here instead, where a
 voice is actually configured: with `bm_george` saved, a preview of `af_bella`
@@ -1038,7 +1038,7 @@ would read back as nothing) and echoed, `null` removing the key, 0 / -1 / 2.5 /
 both rejected as an unknown live setting, 502 on a malformed file, each of the
 other savers preserving `live` and vice versa, both verbs refused to a request
 that isn't from this machine's own page, and the migration case: a
-`live.prompt` key left behind by an older mesa survives a `GET` unread and a
+`live.prompt` key left behind by an older Naru survives a `GET` unread and a
 `PUT` of `auto-send-ms` untouched. "A configured prompt reaches the spawn,
 replacing the built-in" moved with the prompt itself (mesa task 919) — it is
 now `scripts/library-check.sh`'s assertion, proved through a forked library
@@ -1053,14 +1053,14 @@ unknown body key ignored, and **all six** other sections surviving the guard
 section's save.
 
 For keymap it covers the round trip (`GET` reporting all seven actions with a
-`null` override beside the chords mesa ships, the spatial nav's letter-and-arrow
+`null` override beside the chords Naru ships, the spatial nav's letter-and-arrow
 pair included), a chord stored **canonicalized** and only the override stored,
 `PUT null` removing an entry, `commands`/`watchers`/`live`/an unknown section
 surviving a keymap write and vice versa, an action absent from the body left
 alone, a malformed chord / an unknown action (named in the message) / a chord
 the spatial nav already holds / two clashing actions in one body each 422
 writing nothing, both verbs refused to a request that isn't from this machine's
-own page, and the forgiving read: a hand-edited entry mesa cannot use dropped
+own page, and the forgiving read: a hand-edited entry Naru cannot use dropped
 beside a good one that survives.
 
 For pricing it also covers the round trip: `GET` showing the built-ins with

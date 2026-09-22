@@ -303,7 +303,7 @@ function bucketOf(a: AgentSession): Bucket {
 // a session finished the moment its turn ends) — the hint is what keeps that
 // disagreement from reading as a mesa bug (mesa task 802).
 const LIVE_WORK_HINT =
-  'mesa sees this session holding a running Bash call or subagent — it counts those ' +
+  'Naru sees this session holding a running Bash call or subagent — it counts those ' +
   'directly, so the todo watcher will not refill its slot yet. `claude` can report the ' +
   'session as finished at the same time; its `state` ends at the turn, not at the work.'
 

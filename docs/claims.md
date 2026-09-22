@@ -16,13 +16,13 @@ ordinary update destroys it.
 agent's Claude Code session id) is what makes liveness checkable out-of-band
 rather than inferred from a timestamp.
 
-mesa still enforces **no TTL and releases nothing automatically** — a claim
+Naru still enforces **no TTL and releases nothing automatically** — a claim
 expires when someone says so, never when a clock says so. What it does now do
-(mesa task 1017, a deliberate partial reversal of this doc's older "mesa
+(mesa task 1017, a deliberate partial reversal of this doc's older "Naru
 computes no staleness") is *derive* an age on read: precisely because
 `claimed_at` moves only on claim/renew, `now - claimed_at` is exactly "how long
 since anyone asserted they still hold this". That is a fact about the row that
-mesa can compute and nobody else can, so it is worth reporting; acting on it
+Naru can compute and nobody else can, so it is worth reporting; acting on it
 stays a decision, and `owner` remains the authoritative, out-of-band liveness
 check.
 
@@ -61,7 +61,7 @@ Two read-side surfaces, no writes, no new column and no new status.
   The cutoff is `Store::claim_cutoff(minutes)` — `SELECT datetime('now', '-N
   minutes')`, **SQLite's clock**, the one that stamped `claimed_at`, never a
   second time source in Rust — computed once per call, before the filter chain,
-  so the clock cannot move underneath a listing. Every mesa timestamp is
+  so the clock cannot move underneath a listing. Every Naru timestamp is
   fixed-width UTC text, so `claimed_at <= cutoff` is an ordinary string
   comparison.
 
@@ -98,7 +98,7 @@ out — so the badge is styled in the same amber as `status-in_progress`.
 
 `.badge.claim-badge` must keep `text-transform: none`: `.badge` uppercases, and
 an `owner` is a case-sensitive id the reader pastes into `claude attach
-<owner>`. Ages come from `frontend/src/time.ts`, which exists because every mesa
+<owner>`. Ages come from `frontend/src/time.ts`, which exists because every Naru
 timestamp is SQLite `datetime('now')` — UTC with no zone marker, which bare
 `new Date()` would read as local time.
 

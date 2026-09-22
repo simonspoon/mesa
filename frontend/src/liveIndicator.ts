@@ -97,10 +97,10 @@ export function headerIndicator(input: {
  * something is animating.
  */
 export function indicatorLabel(state: LiveIndicator): string {
-  if (state === 'speaking') return 'mesa is speaking'
-  if (state === 'paused') return 'mesa is paused'
-  if (state === 'hearing') return 'mesa is hearing you'
-  if (state === 'resting') return 'mesa is resting'
-  if (state === 'working') return 'mesa is working on it'
-  return 'mesa is listening'
+  if (state === 'speaking') return 'Naru is speaking'
+  if (state === 'paused') return 'Naru is paused'
+  if (state === 'hearing') return 'Naru is hearing you'
+  if (state === 'resting') return 'Naru is resting'
+  if (state === 'working') return 'Naru is working on it'
+  return 'Naru is listening'
 }

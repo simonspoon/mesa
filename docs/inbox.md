@@ -333,7 +333,7 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
     shape task 816 gave this route — so `<audio src>` there fired `error` and
     the row said "could not play this item" while every other part of the page
     worked. Verified against AVFoundation directly: the same bytes play from a
-    range-serving host and refuse to from mesa, and the patched
+    range-serving host and refuse to from Naru, and the patched
     `0x7FFF0000` sizes are **not** what it objects to (they play fine when the
     body is ranged).
     The fix is client-side, so the route's contract is untouched: on that
@@ -382,7 +382,7 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
   - A failed press shows **the reason**, not a fixed sentence: the fallback
     fetch reads the route's `{"error": {...}}` body, so a synthesiser that is
     missing says so, and the `--lan` Host refusal (below) tells the reader to
-    browse mesa by IP instead of failing silently. There is no second sentence
+    browse Naru by IP instead of failing silently. There is no second sentence
     to fall back to after that — a decoded play that fails has a real reason to
     give, unlike the element's reasonless `error`. That holds for the failures
     the *body* carries too, which land long after the request was answered: a
@@ -398,7 +398,7 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
     from the Settings page and read on every press (mesa task 822,
     `docs/config.md`). It reaches the binary as one `Command::arg` after `-v`,
     and it is a bounded identifier, so it can be neither an option nor shell
-    text. Unset — the shipped state — passes **no `-v` at all**: mesa names no
+    text. Unset — the shipped state — passes **no `-v` at all**: Naru names no
     default voice, the synthesiser's own applies, and the argv is exactly what
     it was before the setting existed.
   - The body reaches `kokoro-rs` on **stdin**, verbatim, markdown and all
@@ -407,7 +407,7 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
     `ARG_MAX` ceiling. Stripping markdown before speaking is a deliberate
     non-goal — the body is the record.
   - The audio **streams** (task 816). `kokoro-rs` renders sentence by sentence
-    and writes each one as it lands, so mesa forwards the bytes as they arrive
+    and writes each one as it lands, so Naru forwards the bytes as they arrive
     instead of collecting the render: playback starts a couple of seconds in
     rather than after the whole item. The response is therefore chunked with
     **no `Content-Length`**, and the blocking wait before the 200 is only "the
@@ -415,13 +415,13 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
     can still be a status code. A failure *after* that point ends the body
     early; the listener hears a truncated item, because the 200 is long gone.
     Before that point every failure is still a 503, including the two a
-    streaming reader can get wrong: mesa drains **stderr on its own thread** for
+    streaming reader can get wrong: Naru drains **stderr on its own thread** for
     the child's whole life (a binary that fills that pipe would otherwise block
     there and hang the request), and output that never becomes a WAV header —
     what a binary printing its error on stdout looks like — falls back to
     collect-then-check-the-exit-status rather than being served as `audio/wav`.
   - `kokoro-rs -o -` writes a *streaming* RIFF header with both lengths as
-    `0xFFFFFFFF`; mesa patches them (Chrome tolerates the placeholders, Safari
+    `0xFFFFFFFF`; Naru patches them (Chrome tolerates the placeholders, Safari
     often won't). The real length is unknowable while streaming, so what
     replaces them is the open-ended `0x7FFF0000` (RIFF gets it plus the header
     ahead of the audio) — both still positive 31-bit sizes, the property a
@@ -435,24 +435,24 @@ The audit that fixed this found 263 items, every one a `task-summary`, so
     load-bearing and not redundant: every Origin check in `api.rs` passes a
     request that carries **no** Origin, and a no-cors `<audio>`/`<img>`
     subresource never carries one — so without it any page on the internet
-    could point an `<img src>` at a loopback mesa and spend a core per hit.
+    could point an `<img src>` at a loopback Naru and spend a core per hit.
     `Sec-Fetch-Site` is the header that separates them (browsers always send
     it, scripts cannot forge it); absent means a non-browser client and is
     allowed. There is no timeout (matching hooks/agents/
-    scripts) and no kill path — bar the one case where mesa can no longer read
+    scripts) and no kill path — bar the one case where Naru can no longer read
     the child's output at all, which would otherwise leave a zombie: **stop**
     stops playback, while the in-flight synthesis finishes and its bytes are
-    discarded. Discarding means mesa keeps
+    discarded. Discarding means Naru keeps
     *reading* them: a listener that hangs up mid-stream would otherwise leave
     the synthesiser blocked on a full stdout pipe forever, so the reader drains
     to EOF and throws the audio away (`api-check.sh` asserts no wedged child
     survives a hang-up). A missing or failing binary is `unavailable` (503),
-    the code reserved for a dependency outside mesa. `MESA_KOKORO_BIN`
+    the code reserved for a dependency outside Naru. `MESA_KOKORO_BIN`
     overrides the binary — the seam `api-check.sh` drives this route through.
     One consequence worth knowing, because it looks like a bug from a phone:
     under `--lan` this gate pins the **Host** to `localhost` or an IP literal
     on the serve port, while the pages and the task routes around it do not —
-    so a device that reached mesa by a DNS or Bonjour name (`something.local`,
+    so a device that reached Naru by a DNS or Bonjour name (`something.local`,
     a tunnel domain) can browse the whole UI and gets a 403 on **play alone**.
     That is the DNS-rebinding defense working as designed; the answer is to
     browse by IP, which is what the refusal now says in the row.

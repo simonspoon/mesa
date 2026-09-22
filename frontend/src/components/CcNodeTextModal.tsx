@@ -132,7 +132,7 @@ function CcNodeTextPanel({
           <>
             <p className="muted">
               The transcript this came from is no longer on disk, so the full text can’t be read.
-              What mesa stored is below.
+              What Naru stored is below.
             </p>
             {/* Untrusted transcript text: a text child of a <pre>, never markup. */}
             <pre className="cc-nodetext-body">{preview ?? ''}</pre>

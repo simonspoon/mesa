@@ -1510,6 +1510,10 @@ EXAMPLES
         /// skip|replace an existing row at the same (kind, scope, project, name)
         #[arg(long, default_value = "skip")]
         on_conflict: String,
+        /// Report what the import would meet, item by item, and write
+        /// nothing. The per-item pick itself is the web flow.
+        #[arg(long, conflicts_with = "on_conflict")]
+        preview: bool,
     },
 }
 
@@ -6309,13 +6313,23 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
                 }
             }
         }
-        LibraryCmd::Import { path, on_conflict } => {
+        LibraryCmd::Import {
+            path,
+            on_conflict,
+            preview,
+        } => {
             let mut stdin_used = false;
             let text = resolve_field(None, Some(path), &mut stdin_used)?.unwrap_or_default();
             let bundle: LibraryBundle = serde_json::from_str(&text)
                 .map_err(|e| Error::Validation(format!("not a valid library bundle: {e}")))?;
-            let results = library::import(&mut store, &bundle, &on_conflict)?;
-            print_json(&results);
+            if preview {
+                print_json(&library::import_preview(&store, &bundle)?);
+            } else {
+                // No per-item resolve flag here on purpose: the pick is made
+                // against a diff, which is a thing to read rather than to type.
+                let results = library::import(&mut store, &bundle, &on_conflict, &[])?;
+                print_json(&results);
+            }
         }
     }
     Ok(())

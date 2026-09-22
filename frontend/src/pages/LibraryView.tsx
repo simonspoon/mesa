@@ -13,6 +13,7 @@ import {
   listLibraryVersions,
   listOrphanHooks,
   listProjects,
+  previewLibraryImport,
   registerLibraryHook,
   unregisterLibraryHook,
   updateLibraryItem,
@@ -21,6 +22,19 @@ import { CodeEditor } from '../components/CodeEditor'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { bundleFilename, parseBundle, summarizeImport } from '../libraryBundle'
 import { historyEntries } from '../libraryHistory'
+import {
+  IMPORT_CHOICES,
+  defaultImportChoice,
+  importDatesLabel,
+  importOrientation,
+  importResolutionsFor,
+  importRowKey,
+  importStatusExplains,
+  importStatusLabel,
+  isPickable,
+  summarizePreview,
+  type ImportChoice,
+} from '../libraryImport'
 import {
   displayRegistrations,
   enableError,
@@ -67,8 +81,13 @@ import {
   statusExplains,
   statusLabel,
   summarize,
+  type DiffOrientation,
 } from '../librarySync'
+import type { LibraryBundle } from '../types/LibraryBundle'
+import type { LibraryDiffLine } from '../types/LibraryDiffLine'
 import type { LibraryHookStatus } from '../types/LibraryHookStatus'
+import type { LibraryImportResult } from '../types/LibraryImportResult'
+import type { LibraryImportRow } from '../types/LibraryImportRow'
 import type { LibraryItem } from '../types/LibraryItem'
 import type { LibraryOrphanHook } from '../types/LibraryOrphanHook'
 import type { LibrarySyncResult } from '../types/LibrarySyncResult'
@@ -640,9 +659,121 @@ function LibraryHookPanel({
   )
 }
 
+/**
+ * The comparison half of a resolvable row: when the two sides last changed,
+ * the diff (or both whole bodies, one click away), and the picker. Shared by
+ * the Sync modal and the Import modal (mesa task 1292) — two surfaces asking
+ * the same question of two bodies, so they ask it with one component rather
+ * than a second implementation that drifts.
+ *
+ * `sideLabels` maps the wire's own two side names — a `LibraryDiffLine` is
+ * always `mesa-only`/`disk-only` whatever the pair actually is — onto the
+ * words this caller shows. Everything else is the caller's: the choices and
+ * their labels, the orientation, and the placeholder for a side with no body.
+ */
+function LibraryDiffPick({
+  groupName,
+  sideLabels,
+  mesaBody,
+  diskBody,
+  diff,
+  orientation,
+  dates,
+  choices,
+  choice,
+  onChoice,
+}: {
+  // A composite, never a path or an index: native HTML radio grouping is
+  // keyed by `name` alone, so two rows sharing one would silently uncheck
+  // each other's picks.
+  groupName: string
+  sideLabels: { mesa: string; disk: string }
+  mesaBody: string
+  diskBody: string
+  diff: LibraryDiffLine[] | null
+  orientation: DiffOrientation
+  dates: string | null
+  choices: readonly { value: string; label: string }[]
+  choice: string
+  onChoice: (choice: string) => void
+}) {
+  // The diff is the default view for a row that has one; the whole bodies
+  // stay one click away, since a diff hides the lines both sides agree on and
+  // sometimes the agreement is what needs reading.
+  const [showBodies, setShowBodies] = useState(false)
+  return (
+    <>
+      {dates !== null && <p className="library-sync-dates muted">{dates}</p>}
+      {diff !== null && (
+        <button
+          type="button"
+          className="library-sync-view-toggle"
+          onClick={() => setShowBodies((v) => !v)}
+        >
+          {showBodies ? 'show diff' : 'show both bodies'}
+        </button>
+      )}
+      {diff !== null && !showBodies ? (
+        <>
+          <p className="library-sync-direction muted">
+            {sideLabels[orientation.from]} → {sideLabels[orientation.to]}
+            {' · '}
+            <span className="library-diff-removed">-</span> only in{' '}
+            {sideLabels[orientation.from]}
+            {' · '}
+            <span className="library-diff-added">+</span> only in {sideLabels[orientation.to]}
+          </p>
+          <pre className="library-sync-difflines">
+            {diff.map((line, i) => (
+              <div key={i} className={diffLineClass(line, orientation)}>
+                <span className="library-diff-mark">{diffMark(line, orientation)}</span>
+                {line.text}
+              </div>
+            ))}
+          </pre>
+        </>
+      ) : (
+        <div className="library-sync-diff">
+          <div className="library-sync-side">
+            <h4>{sideLabels.mesa}</h4>
+            <pre>{mesaBody}</pre>
+          </div>
+          <div className="library-sync-side">
+            <h4>{sideLabels.disk}</h4>
+            <pre>{diskBody}</pre>
+          </div>
+        </div>
+      )}
+      {choices.length > 0 && (
+        <div className="library-sync-choice">
+          {choices.map((c) => (
+            <label key={c.value}>
+              <input
+                type="radio"
+                name={groupName}
+                checked={choice === c.value}
+                onChange={() => onChoice(c.value)}
+              />
+              {c.label}
+            </label>
+          ))}
+        </div>
+      )}
+    </>
+  )
+}
+
+/** The Sync modal's three choices, in the order it has always offered them.
+ * The label *is* the wire word here — `mesa`/`disk`/`skip` are what the
+ * modal has always shown. */
+const SYNC_CHOICES = [
+  { value: 'mesa', label: 'mesa' },
+  { value: 'disk', label: 'disk' },
+  { value: 'skip', label: 'skip' },
+] as const
+
 /** One resolvable row inside the Sync modal: the status badge, an explainer
- * sentence, when the two sides last changed, the diff (or the whole bodies,
- * for a one-sided row), and the mesa/disk/skip picker. */
+ * sentence, and the shared comparison half below it. */
 function LibrarySyncRowView({
   rowKey: key,
   row,
@@ -658,16 +789,6 @@ function LibrarySyncRowView({
   choice: 'mesa' | 'disk' | 'skip'
   onChoose: (choice: 'mesa' | 'disk' | 'skip') => void
 }) {
-  // The diff is the default view for a row that has one; the whole bodies
-  // stay one click away, since a diff hides the lines both sides agree on and
-  // sometimes the agreement is what needs reading.
-  const [showBodies, setShowBodies] = useState(false)
-  const dates = changeDatesLabel(row)
-  const diff = hasDiff(row) ? row.diff : null
-  // Read from the side the pick overwrites to the pick itself, or older →
-  // newer while nothing is picked (mesa task 1151) — recomputed from `choice`
-  // on every render, so a radio change turns the diff around at once.
-  const orientation = diffOrientation(row, choice)
   return (
     <li className="library-sync-row">
       <div className="library-sync-row-head">
@@ -677,59 +798,22 @@ function LibrarySyncRowView({
         </span>
       </div>
       <p className="muted">{statusExplains(row.status)}</p>
-      {dates !== null && <p className="library-sync-dates muted">{dates}</p>}
-      {diff !== null && (
-        <button
-          type="button"
-          className="library-sync-view-toggle"
-          onClick={() => setShowBodies((v) => !v)}
-        >
-          {showBodies ? 'show diff' : 'show both bodies'}
-        </button>
-      )}
-      {diff !== null && !showBodies ? (
-        <>
-          <p className="library-sync-direction muted">
-            {orientation.from} → {orientation.to}
-            {' · '}
-            <span className="library-diff-removed">-</span> only in {orientation.from}
-            {' · '}
-            <span className="library-diff-added">+</span> only in {orientation.to}
-          </p>
-          <pre className="library-sync-difflines">
-            {diff.map((line, i) => (
-              <div key={i} className={diffLineClass(line, orientation)}>
-                <span className="library-diff-mark">{diffMark(line, orientation)}</span>
-                {line.text}
-              </div>
-            ))}
-          </pre>
-        </>
-      ) : (
-        <div className="library-sync-diff">
-          <div className="library-sync-side">
-            <h4>mesa</h4>
-            <pre>{row.mesa_body ?? '(not in mesa)'}</pre>
-          </div>
-          <div className="library-sync-side">
-            <h4>disk</h4>
-            <pre>{row.disk_body ?? '(no file)'}</pre>
-          </div>
-        </div>
-      )}
-      <div className="library-sync-choice">
-        {(['mesa', 'disk', 'skip'] as const).map((c) => (
-          <label key={c}>
-            <input
-              type="radio"
-              name={`sync-${key}`}
-              checked={choice === c}
-              onChange={() => onChoose(c)}
-            />
-            {c}
-          </label>
-        ))}
-      </div>
+      <LibraryDiffPick
+        groupName={`sync-${key}`}
+        sideLabels={{ mesa: 'mesa', disk: 'disk' }}
+        mesaBody={row.mesa_body ?? '(not in mesa)'}
+        diskBody={row.disk_body ?? '(no file)'}
+        diff={hasDiff(row) ? row.diff : null}
+        // Read from the side the pick overwrites to the pick itself, or older
+        // → newer while nothing is picked (mesa task 1151) — recomputed from
+        // `choice` on every render, so a radio change turns the diff around
+        // at once.
+        orientation={diffOrientation(row, choice)}
+        dates={changeDatesLabel(row)}
+        choices={SYNC_CHOICES}
+        choice={choice}
+        onChoice={(c) => onChoose(c as 'mesa' | 'disk' | 'skip')}
+      />
     </li>
   )
 }
@@ -850,6 +934,178 @@ function LibrarySyncModal({
   )
 }
 
+/** One row inside the Import modal: the item's name, its preview status, an
+ * explainer, and — for a real conflict only — the shared comparison half with
+ * the keep-local/take-imported picker. */
+function LibraryImportRowView({
+  rowKey: key,
+  row,
+  exportedAt,
+  choice,
+  onChoose,
+}: {
+  rowKey: string
+  row: LibraryImportRow
+  exportedAt: string
+  choice: ImportChoice
+  onChoose: (choice: ImportChoice) => void
+}) {
+  const pickable = isPickable(row)
+  return (
+    <li className="library-sync-row">
+      <div className="library-sync-row-head">
+        <span className="library-sync-path">{row.name}</span>
+        <span className={`library-sync-status library-sync-status-${row.status}`}>
+          {importStatusLabel(row.status)}
+        </span>
+      </div>
+      {row.status === 'unresolvable' ? (
+        // Nothing here to compare against and nothing to pick: the item never
+        // resolved to a row, and importing it would fail the same way. The
+        // status says that; `error` says why, so it is what gets rendered.
+        <p className="error">{row.error}</p>
+      ) : (
+        <>
+          <p className="muted">{importStatusExplains(row.status)}</p>
+          <LibraryDiffPick
+            groupName={`import-${key}`}
+            sideLabels={{ mesa: 'local', disk: 'imported' }}
+            mesaBody={row.local_body ?? '(not in your library)'}
+            diskBody={row.bundle_body}
+            diff={row.diff !== null && row.diff.length > 0 ? row.diff : null}
+            // Read toward the pick, the rule the sync modal follows.
+            orientation={importOrientation(choice)}
+            dates={importDatesLabel(row, exportedAt)}
+            choices={pickable ? IMPORT_CHOICES : []}
+            choice={choice}
+            onChoice={(c) => onChoose(c as ImportChoice)}
+          />
+        </>
+      )}
+    </li>
+  )
+}
+
+/** The Import modal (mesa task 1292): the server's preview of what this
+ * bundle would meet here, and a per-item pick for every real conflict. No
+ * automatic merging, exactly as a sync does not merge — the modal shows both
+ * bodies and the user picks a side. A row nobody touches keeps the local
+ * body, which is what the batch-wide `on_conflict: skip` default this
+ * replaced always did. */
+function LibraryImportModal({
+  bundle,
+  rows,
+  onClose,
+  onImported,
+}: {
+  bundle: LibraryBundle
+  rows: LibraryImportRow[]
+  onClose: () => void
+  onImported: () => void
+}) {
+  const [choices, setChoices] = useState<Record<string, ImportChoice>>({})
+  const [importing, setImporting] = useState(false)
+  const [results, setResults] = useState<LibraryImportResult[] | null>(null)
+  const [importError, setImportError] = useState<string | null>(null)
+
+  const conflicts = rows.filter(isPickable)
+
+  function apply() {
+    setImporting(true)
+    setImportError(null)
+    // `skip` is the fallback for an item no resolution names — every
+    // conflicting row sends one, so this only ever governs a row the server
+    // resolved differently from the preview (a row created since it was read).
+    importLibrary(bundle, 'skip', importResolutionsFor(rows, choices))
+      .then((res) => {
+        setImporting(false)
+        setResults(res)
+        onImported()
+      })
+      .catch((err: unknown) => {
+        setImporting(false)
+        setImportError(err instanceof Error ? err.message : String(err))
+      })
+  }
+
+  /** Every conflicting row at once — the two ends the old batch-wide
+   * `on_conflict` select offered, kept as a starting point rather than as the
+   * only answer. */
+  function chooseAll(choice: ImportChoice) {
+    const next: Record<string, ImportChoice> = {}
+    rows.forEach((row, i) => {
+      if (isPickable(row)) next[importRowKey(row, i)] = choice
+    })
+    setChoices(next)
+  }
+
+  return (
+    <div className="create-task-backdrop" onClick={onClose}>
+      <div
+        className="create-task-modal library-sync-modal"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="panel-head">
+          <h2>Import library</h2>
+          <button type="button" onClick={onClose}>
+            close
+          </button>
+        </div>
+
+        <p className="muted">{summarizePreview(rows)}</p>
+
+        {conflicts.length > 0 && results === null && (
+          <div className="library-sync-choice">
+            <button type="button" onClick={() => chooseAll('skip')}>
+              keep all local
+            </button>
+            <button type="button" onClick={() => chooseAll('replace')}>
+              take all imported
+            </button>
+          </div>
+        )}
+
+        <ul className="library-sync-list">
+          {rows.map((row, i) => (
+            <LibraryImportRowView
+              key={importRowKey(row, i)}
+              rowKey={importRowKey(row, i)}
+              row={row}
+              exportedAt={bundle.exported_at}
+              choice={choices[importRowKey(row, i)] ?? defaultImportChoice()}
+              onChoose={(choice) =>
+                setChoices({ ...choices, [importRowKey(row, i)]: choice })
+              }
+            />
+          ))}
+        </ul>
+
+        {results === null && (
+          <div className="inline-edit-actions">
+            <button type="button" disabled={importing} onClick={apply}>
+              {importing ? 'importing…' : 'import'}
+            </button>
+          </div>
+        )}
+        {importError !== null && <span className="error">{importError}</span>}
+        {results !== null && (
+          <>
+            <p className="muted">{summarizeImport(results)}</p>
+            <ul className="library-sync-results">
+              {results.map((r, i) => (
+                <li key={`${r.name}-${i}`} className={r.error !== null ? 'error' : ''}>
+                  {r.name}: {r.status}
+                  {r.error !== null && ` — ${r.error}`}
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
 /**
  * The Library page: agents, skills, hooks, prompts and CLAUDE.md files,
  * stored in mesa and synced against `.claude` file by file (mesa task 919).
@@ -926,10 +1182,15 @@ export function LibraryView() {
   // page-level project picker — `listLibrary()` above already reads only
   // user-scope rows plus built-ins), so export follows suit and never sends
   // `?project=`.
-  const [onConflict, setOnConflict] = useState<'skip' | 'replace'>('skip')
+  // Import is a preview then a per-item pick (mesa task 1292), not a
+  // batch-wide policy: the chosen file is parsed here, previewed by the
+  // server — whose matching rule is the one the apply will actually use —
+  // and handed to the modal. `null` = no import in flight.
   const [importing, setImporting] = useState(false)
   const [bundleError, setBundleError] = useState<string | null>(null)
-  const [importSummary, setImportSummary] = useState<string | null>(null)
+  const [preview, setPreview] = useState<
+    { bundle: LibraryBundle; rows: LibraryImportRow[] } | null
+  >(null)
   const importInputRef = useRef<HTMLInputElement>(null)
 
   function handleExport() {
@@ -953,20 +1214,20 @@ export function LibraryView() {
     e.target.value = ''
     if (file === null) return
     setBundleError(null)
-    setImportSummary(null)
     setImporting(true)
     file.text().then((text) => {
+      // Client-side shape validation first: a file that is not a bundle at
+      // all is caught here rather than travelling to the server to be refused.
       const parsed = parseBundle(text)
       if ('error' in parsed) {
         setImporting(false)
         setBundleError(parsed.error)
         return
       }
-      importLibrary(parsed.bundle, onConflict).then(
-        (results) => {
+      previewLibraryImport(parsed.bundle).then(
+        (rows) => {
           setImporting(false)
-          setImportSummary(summarizeImport(results))
-          refetch()
+          setPreview({ bundle: parsed.bundle, rows })
         },
         (err: unknown) => {
           setImporting(false)
@@ -1018,19 +1279,12 @@ export function LibraryView() {
         <button type="button" onClick={handleExport}>
           export
         </button>
-        <select
-          value={onConflict}
-          onChange={(e) => setOnConflict(e.target.value as 'skip' | 'replace')}
-        >
-          <option value="skip">on conflict: skip</option>
-          <option value="replace">on conflict: replace</option>
-        </select>
         <button
           type="button"
           disabled={importing}
           onClick={() => importInputRef.current?.click()}
         >
-          {importing ? 'importing…' : 'import'}
+          {importing ? 'reading…' : 'import'}
         </button>
         <input
           ref={importInputRef}
@@ -1042,7 +1296,15 @@ export function LibraryView() {
       </div>
 
       {bundleError !== null && <p className="error">{bundleError}</p>}
-      {importSummary !== null && <p className="muted">{importSummary}</p>}
+
+      {preview !== null && (
+        <LibraryImportModal
+          bundle={preview.bundle}
+          rows={preview.rows}
+          onClose={() => setPreview(null)}
+          onImported={refetch}
+        />
+      )}
 
       {editing === 'new' && (
         <LibraryForm

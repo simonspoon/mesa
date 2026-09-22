@@ -9,6 +9,8 @@
 import { unregisterHookQuery } from './libraryHooks'
 import { finishNdjson, parseEvent, splitNdjson } from './scriptRun'
 
+import type { ImportResolution } from './libraryImport'
+
 import type { AgentSession } from './types/AgentSession'
 import type { AgentSpawned } from './types/AgentSpawned'
 import type { AnchorSide } from './types/AnchorSide'
@@ -51,6 +53,7 @@ import type { LibraryBundle } from './types/LibraryBundle'
 import type { LibraryHookStatus } from './types/LibraryHookStatus'
 import type { LibraryOrphanHook } from './types/LibraryOrphanHook'
 import type { LibraryImportResult } from './types/LibraryImportResult'
+import type { LibraryImportRow } from './types/LibraryImportRow'
 import type { LibraryItem } from './types/LibraryItem'
 import type { LibraryKind } from './types/LibraryKind'
 import type { LibraryScope } from './types/LibraryScope'
@@ -1773,13 +1776,27 @@ export function exportLibrary(): Promise<LibraryBundle> {
   return request('/api/library/export')
 }
 
+/** What importing this bundle would meet here, item by item (mesa task
+ * 1292) — computed server-side because the rule matching an item to an
+ * existing row is import's own, and a preview that matched differently would
+ * preview a different import. Writes nothing. */
+export function previewLibraryImport(bundle: LibraryBundle): Promise<LibraryImportRow[]> {
+  return request('/api/library/import/preview', jsonInit('POST', { bundle }))
+}
+
 /** Imports a bundle. Per-item, not all-or-nothing — a failing item is
- * reported in its own result and the rest still apply. */
+ * reported in its own result and the rest still apply. `resolutions` decides
+ * one item each, by identity; an item none of them names falls back to
+ * `onConflict`. */
 export function importLibrary(
   bundle: LibraryBundle,
   onConflict: 'skip' | 'replace',
+  resolutions: ImportResolution[] = [],
 ): Promise<LibraryImportResult[]> {
-  return request('/api/library/import', jsonInit('POST', { bundle, on_conflict: onConflict }))
+  return request(
+    '/api/library/import',
+    jsonInit('POST', { bundle, on_conflict: onConflict, resolutions }),
+  )
 }
 
 /** Where one `hook` item stands in its scope's `.claude/settings.json`, and

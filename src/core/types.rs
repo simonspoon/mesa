@@ -2485,6 +2485,86 @@ pub struct LibraryBundle {
     pub items: Vec<LibraryBundleItem>,
 }
 
+/// How one bundle item compares to what this instance already holds —
+/// [`core::library::import_preview`]'s verdict, and the only four shapes an
+/// import can meet. Deliberately *not* [`LibrarySyncStatus`]'s seven: a
+/// bundle carries no sync baseline (it is a fact about the exporting
+/// machine's disk alone), so there is no third string to classify against.
+/// Two bodies and a choice is the whole of it — plus the one case where
+/// there are not even two bodies, because the item could not be matched at
+/// all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub enum LibraryImportStatus {
+    /// Nothing here claims this item's identity — it would be created.
+    New,
+    /// A row already holds it, byte-for-byte. Nothing to decide.
+    Identical,
+    /// A row already holds it with a different body — the one real
+    /// conflict; the user picks a side, exactly as a sync does.
+    Conflict,
+    /// The item could not be matched against anything, and importing it
+    /// would fail the same way (an unknown project name, a scope/project
+    /// pairing the bundle got wrong). Its own status rather than `New`,
+    /// because the JSON *is* the interface: a caller counting `new` rows to
+    /// learn what an import would create must not silently be handed an item
+    /// that is going to fail. The variant says *that* it cannot resolve;
+    /// [`LibraryImportRow::error`] says why.
+    Unresolvable,
+}
+
+impl LibraryImportStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LibraryImportStatus::New => "new",
+            LibraryImportStatus::Identical => "identical",
+            LibraryImportStatus::Conflict => "conflict",
+            LibraryImportStatus::Unresolvable => "unresolvable",
+        }
+    }
+}
+
+/// One row of an import preview — one bundle item, against the row this
+/// instance would actually resolve it to. Computed server-side rather than
+/// guessed at in the browser because the matching rule is import's own
+/// (`(kind, scope, project, name)`, then the `builtin_id`'s existing fork),
+/// and a preview that matched differently would be a preview of something
+/// else. Writes nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LibraryImportRow {
+    pub name: String,
+    pub kind: LibraryKind,
+    pub scope: LibraryScope,
+    /// The project's NAME, as the bundle item carries it.
+    pub project: Option<String>,
+    pub status: LibraryImportStatus,
+    /// The db id of the row this item resolved to, null when none did.
+    #[ts(type = "number | null")]
+    pub item_id: Option<i64>,
+    /// The existing row's body — null when nothing was resolved.
+    pub local_body: Option<String>,
+    pub bundle_body: String,
+    /// When the local row last changed — the newest
+    /// `library_versions.created_at` when it has any history, else its
+    /// `updated_at`, exactly as [`LibrarySyncRow::mesa_updated_at`] is read.
+    /// The imported side's own date is the bundle's `exported_at`, which is
+    /// bundle-level and therefore not repeated on every row.
+    pub local_updated_at: Option<String>,
+    /// The line-level local-vs-bundle diff, `Some` only for `conflict` —
+    /// [`LibrarySyncRow::diff`]'s own rule, both sides existing and
+    /// differing. The diff's "mesa" side is the local row, its "disk" side
+    /// the bundle.
+    pub diff: Option<Vec<LibraryDiffLine>>,
+    /// Why this item could not even be matched (an unknown project name, a
+    /// scope/project pairing the bundle got wrong) — the same failure
+    /// `import` would report as `status: "failed"`. Non-null for exactly the
+    /// `unresolvable` status, which is the one that says *that* it cannot
+    /// resolve; this says why.
+    pub error: Option<String>,
+}
+
 /// The outcome of importing one bundle item. Import is per-item, not
 /// all-or-nothing — a failing item is reported here and the rest still
 /// apply. (Deliberately the same posture as `LibrarySyncResult`.)

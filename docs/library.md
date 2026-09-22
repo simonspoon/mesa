@@ -759,16 +759,81 @@ an unknown name fails that one item rather than the whole batch.
 exception.** An unknown `version` refuses the entire bundle up front
 (`validation`) — the one all-or-nothing check, because there is no format to
 interpret an item against. Past that, each item resolves independently
-against any existing row at its `(kind, scope, project, name)`: none existing
-creates it; one existing is a **conflict**, decided by `on_conflict` (`skip`
-by default, `replace` as the opt-in) — `skip` leaves the existing row
-untouched, `replace` overwrites its body only, never its name and never the
-sync baseline. The default is `skip` because import is something a person
-runs deliberately, often to *pull in* items from elsewhere, and a body they
+against any existing row at its `(kind, scope, project, name)` — and, failing
+that, against the existing fork of its `builtin_id`. None existing creates
+it; one existing is a **conflict**, and the conflict is *shown and picked*,
+not decided by a batch-wide policy (mesa task 1292).
+
+**A conflict is previewed, then resolved per item.** `POST
+/api/library/import/preview` (`core::library::import_preview`, `mesa library
+import <path> --preview`) answers one `LibraryImportRow` per bundle item in
+one of **four** statuses: `new` (nothing here claims it), `identical` (a row
+holds it byte for byte), `conflict` (a row holds it with a different body) or
+`unresolvable` (the item could not be matched at all — an unknown project
+name, a scope/project pairing the bundle got wrong — and importing it would
+fail the same way). The row carries both bodies, when the local side last
+changed, and — for a `conflict` alone, `LibrarySyncRow`'s own rule — the
+line-level `diff` between them, computed by the same `diff_lines` a sync
+row's is. `unresolvable` is its own status rather than a `new` row wearing an
+`error`, because the JSON *is* the interface on this surface: a caller
+counting `new` rows to learn what an import would create must never be handed
+an item that is going to fail. The variant says *that* it cannot resolve;
+`error` still says why. It **writes nothing**; it is the read a person
+makes before choosing. It is a *server-side* preview on purpose: the rule
+matching a bundle item to an existing row is import's own (that `builtin_id`
+fork fallback is not something a browser could guess), so
+`resolve_existing` is factored out and both the preview and the apply go
+through it — one matching rule, or the preview would be a preview of a
+different import.
+
+The apply then takes a `resolutions` array beside `on_conflict`: each entry
+names one item by its **identity** — `(name, kind, scope, project)`, never
+its index in the bundle, which would silently resolve the wrong row the
+moment a caller reordered what it previewed — and carries the same two words,
+`skip` (keep the existing row) or `replace` (take the imported body,
+overwriting its body only, never its name and never the sync baseline). An
+item no resolution names falls back to the batch-wide `on_conflict`, so a
+caller sending none behaves byte-identically to how import always has. The
+web page sends one resolution per conflicting row and renders the whole
+thing through the **same diff-and-pick component the sync modal uses**
+(`LibraryDiffPick` in `LibraryView.tsx`, labelled `local`/`imported` here and
+`mesa`/`disk` there) — the surfaces ask the same question of two bodies, so
+they ask it once.
+
+**The preview is a snapshot, and the apply re-resolves — deliberately.**
+Unlike `sync_apply`, which takes its `sync_status` scan inside the same call
+it applies against, a preview and its import are two separate HTTP calls, and
+nothing is held between them: no lock, no body hash, no precondition. Every
+item is matched again by `resolve_existing` at apply time, so a `replace`
+resolves against the local body **as it is then**, not as it was previewed —
+if a concurrent CLI write or another browser tab changed that row in
+between, the body overwritten is one the person never saw in the diff. That
+is accepted rather than fixed: mesa is a single-user local tool, the exposure
+is no worse than the batch-wide `on_conflict: replace` this replaced (which
+overwrote without showing anything at all), and a subtly wrong optimistic
+concurrency check would cost more than the race does. The same goes for a row
+*created* between the two calls, which previews as `new` and imports as a
+conflict decided by the fallback `on_conflict` — `skip`, so it lands on the
+harmless side.
+
+`on_conflict` still defaults to `skip`, and so does every conflicting row's
+pre-selected pick, for the same reason: import is something a person runs
+deliberately, often to *pull in* items from elsewhere, and a body they
 already have replaced out from under them with no warning is the more
-dangerous default; `replace` exists for the deliberate re-import case, and
-is opt-in per call. Any other `Store` failure for one item (the name rule,
-the body cap) fails only that item; the rest of the batch still applies.
+dangerous default. Taking the imported side is opt-in, now per item rather
+than per call.
+
+Every failure stays per item, `sync_apply`'s posture: a bad project name or
+any other `Store` rejection (the name rule, the body cap) fails only that
+item; an unrecognised choice fails only that item, and an item that would
+fail to resolve at all previews as `unresolvable` with its `error` set rather
+than as a plain `new` row, so the page shows it as unresolvable instead of
+offering a choice nobody could apply; a resolution naming an item this bundle does not
+carry — or a second resolution for an item already resolved, `sync_apply`'s
+"only the first is applied" rule — is reported as its own `failed` result
+while the rest of the batch still applies. The CLI deliberately has no
+per-item resolve flag: the pick is made against a diff, which is a thing to
+read rather than to type, so `--preview` reports and the web flow decides.
 
 **Import never touches disk.** It writes rows the same way `create`/`update`
 do, and nothing more — no file is written, no baseline is stamped. A freshly
@@ -797,12 +862,13 @@ somewhere else.
 | `POST /api/library/sync` | 200, results array | `require_agent_access` |
 | `GET /api/library/export` (`?project=<id>`) | 200, the `LibraryBundle` | `require_agent_access` |
 | `POST /api/library/import` | 200, results array | `require_agent_access` |
+| `POST /api/library/import/preview` | 200, bare array of `LibraryImportRow` | `require_agent_access` |
 | `GET /api/library/hooks/orphans` (`?scope=&project=`) | 200, bare array of `LibraryOrphanHook` | `require_agent_access` |
 | `POST /api/library/hooks/adopt` (`{"scope", "project_id", "path"}`) | 200, the new row's `LibraryHookStatus` | `require_agent_access` |
 
-**All sixteen routes are `require_agent_access`** (mesa task 1004; the
+**All seventeen routes are `require_agent_access`** (mesa task 1004; the
 hook-registration trio joined them in mesa task 1115, the orphan pair in
-mesa task 1128) — the same
+mesa task 1128, the import preview in mesa task 1292) — the same
 gate the agents, terminal and scripts-run routes carry. This is not a
 read/write split: unlike scripts (`docs/scripts.md`'s "the read/write
 asymmetry is the point", where a LAN peer may *trigger* a stored script but
@@ -861,7 +927,7 @@ loopback-connected `curl` makes the relaxed and strict gates identical. So
 `scripts/library-check.sh` proves only the *portable* half — a DNS-name
 `Host` (rebinding) and a foreign `Origin` (cross-site) refused under `--lan`,
 a foreign `Host` and a foreign `Origin` refused in default mode, on all
-fourteen routes. The genuinely remote-peer case — does a LAN device now get
+seventeen routes. The genuinely remote-peer case — does a LAN device now get
 *in*, and does a rebound one still get turned away — can only be proved with
 a forged non-loopback `SocketAddr`, which a shell script driving a real
 `curl` cannot produce. That is a Rust unit test,
@@ -932,10 +998,16 @@ or a name — a built-in resolves by name too, since its name and its
   to clobber an existing path, mirroring `backup`) and prints
   `{"path": "...", "items": <n>}`. `PROJECT`/`--project` is the same
   positional-or-flag pair `list` takes.
-- `import <PATH> [--on-conflict skip|replace]` reads a bundle from `PATH` (or
-  `-` for stdin, the `--body-file` convention) and prints the resulting
-  `LibraryImportResult[]` as a bare array; a malformed or unparseable bundle
-  is `validation`, exit 1. `--on-conflict` defaults to `skip`.
+- `import <PATH> [--on-conflict skip|replace] [--preview]` reads a bundle from
+  `PATH` (or `-` for stdin, the `--body-file` convention) and prints the
+  resulting `LibraryImportResult[]` as a bare array; a malformed or
+  unparseable bundle is `validation`, exit 1. `--on-conflict` defaults to
+  `skip`. `--preview` (mesa task 1292, conflicting with `--on-conflict`)
+  prints the `LibraryImportRow[]` instead and **writes nothing** — every
+  item's status, both bodies and, for a real conflict, the diff. There is
+  deliberately no per-item `--resolve` flag to go with it, unlike `sync
+  apply`'s: a pick is made *against a diff*, which is a thing to read rather
+  than to type, so the CLI reports and the web page decides.
 
 `--quiet` follows the house rule (`CLAUDE.md`): accepted on `create`,
 `update`, `delete` and `show`/`get`, dropping `body` and `synced_body`
@@ -1045,11 +1117,11 @@ API:
   row's `mesa` re-creates the file and its `disk` deletes the row; a
   `both-changed` row shows both bodies, and `skip` leaves both sides and the
   status untouched on the next scan).
-- **The API DTOs and status codes** for all fourteen routes, a malformed JSON
+- **The API DTOs and status codes** for all seventeen routes, a malformed JSON
   body as 422 (never a 500), and every mutating route (create, update,
-  delete, fork, sync apply, import) refusing a request with no JSON
-  `Content-Type` as 415.
-- **The `require_agent_access` gate, on all fourteen routes, reads included**,
+  delete, fork, sync apply, import, import preview) refusing a request with no
+  JSON `Content-Type` as 415.
+- **The `require_agent_access` gate, on all seventeen routes, reads included**,
   in both `default` and `--lan` serve modes: in default mode a foreign `Host`
   and a foreign `Origin` are each refused (a request with no `Origin` at all —
   curl, or a same-origin browser GET — is fine); under `--lan`, a DNS-name
@@ -1108,7 +1180,7 @@ API:
   on the new item seeing both registrations and `sync status` reading
   `in-sync`, `orphans` no longer listing it; `--quiet` rejected on both;
   and the two routes serving over the API and joining the gate sweeps (now
-  sixteen routes) in both serve modes.
+  seventeen routes) in both serve modes.
 - **The command kind folded into prompt** (mesa task 1139): a db wound back
   to the pre-1139 schema with `sqlite3` and holding a `command` row with two
   versions opens as a prompt with `export_command` on — same id, path, body,

@@ -2059,6 +2059,7 @@ fn router(state: AppState) -> Router {
         .route("/api/library/hooks/orphans", get(library_orphan_hooks))
         .route("/api/library/hooks/adopt", post(adopt_library_hook))
         .route("/api/library/import", post(import_library))
+        .route("/api/library/import/preview", post(preview_library_import))
         .route(
             "/api/library/{id}",
             get(show_library)
@@ -5620,10 +5621,50 @@ struct LibraryImportBody {
     bundle: LibraryBundle,
     #[serde(default = "default_on_conflict")]
     on_conflict: String,
+    /// Per-item choices (mesa task 1292). Absent = the batch-wide
+    /// `on_conflict` decides every item, exactly as it did before.
+    #[serde(default)]
+    resolutions: Vec<LibraryImportResolutionBody>,
+}
+
+/// One per-item import choice: the item's identity, and `skip`|`replace`.
+/// Keyed by identity rather than by position in `bundle.items`, so a caller
+/// that reorders or filters what it previewed still resolves the right row.
+#[derive(Deserialize)]
+struct LibraryImportResolutionBody {
+    name: String,
+    kind: LibraryKind,
+    scope: LibraryScope,
+    #[serde(default)]
+    project: Option<String>,
+    choice: String,
+}
+
+#[derive(Deserialize)]
+struct LibraryImportPreviewBody {
+    bundle: LibraryBundle,
 }
 
 fn default_on_conflict() -> String {
     "skip".to_string()
+}
+
+/// What importing this bundle would meet here, item by item
+/// (`core::library::import_preview`, mesa task 1292) — the local body, the
+/// imported one, the diff between them for a real conflict, and when the
+/// local side last changed. Writes nothing; it is the read a person makes
+/// before choosing. Same [`require_agent_access`] gate as every other
+/// library route: it answers with the row bodies this surface already serves.
+async fn preview_library_import(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Json<LibraryImportPreviewBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    let store = state.store.lock().unwrap();
+    Ok(Json(library::import_preview(&store, &body.bundle)?).into_response())
 }
 
 /// Applies a `LibraryBundle` (`core::library::import`, mesa task 963) —
@@ -5639,9 +5680,24 @@ async fn import_library(
 ) -> ApiResult<Response> {
     require_agent_access(&state, &addr, &headers)?;
     let Json(body) = body?;
+    let resolutions: Vec<(library::LibraryImportKey, String)> = body
+        .resolutions
+        .into_iter()
+        .map(|r| {
+            (
+                library::LibraryImportKey {
+                    name: r.name,
+                    kind: r.kind,
+                    scope: r.scope,
+                    project: r.project,
+                },
+                r.choice,
+            )
+        })
+        .collect();
     let mut store = state.store.lock().unwrap();
     let results: Vec<LibraryImportResult> =
-        library::import(&mut store, &body.bundle, &body.on_conflict)?;
+        library::import(&mut store, &body.bundle, &body.on_conflict, &resolutions)?;
     Ok(Json(results).into_response())
 }
 
@@ -14430,6 +14486,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Ok(Json(LibraryImportBody {
                 bundle,
                 on_conflict: "skip".to_string(),
+                resolutions: Vec::new(),
             })),
         )
         .await
@@ -14471,6 +14528,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Ok(Json(LibraryImportBody {
                 bundle,
                 on_conflict: "overwrite".to_string(),
+                resolutions: Vec::new(),
             })),
         )
         .await
@@ -14898,6 +14956,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Ok(Json(LibraryImportBody {
                 bundle: bundle(),
                 on_conflict: "skip".to_string(),
+                resolutions: Vec::new(),
             })),
         )
         .await
@@ -14910,6 +14969,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             Ok(Json(LibraryImportBody {
                 bundle: bundle(),
                 on_conflict: "skip".to_string(),
+                resolutions: Vec::new(),
             })),
         )
         .await;

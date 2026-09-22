@@ -24,8 +24,9 @@ use crate::core::config;
 use crate::core::store::{Error, LibraryPatch, Result as StoreResult, Store};
 use crate::core::types::{
     LibraryBundle, LibraryBundleItem, LibraryDiffKind, LibraryDiffLine, LibraryHookRegistration,
-    LibraryHookStatus, LibraryImportResult, LibraryItem, LibraryKind, LibraryOrphanHook,
-    LibraryScope, LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
+    LibraryHookStatus, LibraryImportResult, LibraryImportRow, LibraryImportStatus, LibraryItem,
+    LibraryKind, LibraryOrphanHook, LibraryScope, LibrarySyncResult, LibrarySyncRow,
+    LibrarySyncStatus,
 };
 
 /// One built-in library entry — code, not a db row. `core::library::BUILTINS`
@@ -1127,19 +1128,198 @@ pub fn export(store: &Store, project: Option<i64>) -> StoreResult<LibraryBundle>
     })
 }
 
+/// The identity a per-item import resolution names: the bundle item's own
+/// `(name, kind, scope, project)`, never its index in the bundle. An index
+/// would silently resolve the wrong item the moment a caller reordered or
+/// filtered the items it previewed, and the preview a person reads is a list
+/// of identities, not of positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryImportKey {
+    pub name: String,
+    pub kind: LibraryKind,
+    pub scope: LibraryScope,
+    pub project: Option<String>,
+}
+
+/// The key naming one bundle item, so a caller and [`import`] agree on what
+/// a resolution points at.
+pub fn import_key(item: &LibraryBundleItem) -> LibraryImportKey {
+    LibraryImportKey {
+        name: item.name.clone(),
+        kind: item.kind,
+        scope: item.scope,
+        project: item.project.clone(),
+    }
+}
+
+/// One item's failure, as the batch reports it — never propagated, so a
+/// caller's loop stays a plain walk over the bundle.
+fn import_failed(
+    name: &str,
+    kind: LibraryKind,
+    scope: LibraryScope,
+    error: String,
+) -> LibraryImportResult {
+    LibraryImportResult {
+        name: name.to_string(),
+        kind,
+        scope,
+        status: "failed".to_string(),
+        item_id: None,
+        error: Some(error),
+    }
+}
+
+/// The row a bundle item resolves against on this instance, and the project
+/// id it resolved through — **the one matching rule**, shared by [`import`]
+/// and [`import_preview`] so a preview can never disagree with the apply it
+/// previews. `Err` is the per-item failure message, not a batch error.
+fn resolve_existing(
+    store: &Store,
+    item: &LibraryBundleItem,
+) -> Result<(Option<i64>, Option<LibraryItem>), String> {
+    let project_id = match (item.scope, &item.project) {
+        (LibraryScope::User, Some(_)) => {
+            return Err("a user-scoped item may not carry a project name".to_string());
+        }
+        (LibraryScope::Project, None) => {
+            return Err("a project-scoped item must carry a project name".to_string());
+        }
+        (LibraryScope::User, None) => None,
+        (LibraryScope::Project, Some(name)) => match store.find_project_by_name(name) {
+            Ok(project) => Some(project.id),
+            Err(e) => return Err(e.to_string()),
+        },
+    };
+
+    let existing = store
+        .find_library_item(item.kind, item.scope, project_id, &item.name)
+        .map_err(|e| e.to_string())?;
+
+    let existing = match existing {
+        Some(existing) => Some(existing),
+        // No row claims this exact (kind, scope, project, name) — but if the
+        // item's builtin_id already has a fork somewhere, creating a second
+        // row for the same builtin_id would be `conflict`. Resolve against
+        // that existing fork instead, per the spec's conflict case.
+        None => match &item.builtin_id {
+            Some(builtin_id) => store
+                .find_library_fork(builtin_id)
+                .map_err(|e| e.to_string())?,
+            None => None,
+        },
+    };
+
+    Ok((project_id, existing))
+}
+
+/// What importing a [`LibraryBundle`] here would meet, item by item, writing
+/// nothing (mesa task 1292). The whole-bundle `version` refusal is [`import`]'s
+/// own, checked here too so a preview of a bundle this mesa cannot read fails
+/// the same way the import would rather than listing rows nobody could apply.
+///
+/// Every row resolves through [`resolve_existing`], import's own rule — the
+/// reason this is a server-side preview at all: a browser matching
+/// `(kind, scope, project, name)` itself would not know about the
+/// `builtin_id` fork fallback, and would preview a different import.
+pub fn import_preview(store: &Store, bundle: &LibraryBundle) -> StoreResult<Vec<LibraryImportRow>> {
+    if bundle.version != BUNDLE_VERSION {
+        return Err(Error::Validation(format!(
+            "bundle version {} is not supported; this mesa understands version {BUNDLE_VERSION}",
+            bundle.version
+        )));
+    }
+    // One query for the whole preview rather than one per row — mesa's own
+    // last-changed date is the newest version's `created_at`, since an item's
+    // `updated_at` moves on a rename too (`sync_status` reads it the same way).
+    let version_dates = store.library_version_dates()?;
+    Ok(bundle
+        .items
+        .iter()
+        .map(|item| {
+            let row =
+                |status, item_id, local_body, local_updated_at, diff, error| LibraryImportRow {
+                    name: item.name.clone(),
+                    kind: item.kind,
+                    scope: item.scope,
+                    project: item.project.clone(),
+                    status,
+                    item_id,
+                    local_body,
+                    bundle_body: item.body.clone(),
+                    local_updated_at,
+                    diff,
+                    error,
+                };
+            let existing = match resolve_existing(store, item) {
+                Ok((_, existing)) => existing,
+                // Nothing was matched, and nothing ever will be. Its own
+                // status rather than `New`, so a caller reading the JSON
+                // alone is never told this item would be created.
+                Err(e) => {
+                    return row(
+                        LibraryImportStatus::Unresolvable,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(e),
+                    );
+                }
+            };
+            let Some(existing) = existing else {
+                return row(LibraryImportStatus::New, None, None, None, None, None);
+            };
+            let local_updated_at = existing
+                .id
+                .and_then(|id| version_dates.get(&id).cloned())
+                .or_else(|| existing.updated_at.clone());
+            if existing.body == item.body {
+                return row(
+                    LibraryImportStatus::Identical,
+                    existing.id,
+                    Some(existing.body),
+                    local_updated_at,
+                    None,
+                    None,
+                );
+            }
+            let diff = diff_lines(&existing.body, &item.body);
+            row(
+                LibraryImportStatus::Conflict,
+                existing.id,
+                Some(existing.body),
+                local_updated_at,
+                Some(diff),
+                None,
+            )
+        })
+        .collect())
+}
+
 /// Applies a [`LibraryBundle`] against this instance. `on_conflict` is
 /// `"skip"` (leave an existing row untouched) or `"replace"` (update its
 /// body); any other value is a caller mistake, not a per-item outcome, so it
 /// fails the whole call (`Error::Validation`). A bundle whose `version` this
 /// mesa does not know is likewise refused whole, before a single item is
-/// touched. Every other failure is per item: a bad project name or a
-/// `Store` rejection (the name rule, the body cap, ...) fails only that
-/// item and the rest of the batch still applies — the same posture
-/// `sync_apply` already takes toward its own batch.
+/// touched.
+///
+/// `resolutions` is the per-item half (mesa task 1292): each names one item
+/// by its [`LibraryImportKey`] and carries the same two words, so a person who
+/// read an [`import_preview`] can replace one conflicting body and keep
+/// another in the same call. An item no resolution names falls back to
+/// `on_conflict`, so a caller sending none behaves exactly as before.
+///
+/// Every other failure is per item: a bad project name, a `Store` rejection
+/// (the name rule, the body cap, ...), an unrecognised choice or a resolution
+/// naming an item this bundle does not carry fails only that item and the rest
+/// of the batch still applies — the same posture `sync_apply` already takes
+/// toward its own batch.
 pub fn import(
     store: &mut Store,
     bundle: &LibraryBundle,
     on_conflict: &str,
+    resolutions: &[(LibraryImportKey, String)],
 ) -> StoreResult<Vec<LibraryImportResult>> {
     if on_conflict != "skip" && on_conflict != "replace" {
         return Err(Error::Validation(format!(
@@ -1153,62 +1333,66 @@ pub fn import(
         )));
     }
 
-    Ok(bundle
-        .items
-        .iter()
-        .map(|item| import_one(store, item, on_conflict))
-        .collect())
+    // Each resolution is spent by the first item it names, so a key submitted
+    // twice resolves the first item and is then reported unused — `sync_apply`'s
+    // own "only the first resolution for a path is applied" rule, which keeps a
+    // second resolution from silently reverting a same-batch write.
+    let mut spent = vec![false; resolutions.len()];
+    let mut results: Vec<LibraryImportResult> = Vec::with_capacity(bundle.items.len());
+
+    for item in &bundle.items {
+        let key = import_key(item);
+        let picked = resolutions
+            .iter()
+            .enumerate()
+            .find(|(i, (k, _))| !spent[*i] && *k == key)
+            .map(|(i, (_, choice))| (i, choice.as_str()));
+        let choice = match picked {
+            Some((i, choice)) => {
+                spent[i] = true;
+                Some(choice)
+            }
+            None => None,
+        };
+        results.push(match choice {
+            Some(choice) if choice != "skip" && choice != "replace" => import_failed(
+                &item.name,
+                item.kind,
+                item.scope,
+                format!("{choice:?} is not a valid import choice; use \"skip\" or \"replace\""),
+            ),
+            _ => import_one(store, item, choice.unwrap_or(on_conflict)),
+        });
+    }
+
+    for (i, (key, _)) in resolutions.iter().enumerate() {
+        if spent[i] {
+            continue;
+        }
+        let error = if bundle.items.iter().any(|item| import_key(item) == *key) {
+            "only the first resolution for an item is applied".to_string()
+        } else {
+            format!("{:?} is not part of this bundle", key.name)
+        };
+        results.push(import_failed(&key.name, key.kind, key.scope, error));
+    }
+
+    Ok(results)
 }
 
 /// Imports one bundle item, never propagating an error — every outcome,
 /// including a failure, is reported in the returned [`LibraryImportResult`]
-/// so the caller's batch loop stays a plain `map`.
+/// so the caller's batch loop stays a plain walk.
 fn import_one(
     store: &mut Store,
     item: &LibraryBundleItem,
     on_conflict: &str,
 ) -> LibraryImportResult {
-    let fail = |error: String| LibraryImportResult {
-        name: item.name.clone(),
-        kind: item.kind,
-        scope: item.scope,
-        status: "failed".to_string(),
-        item_id: None,
-        error: Some(error),
-    };
+    let fail = |error: String| import_failed(&item.name, item.kind, item.scope, error);
 
-    let project_id = match (item.scope, &item.project) {
-        (LibraryScope::User, Some(_)) => {
-            return fail("a user-scoped item may not carry a project name".to_string());
-        }
-        (LibraryScope::Project, None) => {
-            return fail("a project-scoped item must carry a project name".to_string());
-        }
-        (LibraryScope::User, None) => None,
-        (LibraryScope::Project, Some(name)) => match store.find_project_by_name(name) {
-            Ok(project) => Some(project.id),
-            Err(e) => return fail(e.to_string()),
-        },
-    };
-
-    let existing = match store.find_library_item(item.kind, item.scope, project_id, &item.name) {
-        Ok(existing) => existing,
-        Err(e) => return fail(e.to_string()),
-    };
-
-    let existing = match existing {
-        Some(existing) => Some(existing),
-        // No row claims this exact (kind, scope, project, name) — but if the
-        // item's builtin_id already has a fork somewhere, creating a second
-        // row for the same builtin_id would be `conflict`. Resolve against
-        // that existing fork instead, per the spec's conflict case.
-        None => match &item.builtin_id {
-            Some(builtin_id) => match store.find_library_fork(builtin_id) {
-                Ok(fork) => fork,
-                Err(e) => return fail(e.to_string()),
-            },
-            None => None,
-        },
+    let (project_id, existing) = match resolve_existing(store, item) {
+        Ok(resolved) => resolved,
+        Err(e) => return fail(e),
     };
 
     match existing {
@@ -3763,7 +3947,7 @@ mod tests {
         assert_eq!(bundle.items[1].kind, LibraryKind::Prompt);
         assert!(!bundle.items[1].export_command, "absent reads as off");
 
-        let results = import(&mut store, &bundle, "skip").unwrap();
+        let results = import(&mut store, &bundle, "skip", &[]).unwrap();
         assert!(results.iter().all(|r| r.status == "created"), "{results:?}");
         let refine = store.get_library_item(results[0].item_id.unwrap()).unwrap();
         assert!(refine.export_command);
@@ -4536,14 +4720,14 @@ mod tests {
             export_command: false,
         }]);
 
-        let results = import(&mut store, &bundle, "skip").unwrap();
+        let results = import(&mut store, &bundle, "skip", &[]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, "created");
         let id = results[0].item_id.expect("a created row has an id");
         assert_eq!(store.get_library_item(id).unwrap().body, "original body");
 
         // A second import with the default policy leaves it entirely untouched.
-        let results = import(&mut store, &bundle, "skip").unwrap();
+        let results = import(&mut store, &bundle, "skip", &[]).unwrap();
         assert_eq!(results[0].status, "skipped");
         assert_eq!(results[0].item_id, Some(id));
         assert_eq!(store.get_library_item(id).unwrap().body, "original body");
@@ -4551,7 +4735,7 @@ mod tests {
         // Re-import with `replace` after the source changed updates the body.
         let mut changed = bundle;
         changed.items[0].body = "new body".to_string();
-        let results = import(&mut store, &changed, "replace").unwrap();
+        let results = import(&mut store, &changed, "replace", &[]).unwrap();
         assert_eq!(results[0].status, "replaced");
         assert_eq!(results[0].item_id, Some(id));
         assert_eq!(store.get_library_item(id).unwrap().body, "new body");
@@ -4581,7 +4765,7 @@ mod tests {
             },
         ]);
 
-        let results = import(&mut store, &bundle, "skip").unwrap();
+        let results = import(&mut store, &bundle, "skip", &[]).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, "failed");
         assert!(results[0].error.is_some());
@@ -4603,7 +4787,7 @@ mod tests {
         let mut unknown_version = bundle;
         unknown_version.version = 99;
 
-        let err = import(&mut store, &unknown_version, "skip").unwrap_err();
+        let err = import(&mut store, &unknown_version, "skip", &[]).unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(
             store
@@ -4628,7 +4812,7 @@ mod tests {
             export_command: false,
         }]);
 
-        let err = import(&mut store, &bundle, "merge").unwrap_err();
+        let err = import(&mut store, &bundle, "merge", &[]).unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(store.list_library_items(None).unwrap().is_empty());
     }
@@ -4657,11 +4841,214 @@ mod tests {
             },
         ]);
 
-        let results = import(&mut store, &bundle, "skip").unwrap();
+        let results = import(&mut store, &bundle, "skip", &[]).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].status, "failed");
         assert!(results[0].error.is_some());
         assert_eq!(results[1].status, "created");
+    }
+
+    // ---- per-item import resolutions + preview (mesa task 1292) ----
+
+    fn user_hook_item(name: &str, body: &str) -> LibraryBundleItem {
+        LibraryBundleItem {
+            name: name.to_string(),
+            kind: LibraryKind::Hook,
+            scope: LibraryScope::User,
+            project: None,
+            body: body.to_string(),
+            builtin_id: None,
+            export_command: false,
+        }
+    }
+
+    #[test]
+    fn import_preview_reports_new_identical_and_conflict() {
+        let (mut store, _dir) = temp_store();
+        let seed = bundle_of(vec![
+            user_hook_item("same-hook", "shared body"),
+            user_hook_item("moved-hook", "the local body"),
+        ]);
+        import(&mut store, &seed, "skip", &[]).unwrap();
+
+        let bundle = bundle_of(vec![
+            user_hook_item("same-hook", "shared body"),
+            user_hook_item("moved-hook", "the imported body"),
+            user_hook_item("fresh-hook", "brand new"),
+        ]);
+        let rows = import_preview(&store, &bundle).unwrap();
+        assert_eq!(rows.len(), 3);
+
+        assert_eq!(rows[0].status, LibraryImportStatus::Identical);
+        assert!(
+            rows[0].diff.is_none(),
+            "identical bodies have nothing to diff"
+        );
+        assert_eq!(rows[0].local_body.as_deref(), Some("shared body"));
+        assert!(rows[0].local_updated_at.is_some());
+
+        assert_eq!(rows[1].status, LibraryImportStatus::Conflict);
+        assert_eq!(rows[1].local_body.as_deref(), Some("the local body"));
+        assert_eq!(rows[1].bundle_body, "the imported body");
+        let diff = rows[1].diff.as_ref().expect("a conflict carries a diff");
+        // The diff's "mesa" side is the local row and its "disk" side the bundle.
+        assert!(
+            diff.iter()
+                .any(|l| l.kind == LibraryDiffKind::MesaOnly && l.text == "the local body")
+        );
+        assert!(
+            diff.iter()
+                .any(|l| l.kind == LibraryDiffKind::DiskOnly && l.text == "the imported body")
+        );
+
+        assert_eq!(rows[2].status, LibraryImportStatus::New);
+        assert!(rows[2].item_id.is_none());
+        assert!(rows[2].local_body.is_none());
+        assert!(rows[2].local_updated_at.is_none());
+        assert!(rows[2].diff.is_none());
+    }
+
+    #[test]
+    fn import_preview_writes_nothing_and_refuses_an_unknown_version() {
+        let (store, _dir) = temp_store();
+        let bundle = bundle_of(vec![user_hook_item("fresh-hook", "brand new")]);
+        import_preview(&store, &bundle).unwrap();
+        assert!(
+            store.list_library_items(None).unwrap().is_empty(),
+            "a preview must write nothing"
+        );
+
+        let mut unknown = bundle;
+        unknown.version = 99;
+        assert!(matches!(
+            import_preview(&store, &unknown).unwrap_err(),
+            Error::Validation(_)
+        ));
+    }
+
+    #[test]
+    fn import_preview_reports_an_unresolvable_item_with_its_error() {
+        let (store, _dir) = temp_store();
+        let bundle = bundle_of(vec![LibraryBundleItem {
+            name: "scoped-hook".to_string(),
+            kind: LibraryKind::Hook,
+            scope: LibraryScope::Project,
+            project: Some("no-such-project".to_string()),
+            body: "body".to_string(),
+            builtin_id: None,
+            export_command: false,
+        }]);
+        let rows = import_preview(&store, &bundle).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status,
+            LibraryImportStatus::Unresolvable,
+            "an item that cannot be matched must never preview as `new`"
+        );
+        assert!(
+            rows[0].error.is_some(),
+            "an unresolvable item carries its error"
+        );
+        assert!(rows[0].diff.is_none());
+        assert!(rows[0].item_id.is_none());
+    }
+
+    #[test]
+    fn import_resolves_one_item_replace_and_another_skip_in_one_call() {
+        let (mut store, _dir) = temp_store();
+        let seed = bundle_of(vec![
+            user_hook_item("keep-hook", "the local keep body"),
+            user_hook_item("take-hook", "the local take body"),
+        ]);
+        import(&mut store, &seed, "skip", &[]).unwrap();
+
+        let bundle = bundle_of(vec![
+            user_hook_item("keep-hook", "the imported keep body"),
+            user_hook_item("take-hook", "the imported take body"),
+        ]);
+        let resolutions = vec![
+            (import_key(&bundle.items[0]), "skip".to_string()),
+            (import_key(&bundle.items[1]), "replace".to_string()),
+        ];
+        let results = import(&mut store, &bundle, "skip", &resolutions).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].status, "skipped");
+        assert_eq!(results[1].status, "replaced");
+
+        let items = store.list_library_items(None).unwrap();
+        let body = |name: &str| {
+            items
+                .iter()
+                .find(|i| i.name == name)
+                .expect("row present")
+                .body
+                .clone()
+        };
+        assert_eq!(body("keep-hook"), "the local keep body");
+        assert_eq!(body("take-hook"), "the imported take body");
+    }
+
+    #[test]
+    fn an_item_with_no_resolution_falls_back_to_on_conflict() {
+        let (mut store, _dir) = temp_store();
+        let seed = bundle_of(vec![user_hook_item("my-hook", "the local body")]);
+        import(&mut store, &seed, "skip", &[]).unwrap();
+
+        let bundle = bundle_of(vec![user_hook_item("my-hook", "the imported body")]);
+        let results = import(&mut store, &bundle, "replace", &[]).unwrap();
+        assert_eq!(results[0].status, "replaced");
+        assert_eq!(
+            store.list_library_items(None).unwrap()[0].body,
+            "the imported body"
+        );
+    }
+
+    #[test]
+    fn a_resolution_naming_nothing_in_the_bundle_fails_alone() {
+        let (mut store, _dir) = temp_store();
+        let bundle = bundle_of(vec![user_hook_item("my-hook", "hook body")]);
+        let stray = (
+            LibraryImportKey {
+                name: "not-here".to_string(),
+                kind: LibraryKind::Hook,
+                scope: LibraryScope::User,
+                project: None,
+            },
+            "replace".to_string(),
+        );
+        let results = import(&mut store, &bundle, "skip", &[stray]).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].status, "created");
+        assert_eq!(results[1].status, "failed");
+        assert_eq!(results[1].name, "not-here");
+        assert!(
+            results[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not part of this bundle")
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_per_item_choice_fails_only_that_item() {
+        let (mut store, _dir) = temp_store();
+        let bundle = bundle_of(vec![
+            user_hook_item("bad-choice-hook", "a"),
+            user_hook_item("good-hook", "b"),
+        ]);
+        let resolutions = vec![(import_key(&bundle.items[0]), "merge".to_string())];
+        let results = import(&mut store, &bundle, "skip", &resolutions).unwrap();
+        assert_eq!(results[0].status, "failed");
+        assert_eq!(results[1].status, "created");
+        assert!(
+            store
+                .list_library_items(None)
+                .unwrap()
+                .iter()
+                .all(|i| i.name != "bad-choice-hook"),
+            "the refused item must not be written"
+        );
     }
 
     // ---- hook registration in `.claude/settings.json` (mesa task 1115) ----

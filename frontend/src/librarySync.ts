@@ -241,27 +241,49 @@ export function diffMark(
  * value.
  */
 export function newerSide(row: LibrarySyncRow): 'mesa' | 'disk' | 'same' | null {
-  const mesa = row.mesa_updated_at
-  const disk = row.disk_mtime
-  if (mesa === null || disk === null) return null
-  if (mesa === disk) return 'same'
-  return mesa > disk ? 'mesa' : 'disk'
+  return newerOf(row.mesa_updated_at, row.disk_mtime)
+}
+
+/**
+ * `newerSide` over two bare timestamps, so a second pair of sides can ask the
+ * same question (the import preview's local row vs. the bundle's
+ * `exported_at`, mesa task 1292) without a second implementation of the
+ * comparison. `'a'`/`'b'` name the arguments' order, and the caller maps them
+ * onto whatever its two sides are called.
+ */
+export function newerOf(a: string | null, b: string | null): 'mesa' | 'disk' | 'same' | null {
+  if (a === null || b === null) return null
+  if (a === b) return 'same'
+  return a > b ? 'mesa' : 'disk'
 }
 
 /** The two change dates as one short line above a row's diff, naming which
  * side is which and which is newer. `null` when neither side has a date —
  * there is nothing to say, and an empty line is not worth the space. */
 export function changeDatesLabel(row: LibrarySyncRow): string | null {
+  return datesLabel(['mesa', row.mesa_updated_at], ['disk', row.disk_mtime])
+}
+
+/**
+ * `changeDatesLabel` over two `(label, timestamp)` pairs — the same line for
+ * any two sides that can be dated, so the import preview's local-vs-bundle
+ * line reads exactly as a sync row's does (mesa task 1292). The verdict names
+ * the side by the label it was given.
+ */
+export function datesLabel(
+  a: [string, string | null],
+  b: [string, string | null],
+): string | null {
   const parts: string[] = []
-  if (row.mesa_updated_at !== null) parts.push(`mesa ${shortDate(row.mesa_updated_at)}`)
-  if (row.disk_mtime !== null) parts.push(`disk ${shortDate(row.disk_mtime)}`)
+  if (a[1] !== null) parts.push(`${a[0]} ${shortDate(a[1])}`)
+  if (b[1] !== null) parts.push(`${b[0]} ${shortDate(b[1])}`)
   if (parts.length === 0) return null
-  const newer = newerSide(row)
+  const newer = newerOf(a[1], b[1])
   const verdict =
     newer === 'mesa'
-      ? ' (mesa is newer)'
+      ? ` (${a[0]} is newer)`
       : newer === 'disk'
-        ? ' (disk is newer)'
+        ? ` (${b[0]} is newer)`
         : newer === 'same'
           ? ' (same time)'
           : ''

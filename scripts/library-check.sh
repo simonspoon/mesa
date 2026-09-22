@@ -1301,6 +1301,184 @@ run 1 "$MESA" library import "$TMP/malformed.json"
 [ "$(jqe .error.code)" = "validation" ] || fail "import unparseable bundle: error.code"
 ok "import of an unparseable bundle: exit 1 validation"
 
+# ---- import preview + per-item resolutions (mesa task 1292) ----
+# A bundle's only conflict shape is two bodies and a choice (there is no sync
+# baseline in a bundle), so import previews each item against the row it would
+# ACTUALLY resolve to — import's own matching rule, shared code — and the apply
+# takes one choice per item, keyed by identity. Everything here runs against a
+# throwaway db and its own `serve`, so the main db above is untouched.
+
+MESA_DB_5="$TMP/mesa5.db"
+run 0 env MESA_DB="$MESA_DB_5" "$MESA" library create --kind prompt --scope user \
+  --name keep-note --body 'local keep'
+run 0 env MESA_DB="$MESA_DB_5" "$MESA" library create --kind prompt --scope user \
+  --name take-note --body 'local take'
+run 0 env MESA_DB="$MESA_DB_5" "$MESA" library create --kind prompt --scope user \
+  --name same-note --body 'shared'
+
+cat > "$TMP/preview-bundle.json" <<'JSON'
+{"version":1,"exported_at":"2026-01-01 00:00:00","items":[
+ {"name":"keep-note","kind":"prompt","scope":"user","project":null,"body":"imported keep","builtin_id":null,"export_command":false},
+ {"name":"take-note","kind":"prompt","scope":"user","project":null,"body":"imported take","builtin_id":null,"export_command":false},
+ {"name":"same-note","kind":"prompt","scope":"user","project":null,"body":"shared","builtin_id":null,"export_command":false},
+ {"name":"fresh-note","kind":"prompt","scope":"user","project":null,"body":"brand new","builtin_id":null,"export_command":false},
+ {"name":"scoped-note","kind":"prompt","scope":"project","project":"no-such-project","body":"x","builtin_id":null,"export_command":false}
+]}
+JSON
+
+PORT5=17798
+MESA_DB="$MESA_DB_5" "$MESA" serve --port "$PORT5" >"$TMP/serve10.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "http://127.0.0.1:$PORT5/api/projects" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "http://127.0.0.1:$PORT5/api/projects" >/dev/null ||
+  fail "section 10 server did not start (log: $(cat "$TMP/serve10.log"))"
+
+api5() { # api5 <expected-status> <method> <path> [json-body]
+  STATUS=$(curl -s -o "$TMP/body5" -w '%{http_code}' -X "$2" \
+    -H 'Content-Type: application/json' -d "${4:-{\}}" \
+    "http://127.0.0.1:$PORT5$3")
+  BODY=$(cat "$TMP/body5")
+  [ "$STATUS" = "$1" ] || fail "expected HTTP $1, got $STATUS: $2 $3 ($BODY)"
+}
+jqb5() { jq -r "$1" <<<"$BODY"; }
+
+jq -c '{bundle: .}' "$TMP/preview-bundle.json" > "$TMP/preview-body.json"
+api5 200 POST /api/library/import/preview "$(cat "$TMP/preview-body.json")"
+[ "$(jqb5 type)" = "array" ] || fail "import preview: bare array"
+[ "$(jqb5 length)" = "5" ] || fail "import preview: one row per bundle item"
+
+PREVIEW=$BODY
+prow() { jq -c --arg n "$1" '.[] | select(.name==$n)' <<<"$PREVIEW"; }
+
+ROW=$(prow fresh-note)
+[ "$(jq -r .status <<<"$ROW")" = "new" ] || fail "preview: fresh-note must be new, got $ROW"
+[ "$(jq -r .item_id <<<"$ROW")" = "null" ] || fail "preview: a new row resolves to no item"
+[ "$(jq -r .local_body <<<"$ROW")" = "null" ] || fail "preview: a new row has no local body"
+[ "$(jq -r .local_updated_at <<<"$ROW")" = "null" ] || fail "preview: a new row has no local date"
+[ "$(jq -r .diff <<<"$ROW")" = "null" ] || fail "preview: a new row carries no diff"
+[ "$(jq -r .bundle_body <<<"$ROW")" = "brand new" ] || fail "preview: bundle_body"
+
+ROW=$(prow same-note)
+[ "$(jq -r .status <<<"$ROW")" = "identical" ] || fail "preview: same-note must be identical, got $ROW"
+[ "$(jq -r .diff <<<"$ROW")" = "null" ] || fail "preview: identical bodies carry no diff"
+[ "$(jq -r .local_body <<<"$ROW")" = "shared" ] || fail "preview: identical row carries the local body"
+[ "$(jq -r .local_updated_at <<<"$ROW")" != "null" ] || fail "preview: an existing row reports its last-changed date"
+
+ROW=$(prow keep-note)
+[ "$(jq -r .status <<<"$ROW")" = "conflict" ] || fail "preview: keep-note must be a conflict, got $ROW"
+[ "$(jq -r .local_body <<<"$ROW")" = "local keep" ] || fail "preview: conflict local_body"
+[ "$(jq -r .bundle_body <<<"$ROW")" = "imported keep" ] || fail "preview: conflict bundle_body"
+[ "$(jq -r .item_id <<<"$ROW")" != "null" ] || fail "preview: a conflict names the row it resolved to"
+[ "$(jq -r .local_updated_at <<<"$ROW")" != "null" ] || fail "preview: a conflict reports the local date"
+[ "$(jq -r '.diff | length' <<<"$ROW")" -gt 0 ] || fail "preview: a conflict carries a diff, got $ROW"
+# The diff's "mesa" side is the local row and its "disk" side the bundle.
+[ "$(jq -r '[.diff[] | select(.kind=="mesa-only") | .text] | join("")' <<<"$ROW")" = "local keep" ] ||
+  fail "preview diff: the mesa-only line must be the LOCAL body"
+[ "$(jq -r '[.diff[] | select(.kind=="disk-only") | .text] | join("")' <<<"$ROW")" = "imported keep" ] ||
+  fail "preview diff: the disk-only line must be the IMPORTED body"
+
+ROW=$(prow scoped-note)
+# Its own status, never `new`: the JSON is the interface, and a caller
+# counting `new` rows to learn what an import would create must not be handed
+# an item that is going to fail.
+[ "$(jq -r .status <<<"$ROW")" = "unresolvable" ] ||
+  fail "preview: an item naming an unknown project must be unresolvable, not new, got $ROW"
+[ "$(jq -r .error <<<"$ROW")" != "null" ] ||
+  fail "preview: an unresolvable item must carry its error, got $ROW"
+[ "$(jq -r .diff <<<"$ROW")" = "null" ] || fail "preview: an unresolvable row carries no diff"
+[ "$(jq -r '[.[] | select(.status=="new")] | length' <<<"$PREVIEW")" = "1" ] ||
+  fail "preview: exactly one row is `new` — the unresolvable one must not be counted with it"
+ok "POST /api/library/import/preview: new/identical/conflict/unresolvable per item, a diff ONLY on a conflict (local as its mesa side), local_updated_at on every resolved row, and an unresolvable item carrying its error rather than reading as new"
+
+run 0 env MESA_DB="$MESA_DB_5" "$MESA" library list
+[ "$(jqs 'map(select(.id != null)) | length')" = "3" ] ||
+  fail "import preview must write nothing, got $STDOUT"
+ok "the import preview writes nothing"
+
+# ---- one `replace` and one `skip` in the SAME call ----
+
+RESOLVED=$(jq -c '{bundle: ., resolutions: [
+  {name:"keep-note",kind:"prompt",scope:"user",project:null,choice:"skip"},
+  {name:"take-note",kind:"prompt",scope:"user",project:null,choice:"replace"},
+  {name:"ghost-note",kind:"prompt",scope:"user",project:null,choice:"replace"}
+]}' "$TMP/preview-bundle.json")
+api5 200 POST /api/library/import "$RESOLVED"
+RESULTS=$BODY
+rres() { jq -c --arg n "$1" '.[] | select(.name==$n)' <<<"$RESULTS"; }
+[ "$(jq -r .status <<<"$(rres keep-note)")" = "skipped" ] || fail "resolutions: keep-note must be skipped"
+[ "$(jq -r .status <<<"$(rres take-note)")" = "replaced" ] || fail "resolutions: take-note must be replaced"
+[ "$(jq -r .status <<<"$(rres same-note)")" = "skipped" ] ||
+  fail "resolutions: an item nobody resolved falls back to on_conflict (skip)"
+[ "$(jq -r .status <<<"$(rres fresh-note)")" = "created" ] || fail "resolutions: fresh-note must be created"
+
+run 0 env MESA_DB="$MESA_DB_5" "$MESA" library show keep-note
+[ "$(jqs .body)" = "local keep" ] || fail "resolutions: the skipped row keeps its LOCAL body"
+run 0 env MESA_DB="$MESA_DB_5" "$MESA" library show take-note
+[ "$(jqs .body)" = "imported take" ] || fail "resolutions: the replaced row takes the IMPORTED body"
+ok "POST /api/library/import with per-item resolutions: one conflict replaced and another skipped in the same call, each side winning its own row's body"
+
+GHOST=$(rres ghost-note)
+[ "$(jq -r .status <<<"$GHOST")" = "failed" ] ||
+  fail "a resolution naming nothing in the bundle must fail alone, got $GHOST"
+[ "$(jq -r .error <<<"$GHOST")" != "null" ] || fail "the stray resolution's failure carries an error"
+[ "$(jq -r '.[] | select(.name=="scoped-note") | .status' <<<"$RESULTS")" = "failed" ] ||
+  fail "the unresolvable item still fails alone"
+[ "$(jq -r 'length' <<<"$RESULTS")" = "6" ] ||
+  fail "one result per bundle item plus one for the stray resolution, got $RESULTS"
+ok "a resolution naming an item not in the bundle fails alone while the rest of the batch still applies"
+
+# ---- BACKWARD COMPAT: no `resolutions` is byte-identical to on_conflict ----
+
+MESA_DB_6="$TMP/mesa6.db"
+run 0 env MESA_DB="$MESA_DB_6" "$MESA" library create --kind prompt --scope user \
+  --name keep-note --body 'local keep'
+kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null || true
+MESA_DB="$MESA_DB_6" "$MESA" serve --port "$PORT5" >"$TMP/serve10b.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "http://127.0.0.1:$PORT5/api/projects" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+
+api5 200 POST /api/library/import "$(cat "$TMP/preview-body.json")"
+[ "$(jq -r '.[] | select(.name=="keep-note") | .status' <<<"$BODY")" = "skipped" ] ||
+  fail "no resolutions, no on_conflict: must still default to skip"
+run 0 env MESA_DB="$MESA_DB_6" "$MESA" library show keep-note
+[ "$(jqs .body)" = "local keep" ] || fail "no resolutions: the body must be untouched"
+
+api5 200 POST /api/library/import \
+  "$(jq -c '{bundle: ., on_conflict: "replace"}' "$TMP/preview-bundle.json")"
+[ "$(jq -r '.[] | select(.name=="keep-note") | .status' <<<"$BODY")" = "replaced" ] ||
+  fail "no resolutions, on_conflict=replace: must still replace"
+run 0 env MESA_DB="$MESA_DB_6" "$MESA" library show keep-note
+[ "$(jqs .body)" = "imported keep" ] || fail "no resolutions, on_conflict=replace: the imported body must win"
+ok "an import posted with NO resolutions is byte-identical to the old batch-wide on_conflict behaviour"
+
+kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=
+
+# ---- CLI --preview reports and writes nothing ----
+
+MESA_DB_7="$TMP/mesa7.db"
+run 0 env MESA_DB="$MESA_DB_7" "$MESA" library create --kind prompt --scope user \
+  --name keep-note --body 'local keep'
+run 0 env MESA_DB="$MESA_DB_7" "$MESA" library import "$TMP/preview-bundle.json" --preview
+[ "$(jqs 'length')" = "5" ] || fail "CLI --preview: one row per bundle item"
+[ "$(jqs '.[] | select(.name=="keep-note") | .status')" = "conflict" ] ||
+  fail "CLI --preview: keep-note must be a conflict"
+[ "$(jqs '.[] | select(.name=="fresh-note") | .status')" = "new" ] ||
+  fail "CLI --preview: fresh-note must be new"
+run 0 env MESA_DB="$MESA_DB_7" "$MESA" library list
+[ "$(jqs 'map(select(.id != null)) | length')" = "1" ] ||
+  fail "CLI --preview must write nothing, got $STDOUT"
+run 0 env MESA_DB="$MESA_DB_7" "$MESA" library show keep-note
+[ "$(jqs .body)" = "local keep" ] || fail "CLI --preview must leave the body untouched"
+run 2 env MESA_DB="$MESA_DB_7" "$MESA" library import "$TMP/preview-bundle.json" --preview --quiet
+[ "$(jqe .error.code)" = "usage" ] || fail "--quiet on library import --preview: code=usage"
+ok "CLI library import --preview: reports the rows, writes nothing, and still refuses --quiet"
+
 echo "== library-check: section 10 (import/export) passed ($CHECKS checks so far) =="
 
 # ================= 11. hook registration (mesa task 1115) =================

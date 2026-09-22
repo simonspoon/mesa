@@ -10507,12 +10507,19 @@ button:focus-visible,
   white-space: nowrap;
 }
 
-.library-sync-status-both-changed {
+.library-sync-status-both-changed,
+/* The import preview's own conflict (mesa task 1292) — the same word and the
+   same red, since it is the same thing: two bodies and a pick. */
+.library-sync-status-conflict {
   color: var(--red);
   border-color: rgba(255, 59, 92, 0.5);
 }
 
-.library-sync-status-disk-new {
+.library-sync-status-disk-new,
+/* An import preview's `unresolvable` — like an unfamiliar file, it is a row
+   that needs a person's attention but is not the two-bodies conflict red is
+   for. */
+.library-sync-status-unresolvable {
   color: var(--amber);
   border-color: rgba(255, 180, 68, 0.5);
 }
@@ -10520,7 +10527,11 @@ button:focus-visible,
 .library-sync-status-mesa-changed,
 .library-sync-status-disk-changed,
 .library-sync-status-mesa-new,
-.library-sync-status-disk-deleted {
+.library-sync-status-disk-deleted,
+/* An import preview's `new` — one side exists, like a `mesa-new` row. Its
+   `identical` keeps the plain badge shell: nothing happened, and nothing to
+   colour. */
+.library-sync-status-new {
   color: var(--cyan);
 }
 

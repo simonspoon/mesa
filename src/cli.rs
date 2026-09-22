@@ -155,6 +155,18 @@ enum Command {
         /// can run code via the Agents or Terminal tabs.
         #[arg(long, default_value_t = false)]
         lan: bool,
+        /// Under --lan, also trust this exact hostname in the Host header, so
+        /// you can browse the UI by name (--allow-host naru.local) instead of
+        /// by an IP your router keeps reassigning. Repeatable; only meaningful
+        /// with --lan. It is an allowlist rather than an off switch because
+        /// the check it widens is the DNS-rebinding defense, and a rebound
+        /// page can only ever send *its own* DNS name — naming the handful of
+        /// names you trust leaves that defense standing for every other name.
+        /// Matched case-insensitively and in full, on the serve port:
+        /// naru.local admits neither evil-naru.local nor naru.local.evil.com.
+        /// Preserved across the web UI's Restart Server action.
+        #[arg(long, value_name = "HOSTNAME")]
+        allow_host: Vec<String>,
         /// Periodically check every project for an actionable todo task and
         /// auto-start a background `claude` agent on it (default prompt:
         /// `/execute-mesa-task <task-id>`, configurable in
@@ -3846,11 +3858,20 @@ fn execute(command: Command) -> Result<()> {
         Command::Serve {
             port,
             lan,
+            allow_host,
             watch_todo,
             watch_inbox,
             watch_cost,
             watch_retro,
-        } => crate::api::serve(port, lan, watch_todo, watch_inbox, watch_cost, watch_retro),
+        } => crate::api::serve(
+            port,
+            lan,
+            allow_host,
+            watch_todo,
+            watch_inbox,
+            watch_cost,
+            watch_retro,
+        ),
 
         Command::System => {
             print_json(&system::snapshot());

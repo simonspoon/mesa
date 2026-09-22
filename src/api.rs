@@ -69,6 +69,12 @@ struct AppState {
     store: Arc<Mutex<Store>>,
     port: u16,
     lan: bool,
+    /// The hostnames `--allow-host` named, trimmed and lowercased once at
+    /// startup. Under `--lan` these are the DNS-name Hosts
+    /// `require_lan_agent_host` accepts alongside `localhost` and the IP
+    /// literals — an exact, opt-in widening of the rebinding defense, empty
+    /// unless the person asked for it. Nothing in default mode reads it.
+    allow_hosts: Arc<[String]>,
     /// CC Dashboard cache, keyed by window. Each entry pairs the db-derived
     /// `cc_stamp` (persisted cc row counts) seen when it was built with the
     /// dashboard; a request re-aggregates only when the stamp moved — i.e.
@@ -1647,7 +1653,12 @@ fn forget_dispatch(state: &AppState, job_id: &str) {
 
 /// Opens the default store and serves the API, blocking until the process is
 /// killed. Binds 127.0.0.1 by default; with `lan`, binds 0.0.0.0 so other
-/// devices on the local network can reach it (no auth — see `serve --help`).
+/// devices on the local network can reach it (no auth — see `serve --help`),
+/// and `allow_hosts` (`--allow-host <name>`, repeatable, only meaningful with
+/// `lan`) names the exact DNS hostnames the agent gate's rebinding defense
+/// should accept besides `localhost` and the IP literals — see
+/// [`require_lan_agent_host`]. It is propagated across the web UI's Restart
+/// Server action like the flags below.
 /// `watch_todo` starts the periodic todo-watcher (see [`todo_watcher_tick`]),
 /// `watch_inbox` the periodic inbox-watcher (see [`inbox_watcher_tick`]) and
 /// `watch_retro` the scheduled retrospective (see [`retro_watcher_tick`]);
@@ -1657,6 +1668,7 @@ fn forget_dispatch(state: &AppState, job_id: &str) {
 pub fn serve(
     port: u16,
     lan: bool,
+    allow_hosts: Vec<String>,
     watch_todo: bool,
     watch_inbox: bool,
     watch_cost: bool,
@@ -1665,10 +1677,20 @@ pub fn serve(
     let store = Store::open_default()?;
     let restart_requested = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Normalize the `--allow-host` names once here rather than per request:
+    // DNS is case-insensitive, and a name that trims to nothing was never a
+    // name. The comparison stays case-insensitive anyway, so this is only to
+    // keep what the relaunched argv carries identical to what is matched.
+    let allow_hosts: Arc<[String]> = allow_hosts
+        .iter()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         port,
         lan,
+        allow_hosts: allow_hosts.clone(),
         cc_cache: Arc::new(Mutex::new(HashMap::new())),
         project_cc_cache: Arc::new(Mutex::new(HashMap::new())),
         usage_cache: Arc::new(Mutex::new(None)),
@@ -1802,6 +1824,10 @@ pub fn serve(
         let mut args = vec!["serve".to_string(), "--port".to_string(), port.to_string()];
         if lan {
             args.push("--lan".to_string());
+        }
+        for host in allow_hosts.iter() {
+            args.push("--allow-host".to_string());
+            args.push(host.clone());
         }
         if watch_todo {
             args.push("--watch-todo".to_string());
@@ -7363,10 +7389,11 @@ fn require_local_host(headers: &HeaderMap, port: u16) -> Result<(), ApiError> {
 /// `--lan` mode: LAN peers are allowed (the opt-in "trust every device on the
 /// LAN" posture now includes the terminal, so the web UI works from another
 /// machine), but the browser-as-confused-deputy holes stay closed:
-/// - DNS rebinding: `require_lan_agent_host` — the Host must be `localhost` or
-///   an IP literal on the serve port. A rebound page's requests carry its own
-///   DNS hostname in Host (that's the name the browser resolved), never an IP
-///   literal, so this refuses it without needing to enumerate LAN addresses.
+/// - DNS rebinding: `require_lan_agent_host` — the Host must be `localhost`,
+///   an IP literal, or one of the exact hostnames `--allow-host` named, on the
+///   serve port. A rebound page's requests carry its own DNS hostname in Host
+///   (that's the name the browser resolved), never an IP literal, so this
+///   refuses it without needing to enumerate LAN addresses.
 /// - Cross-site fetch/WebSocket: `require_origin_matches_host` — a browser
 ///   Origin must be local or exactly the host the request was addressed to.
 fn require_agent_access(
@@ -7375,7 +7402,7 @@ fn require_agent_access(
     headers: &HeaderMap,
 ) -> Result<(), ApiError> {
     if state.lan {
-        return require_lan_page_access(addr, headers, state.port);
+        return require_lan_page_access(addr, headers, state.port, &state.allow_hosts);
     }
     require_loopback(addr)?;
     require_local_host(headers, state.port)?;
@@ -7396,8 +7423,9 @@ fn require_lan_page_access(
     addr: &SocketAddr,
     headers: &HeaderMap,
     port: u16,
+    allow_hosts: &[String],
 ) -> Result<(), ApiError> {
-    require_lan_agent_host(headers, port)?;
+    require_lan_agent_host(headers, port, allow_hosts)?;
     require_origin_matches_host(addr, headers)?;
     Ok(())
 }
@@ -7408,7 +7436,20 @@ fn require_lan_page_access(
 /// DNS-name Hosts (the only kind a rebinding page can send). The port must be
 /// ours: an IP Host on a foreign port is some other service's origin, not a
 /// page this server handed out.
-fn require_lan_agent_host(headers: &HeaderMap, port: u16) -> Result<(), ApiError> {
+///
+/// `serve --lan --allow-host <name>` widens that by exact name and never by
+/// rule, because the person whose router keeps reassigning the machine's IP
+/// needs to browse by name: a rebound page can only ever send *its own* DNS
+/// name, so naming the handful of names the person trusts leaves the defense
+/// standing for every other name. The match is case-insensitive (DNS is) and
+/// over the whole host portion — `naru.local` admits neither
+/// `evil-naru.local` nor `naru.local.evil.com` — and still pinned to our
+/// port, for the same reason an IP Host is.
+fn require_lan_agent_host(
+    headers: &HeaderMap,
+    port: u16,
+    allow_hosts: &[String],
+) -> Result<(), ApiError> {
     let host = headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -7438,13 +7479,28 @@ fn require_lan_agent_host(headers: &HeaderMap, port: u16) -> Result<(), ApiError
             return Ok(());
         }
     }
+    // A name the person named with `--allow-host`, on our port — or portless
+    // on 80, where the browser omits the default port from a name exactly as
+    // it does from the forms above.
+    if !allow_hosts.is_empty() {
+        let name = match host.rsplit_once(':') {
+            Some((name, p)) => (p.parse::<u16>().ok() == Some(port)).then_some(name),
+            None => (port == 80).then_some(host),
+        };
+        if let Some(name) = name
+            && allow_hosts.iter().any(|a| a.eq_ignore_ascii_case(name))
+        {
+            return Ok(());
+        }
+    }
     Err(ApiError {
         status: StatusCode::FORBIDDEN,
         code: "validation",
         message: format!(
             "rejected Host {host:?}: this endpoint under --lan requires localhost:{port} or an \
              IP-literal host on port {port} (DNS-rebinding defense) — browse the UI by IP, e.g. \
-             http://<machine-ip>:{port}"
+             http://<machine-ip>:{port}, or start the server with --lan --allow-host <name> to \
+             trust that exact hostname"
         ),
     })
 }
@@ -9207,25 +9263,82 @@ mod tests {
 
     #[test]
     fn lan_host_accepts_localhost_and_ip_literals_on_our_port() {
-        assert!(require_lan_agent_host(&hdrs(Some("localhost:7770"), None), 7770).is_ok());
-        assert!(require_lan_agent_host(&hdrs(Some("192.168.1.50:7770"), None), 7770).is_ok());
-        assert!(require_lan_agent_host(&hdrs(Some("[::1]:7770"), None), 7770).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("localhost:7770"), None), 7770, &[]).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("192.168.1.50:7770"), None), 7770, &[]).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("[::1]:7770"), None), 7770, &[]).is_ok());
     }
 
     #[test]
     fn lan_host_rejects_dns_names_and_foreign_ports() {
         // A DNS-name Host is the only shape a rebinding page can send.
-        assert!(require_lan_agent_host(&hdrs(Some("evil.example"), None), 7770).is_err());
-        assert!(require_lan_agent_host(&hdrs(Some("evil.example:7770"), None), 7770).is_err());
-        assert!(require_lan_agent_host(&hdrs(Some("192.168.1.50:999"), None), 7770).is_err());
+        assert!(require_lan_agent_host(&hdrs(Some("evil.example"), None), 7770, &[]).is_err());
+        assert!(require_lan_agent_host(&hdrs(Some("evil.example:7770"), None), 7770, &[]).is_err());
+        assert!(require_lan_agent_host(&hdrs(Some("192.168.1.50:999"), None), 7770, &[]).is_err());
     }
 
     #[test]
     fn lan_host_port_80_accepts_portless_forms_but_not_dns_names() {
-        assert!(require_lan_agent_host(&hdrs(Some("localhost"), None), 80).is_ok());
-        assert!(require_lan_agent_host(&hdrs(Some("192.168.1.50"), None), 80).is_ok());
-        assert!(require_lan_agent_host(&hdrs(Some("[::1]"), None), 80).is_ok());
-        assert!(require_lan_agent_host(&hdrs(Some("evil.example"), None), 80).is_err());
+        assert!(require_lan_agent_host(&hdrs(Some("localhost"), None), 80, &[]).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("192.168.1.50"), None), 80, &[]).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("[::1]"), None), 80, &[]).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("evil.example"), None), 80, &[]).is_err());
+    }
+
+    /// `--allow-host` (mesa task 1294): the names the person named are
+    /// accepted on our port, and the widening stops there. The near misses are
+    /// the whole point of matching the host portion in full — a suffix or
+    /// substring rule would hand `naru.local` to anyone who can register
+    /// `evil-naru.local` or serve `naru.local.evil.com`.
+    #[test]
+    fn lan_host_accepts_only_the_exact_allowlisted_names() {
+        let allow = [String::from("naru.local"), String::from("naru.home")];
+        assert!(require_lan_agent_host(&hdrs(Some("naru.local:7770"), None), 7770, &allow).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("naru.home:7770"), None), 7770, &allow).is_ok());
+        // DNS is case-insensitive, so the Host a browser sends may not be the
+        // case the person typed on the command line.
+        assert!(require_lan_agent_host(&hdrs(Some("NARU.Local:7770"), None), 7770, &allow).is_ok());
+        // Our port only — an allowlisted name on a foreign port is some other
+        // service's origin, exactly as it is for an IP literal.
+        assert!(require_lan_agent_host(&hdrs(Some("naru.local:999"), None), 7770, &allow).is_err());
+        // A name nobody allowlisted is refused as before.
+        assert!(
+            require_lan_agent_host(&hdrs(Some("evil.example:7770"), None), 7770, &allow).is_err()
+        );
+        // Near misses: neither a prefix, a suffix nor a substring is a match.
+        assert!(
+            require_lan_agent_host(&hdrs(Some("evil-naru.local:7770"), None), 7770, &allow)
+                .is_err()
+        );
+        assert!(
+            require_lan_agent_host(&hdrs(Some("naru.local.evil.com:7770"), None), 7770, &allow)
+                .is_err()
+        );
+        assert!(require_lan_agent_host(&hdrs(Some("naru.loca:7770"), None), 7770, &allow).is_err());
+    }
+
+    /// On port 80 a browser omits the port from an allowlisted name too, so
+    /// the portless branch has to cover it — and only it.
+    #[test]
+    fn lan_host_port_80_accepts_a_portless_allowlisted_name() {
+        let allow = [String::from("naru.local")];
+        assert!(require_lan_agent_host(&hdrs(Some("naru.local"), None), 80, &allow).is_ok());
+        assert!(require_lan_agent_host(&hdrs(Some("evil.example"), None), 80, &allow).is_err());
+        // Portless is a port-80 affair: on any other port the name must carry
+        // ours, so the bare name is not a Host this server handed out.
+        assert!(require_lan_agent_host(&hdrs(Some("naru.local"), None), 7770, &allow).is_err());
+    }
+
+    /// An empty allowlist — every server that was not started with the flag —
+    /// is byte-identical to the behaviour before it existed.
+    #[test]
+    fn lan_host_with_an_empty_allowlist_is_unchanged() {
+        let none: [String; 0] = [];
+        assert!(require_lan_agent_host(&hdrs(Some("naru.local:7770"), None), 7770, &none).is_err());
+        assert!(require_lan_agent_host(&hdrs(Some("naru.local"), None), 80, &none).is_err());
+        assert!(require_lan_agent_host(&hdrs(Some("localhost:7770"), None), 7770, &none).is_ok());
+        assert!(
+            require_lan_agent_host(&hdrs(Some("192.168.1.50:7770"), None), 7770, &none).is_ok()
+        );
     }
 
     #[test]
@@ -9253,7 +9366,7 @@ mod tests {
         // localhost:* page, addressing the server by IP. Must NOT pass.
         let h = hdrs(Some("192.168.1.50:7770"), Some("http://localhost:3000"));
         assert!(require_origin_matches_host(&lan_peer(), &h).is_err());
-        assert!(require_lan_page_access(&lan_peer(), &h, 7770).is_err());
+        assert!(require_lan_page_access(&lan_peer(), &h, 7770, &[]).is_err());
     }
 
     #[test]
@@ -9266,9 +9379,9 @@ mod tests {
     #[test]
     fn lan_page_access_allows_legit_remote_and_local_pages() {
         let remote = hdrs(Some("192.168.1.50:7770"), Some("http://192.168.1.50:7770"));
-        assert!(require_lan_page_access(&lan_peer(), &remote, 7770).is_ok());
+        assert!(require_lan_page_access(&lan_peer(), &remote, 7770, &[]).is_ok());
         let dev = hdrs(Some("127.0.0.1:7770"), Some("http://localhost:5173"));
-        assert!(require_lan_page_access(&loopback(), &dev, 7770).is_ok());
+        assert!(require_lan_page_access(&loopback(), &dev, 7770, &[]).is_ok());
     }
 
     // --- Files tab: GET /files and /files/content (mesa task 279) ---------
@@ -9283,6 +9396,7 @@ mod tests {
             store: Arc::new(Mutex::new(store)),
             port: 0,
             lan: false,
+            allow_hosts: Arc::from(Vec::new()),
             cc_cache: Arc::new(Mutex::new(HashMap::new())),
             project_cc_cache: Arc::new(Mutex::new(HashMap::new())),
             usage_cache: Arc::new(Mutex::new(None)),

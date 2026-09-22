@@ -112,7 +112,10 @@ a different tool yields sessions the sidebar can't list or attach to.
     `localhost:<port>` or an IP-literal on the serve port (plus the portless
     forms browsers send when the port is 80), which kills DNS rebinding without
     enumerating LAN addresses (a rebound page's requests carry its own DNS
-    hostname, never an IP literal; browse the UI by IP from remote machines) —
+    hostname, never an IP literal; browse the UI by IP from remote machines, or
+    start the server with `--lan --allow-host <name>` to trust that exact
+    hostname too — repeatable, matched case-insensitively and in full, on the
+    serve port, so every *other* DNS name stays refused) —
     **then** `require_origin_matches_host` — a browser Origin must exactly match
     that vetted Host, **or** be a local page (embedded UI / vite dev) from a
     **loopback peer**. The loopback scope on the local-page allowance is

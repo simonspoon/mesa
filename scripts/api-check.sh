@@ -37,8 +37,10 @@
 #      all when it is blank, and a name shaped like an option refused before
 #      anything is spawned;
 #   6. LAN mode — the Host allowlist is skipped while the Content-Type gate
-#      still applies, the two halves of one posture (CLAUDE.md), and the speak
-#      route keeps its stronger gate through the flip.
+#      still applies, the two halves of one posture (CLAUDE.md), the speak
+#      route keeps its stronger gate through the flip, and `--allow-host`
+#      (task 1294) serves exactly the DNS name it was given while every other
+#      name, near miss and foreign port stays 403.
 #
 # Attachment routes have their own gate (scripts/attachments-check.sh); the
 # agents/terminal/hook routes have theirs (agents-check.sh, hooks-check.sh).
@@ -1188,6 +1190,48 @@ speak "/api/config/speech/preview?voice=af_heart" -H "Host: evil.example"
 speak "/api/config/speech/preview?voice=af_heart" -H "Host: 127.0.0.1:$LAN_PORT"
 [ "$STATUS" = "200" ] || fail "--lan preview: an IP-literal Host must be served, got $STATUS"
 ok "--lan: the voice preview keeps the agent gate too"
+
+kill "$LAN_PID" 2>/dev/null || true
+wait "$LAN_PID" 2>/dev/null || true
+LAN_PID=
+
+# ---- --lan --allow-host <name> (mesa task 1294) ----
+#
+# The rebinding defense above refuses every DNS-name Host, which is why the
+# person whose router keeps reassigning the machine's IP cannot browse by
+# name. `--allow-host` widens it by *exact name* and nothing else: the name
+# the person named is served, every other name is refused exactly as before.
+
+ALLOW_PORT=17777
+ALLOW_BASE="http://127.0.0.1:$ALLOW_PORT"
+"$MESA" serve --lan --allow-host naru.local --port "$ALLOW_PORT" \
+  >"$TMP/allow.log" 2>&1 &
+LAN_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "$ALLOW_BASE/api/projects" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+curl -sf "$ALLOW_BASE/api/projects" >/dev/null ||
+  fail "allow-host server did not start (log: $(cat "$TMP/allow.log"))"
+
+BASE=$ALLOW_BASE
+
+speak "/api/inbox/$SPEAK_ID/speak" -H "Host: naru.local:$ALLOW_PORT"
+[ "$STATUS" = "200" ] || fail "--allow-host: the named host must be served, got $STATUS"
+grep -qi '^content-type: audio/wav' "$TMP/headers" || fail "--allow-host: Content-Type"
+speak "/api/inbox/$SPEAK_ID/speak" -H "Host: NARU.local:$ALLOW_PORT"
+[ "$STATUS" = "200" ] || fail "--allow-host: DNS is case-insensitive, got $STATUS"
+speak "/api/inbox/$SPEAK_ID/speak" -H "Host: evil.example:$ALLOW_PORT"
+[ "$STATUS" = "403" ] || fail "--allow-host: an unlisted name must still be 403, got $STATUS"
+speak "/api/inbox/$SPEAK_ID/speak" -H "Host: evil-naru.local:$ALLOW_PORT"
+[ "$STATUS" = "403" ] || fail "--allow-host: a near-miss prefix must be 403, got $STATUS"
+speak "/api/inbox/$SPEAK_ID/speak" -H "Host: naru.local.evil.com:$ALLOW_PORT"
+[ "$STATUS" = "403" ] || fail "--allow-host: a near-miss suffix must be 403, got $STATUS"
+speak "/api/inbox/$SPEAK_ID/speak" -H "Host: naru.local:999"
+[ "$STATUS" = "403" ] || fail "--allow-host: the named host on a foreign port must be 403, got $STATUS"
+speak "/api/inbox/$SPEAK_ID/speak" -H "Host: 127.0.0.1:$ALLOW_PORT"
+[ "$STATUS" = "200" ] || fail "--allow-host: an IP-literal Host must still be served, got $STATUS"
+ok "--lan --allow-host: the named host is served; every other name, near miss and foreign port is 403"
 
 kill "$LAN_PID" 2>/dev/null || true
 wait "$LAN_PID" 2>/dev/null || true

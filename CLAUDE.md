@@ -42,7 +42,7 @@ isolation.
 | Script | Gates | Extra env |
 | --- | --- | --- |
 | `cli-check` | CLI JSON contract: create→list→block→cycle→delete→backup. Never speaks HTTP | |
-| `api-check` | Task routes over a live `serve`: CRUD, derived `blocked`, block/cycle, claim/release, archived scoping, **both** halves of the security boundary in default *and* `--lan`, plus `/api/inbox/{id}/speak` (audio contract, patched WAV sizes, the header arriving mid-render, injection-proof body, `require_agent_access` in both modes) | `MESA_KOKORO_BIN` (stub) |
+| `api-check` | Task routes over a live `serve`: CRUD, derived `blocked`, block/cycle, claim/release, archived scoping, **both** halves of the security boundary in default *and* `--lan` (including `--allow-host`, mesa task 1294: the named DNS host served, an unlisted name, a near miss and a foreign port each still 403), plus `/api/inbox/{id}/speak` (audio contract, patched WAV sizes, the header arriving mid-render, injection-proof body, `require_agent_access` in both modes) | `MESA_KOKORO_BIN` (stub) |
 | `auris-check` | `POST /api/live/transcribe` (`src/core/listen.rs`), the input-direction mirror of the speak routes above: a missing binary is 503 `unavailable`; a recording reaches auris on stdin byte-identical to what was sent, never as an argument, argv exactly `-q --format json`; auris's JSON-Lines contract (the LAST `transcript` line wins, an unrecognised `type` is ignored rather than aborting); a failing run and one with no `transcript` line are both `unavailable`, never a silent empty 200; **injection-proof transcript** (`$()`, backticks, quotes, a literal `\n` escape and JSON-shaped text come back byte-identical, never expanded or re-parsed) and a noisy stderr on a *successful* run neither hanging the request nor leaking into the text; a body one byte over `LIVE_AUDIO_MAX` is 413 `validation` naming the limit and still JSON, distinct from 422 for invalid/empty/missing base64; both halves of the security boundary in default mode; **`GET /api/live/transcribe`** (mesa task 957) answers `{"available": bool}` off the same `!listen::models().is_empty()` signal, `true`/`false` for a working/missing stub, never an error; and under `--lan` **both** verbs on the route are **present and gated**, not absent — a LAN POST reaches the stub auris, the GET answers `available`, the Content-Type gate still fires | `MESA_AURIS_BIN` (stub) |
 | `diagram-check` | Board/frame/edge CRUD, cascade, history | |
 | `concurrent-check` | 20 interleaved CLI + API writes on one db | |
@@ -207,7 +207,14 @@ The code is the source of truth. These are the invariants you must not break:
     not `localhost:<port>`/`127.0.0.1:<port>`. Enforced in default mode (bind
     127.0.0.1); **skipped** under `--lan` (bind 0.0.0.0), an opt-in, no-auth
     "trust every device on the LAN" choice. The flag flips bind + Host policy
-    together (`AppState.lan`) — two halves of one posture.
+    together (`AppState.lan`) — two halves of one posture. The *agent* routes
+    keep their own, stricter Host check under `--lan`
+    (`require_lan_agent_host`: `localhost`/an IP literal on the serve port),
+    and `--allow-host <name>` (repeatable, `--lan` only) adds exactly the
+    hostnames the person trusts to it — an allowlist rather than an off
+    switch, because a rebound page can only send its own DNS name, matched
+    case-insensitively and in full on our port, so `naru.local` admits
+    neither `evil-naru.local` nor `naru.local.evil.com`.
   - **Content-Type gate** (cross-site form posts) — requires
     `Content-Type: application/json` on mutating methods, in **both** modes.
 

@@ -893,7 +893,8 @@ What that gate means, per mode:
   the network reaches the library, so the Library page actually works from
   the phone or tablet `--lan` exists to serve. Both confused-deputy defenses
   stay shut — `require_lan_agent_host` (the `Host` must be `localhost` or an
-  IP literal on our port, so a DNS-rebinding page is refused) and
+  IP literal on our port — or one of the exact hostnames `serve --lan
+  --allow-host <name>` named — so a DNS-rebinding page is refused) and
   `require_origin_matches_host` (a browser `Origin` must equal that vetted
   `Host`). The Content-Type gate on mutations is unchanged in both modes.
   Neither defense is authentication, and neither is claimed to be: they stop

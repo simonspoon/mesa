@@ -23,6 +23,8 @@
 # (product|never — `never` makes nodecay touch every entry at each start),
 # MESA_EVAL_SOURCE_DB (the person's db, copied once to <out>/real.db).
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 EVAL_DIR=$(cd "$(dirname "$0")" && pwd); export EVAL_DIR
 ROOT=$(cd "$EVAL_DIR/../.." && pwd)
 # shellcheck source=lib.sh
@@ -168,7 +170,10 @@ cmd_setup() {
   done
   [ "$dream_every" -ge 1 ] 2>/dev/null || die "--dream-every must be a whole number of sessions, 1 or more"
   if [ ! -f "$REAL_DB" ]; then
-    local src="${MESA_EVAL_SOURCE_DB:-$HOME/Library/Application Support/mesa/mesa.db}"
+    # Naru's own default (mesa task 1301): naru.db when it exists, else mesa.db.
+    local src="$HOME/Library/Application Support/naru/naru.db"
+    [ -f "$src" ] || src="$HOME/Library/Application Support/mesa/mesa.db"
+    src="${MESA_EVAL_SOURCE_DB:-$src}"
     cp "$src" "$REAL_DB"; rm -f "$REAL_DB-wal" "$REAL_DB-shm"
   fi
   if [ -f "$STATE" ] && [ "$fresh" = 0 ]; then

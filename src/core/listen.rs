@@ -32,7 +32,7 @@ use crate::core::speech::{drain_capped, list_names};
 /// end-to-end checks drive this route against a stub instead of a real
 /// recognizer.
 pub fn auris_bin() -> String {
-    std::env::var("MESA_AURIS_BIN").unwrap_or_else(|_| "auris".to_string())
+    crate::core::env::var("AURIS_BIN").unwrap_or_else(|| "auris".to_string())
 }
 
 /// The most models [`models`] will report. auris ships exactly one today

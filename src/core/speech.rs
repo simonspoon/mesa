@@ -165,7 +165,7 @@ const STREAM_DATA_LEN: u32 = 0x7fff_0000;
 /// as `agents::claude_bin`, and how `api-check.sh` drives this route against a
 /// stub instead of a real 45 KB/second synthesiser.
 pub fn kokoro_bin() -> String {
-    std::env::var("MESA_KOKORO_BIN").unwrap_or_else(|_| "kokoro-rs".to_string())
+    crate::core::env::var("KOKORO_BIN").unwrap_or_else(|| "kokoro-rs".to_string())
 }
 
 /// The most voices [`voices`] will report. `kokoro-rs` ships ~54; the bound is

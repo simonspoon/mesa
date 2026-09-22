@@ -309,25 +309,43 @@ pub fn default_command(action: &str) -> Option<&'static str> {
     }
 }
 
-/// `MESA_CONFIG_FILE` if set (the test seam, mirroring `MESA_HOOKS_FILE`),
-/// else `~/.mesa/config.json`. `~/.mesa` may also be the JSON file itself —
-/// accepted because "a config in ~/.mesa" reads both ways, and a user who
-/// wrote one file shouldn't get silent no-ops.
+/// `NARU_CONFIG_FILE` / `MESA_CONFIG_FILE` if set (the test seam, mirroring
+/// `MESA_HOOKS_FILE`), else `config.json` in Naru's home directory
+/// ([`dot_dir_in`]: `~/.naru`, or `~/.mesa` on an install that predates the
+/// rename). That directory may also be the JSON file itself — accepted
+/// because "a config in ~/.mesa" reads both ways, and a user who wrote one
+/// file shouldn't get silent no-ops.
 pub fn config_file() -> PathBuf {
-    if let Ok(p) = std::env::var("MESA_CONFIG_FILE") {
+    if let Some(p) = crate::core::env::var("CONFIG_FILE") {
         return PathBuf::from(p);
     }
     let home = directories::BaseDirs::new()
         .map(|d| d.home_dir().to_path_buf())
         .unwrap_or_default();
-    let dot = home.join(".mesa");
+    let dot = dot_dir_in(&home);
     if dot.is_file() {
         return dot;
     }
     dot.join("config.json")
 }
 
-/// `~/.mesa/workspace`, created on demand — the working directory for every
+/// Naru's home directory under `home` (mesa task 1301): `.naru` when it
+/// exists, else `.mesa` when *it* exists (an install from before the rename,
+/// file or directory), else `.naru` (a fresh install). Nothing is moved —
+/// an existing `~/.mesa` simply stays the one in use. The config file, the
+/// workspace and `mesa migrate`'s config item all resolve through this.
+pub fn dot_dir_in(home: &Path) -> PathBuf {
+    let new = home.join(".naru");
+    let old = home.join(".mesa");
+    if !new.exists() && old.exists() {
+        old
+    } else {
+        new
+    }
+}
+
+/// `~/.naru/workspace` (or `~/.mesa/workspace`, whichever [`dot_dir_in`]
+/// picks), created on demand — the working directory for every
 /// agent or shell mesa runs that is **not** bound to a project (the live
 /// agent and its summary agent, an inbox-watcher dispatch, an unbound script,
 /// the global Terminal page, the `claude attach` client).
@@ -352,7 +370,7 @@ pub fn workspace_dir() -> PathBuf {
 /// The body of [`workspace_dir`], taking `home` explicitly so it is testable
 /// without touching process-wide env.
 fn workspace_in(home: &Path) -> PathBuf {
-    let dir = home.join(".mesa").join("workspace");
+    let dir = dot_dir_in(home).join("workspace");
     match std::fs::create_dir_all(&dir) {
         Ok(()) => dir,
         Err(_) => home.to_path_buf(),
@@ -3219,7 +3237,7 @@ mod tests {
     #[test]
     fn the_workspace_folder_is_created_on_demand_and_is_idempotent() {
         let home = tempfile::tempdir().unwrap();
-        let want = home.path().join(".mesa").join("workspace");
+        let want = home.path().join(".naru").join("workspace");
 
         let first = workspace_in(home.path());
         assert_eq!(first, want);
@@ -3228,6 +3246,34 @@ mod tests {
         let second = workspace_in(home.path());
         assert_eq!(second, want);
         assert!(want.is_dir());
+    }
+
+    /// The rename's home-directory rule (mesa task 1301): `.naru` if it
+    /// exists, else `.mesa` if it exists (dir or file), else `.naru` — and the
+    /// workspace follows whichever is chosen.
+    #[test]
+    fn the_config_dir_prefers_naru_and_falls_back_to_mesa() {
+        let home = tempfile::tempdir().unwrap();
+        let (naru, mesa) = (home.path().join(".naru"), home.path().join(".mesa"));
+
+        // Neither: a fresh install gets .naru.
+        assert_eq!(dot_dir_in(home.path()), naru);
+
+        // Only .mesa, as a directory: the old install keeps it, workspace too.
+        std::fs::create_dir(&mesa).unwrap();
+        assert_eq!(dot_dir_in(home.path()), mesa);
+        assert_eq!(workspace_in(home.path()), mesa.join("workspace"));
+        assert!(!naru.exists(), "nothing may be created under .naru");
+
+        // Only .mesa, as the config file itself: still chosen.
+        std::fs::remove_dir_all(&mesa).unwrap();
+        std::fs::write(&mesa, "{}").unwrap();
+        assert_eq!(dot_dir_in(home.path()), mesa);
+
+        // Both: .naru wins.
+        std::fs::create_dir(&naru).unwrap();
+        assert_eq!(dot_dir_in(home.path()), naru);
+        assert_eq!(workspace_in(home.path()), naru.join("workspace"));
     }
 
     // ---- guard (mesa task 1018) ------------------------------------------

@@ -24,7 +24,7 @@ const OUTPUT_CAP: usize = 64 * 1024;
 /// `MESA_HOOKS_FILE` if set, else `hooks.json` in the same directory as the
 /// resolved database.
 pub fn hooks_file() -> PathBuf {
-    if let Ok(p) = std::env::var("MESA_HOOKS_FILE") {
+    if let Some(p) = crate::core::env::var("HOOKS_FILE") {
         return PathBuf::from(p);
     }
     let mut path = crate::core::default_db_path();
@@ -62,16 +62,21 @@ pub fn run_task_execute(
     project_dir: Option<&str>,
 ) -> Result<HookRun, String> {
     let payload = serde_json::to_string(task).map_err(|e| format!("task encode: {e}"))?;
+    let db = crate::core::default_db_path().display().to_string();
+    // Each value under both spellings (mesa task 1301): `NARU_*` for new
+    // hooks, `MESA_*` so an existing hook script keeps working.
     let env = [
+        ("NARU_TASK_ID", task.id.to_string()),
         ("MESA_TASK_ID", task.id.to_string()),
+        ("NARU_TASK_NAME", task.name.clone()),
         ("MESA_TASK_NAME", task.name.clone()),
+        ("NARU_PROJECT_ID", task.project_id.to_string()),
         ("MESA_PROJECT_ID", task.project_id.to_string()),
-        // Explicit so a hook driving `mesa` itself hits the same database the
-        // triggering process resolved, even under a MESA_DB override.
-        (
-            "MESA_DB",
-            crate::core::default_db_path().display().to_string(),
-        ),
+        // Explicit so a hook driving `naru` itself hits the same database the
+        // triggering process resolved, even under a NARU_DB/MESA_DB override
+        // (and so an inherited NARU_DB cannot point elsewhere).
+        ("NARU_DB", db.clone()),
+        ("MESA_DB", db),
     ];
     let cwd = project_dir.filter(|d| Path::new(d).is_dir());
     run(TASK_EXECUTE, command, cwd, &env, &payload)
@@ -91,6 +96,7 @@ fn run(
 ) -> Result<HookRun, String> {
     let mut cmd = Command::new("sh");
     cmd.args(["-c", command])
+        .env("NARU_HOOK", hook)
         .env("MESA_HOOK", hook)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -180,14 +186,17 @@ mod tests {
     fn run_captures_output_env_stdin_and_exit() {
         let out = run(
             "test-hook",
-            "cat; echo \"id=$MESA_TASK_ID hook=$MESA_HOOK\"; echo oops >&2; exit 3",
+            "cat; echo \"id=$MESA_TASK_ID hook=$MESA_HOOK/$NARU_HOOK\"; echo oops >&2; exit 3",
             None,
             &[("MESA_TASK_ID", "42".to_string())],
             "{\"payload\":true}",
         )
         .unwrap();
         assert_eq!(out.exit_code, 3);
-        assert_eq!(out.stdout, "{\"payload\":true}id=42 hook=test-hook\n");
+        assert_eq!(
+            out.stdout,
+            "{\"payload\":true}id=42 hook=test-hook/test-hook\n"
+        );
         assert_eq!(out.stderr, "oops\n");
         assert_eq!(out.hook, "test-hook");
     }

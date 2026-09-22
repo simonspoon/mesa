@@ -13,7 +13,7 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024; // 25 MiB
 /// `MESA_DB` / `hooks_file()` convention: SQLite/fs treat `""` as "here",
 /// which would silently misplace files).
 pub fn attachments_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("MESA_ATTACHMENTS_DIR")
+    if let Some(p) = crate::core::env::var("ATTACHMENTS_DIR")
         && !p.is_empty()
     {
         return PathBuf::from(p);

@@ -5,12 +5,14 @@
 # MESA_CLAUDE_BIN) to shrink the tick from 60s down to test speed.
 #
 # HOME is pointed at a throwaway dir for the server process: the inbox-watcher
-# dispatches in $HOME/.mesa/workspace (an inbox item belongs to no project, so
+# dispatches in $HOME/.naru/workspace (an inbox item belongs to no project, so
 # there is no local_path to spawn in), and the stub logs its cwd — asserting
 # against the real home directory would be neither hermetic nor portable. That
 # the folder follows $HOME at all is what proves mesa's home lookup reads the
 # environment, not the passwd entry.
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 
 cd "$(dirname "$0")/.."
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
@@ -107,7 +109,7 @@ mkdir -p "$TMP/home" "$TMP/projA"
 FAKE_HOME=$(cd "$TMP/home" && pwd -P)
 # mesa creates this on demand (mesa task 1040); it deliberately does not exist
 # yet, and the dispatch assertions below are what prove it appears.
-WORKSPACE="$FAKE_HOME/.mesa/workspace"
+WORKSPACE="$FAKE_HOME/.naru/workspace"
 DIR_A=$(cd "$TMP/projA" && pwd -P)
 
 # A project with a real path and an actionable todo task, purely to prove the
@@ -177,8 +179,8 @@ wait_bg_lines 1
 LINE=$(head -1 "$BG_LOG" | cut -d'|' -f1-3)
 EXPECT="$WORKSPACE|inbox $ITEM_1: khora: eval errors on undefined|Triage mesa inbox item $ITEM_1."
 [ "$LINE" = "$EXPECT" ] || fail "expected '$EXPECT', got '$LINE'"
-[ -d "$WORKSPACE" ] || fail "the dispatch folder ~/.mesa/workspace must be created on demand"
-ok "spawn failure releases the claim; the next tick retries and dispatches in ~/.mesa/workspace (created on demand), prompt 'Triage mesa inbox item <id>.', session named 'inbox <id>: <first body line>'"
+[ -d "$WORKSPACE" ] || fail "the dispatch folder ~/.naru/workspace must be created on demand"
+ok "spawn failure releases the claim; the next tick retries and dispatches in ~/.naru/workspace (created on demand), prompt 'Triage mesa inbox item <id>.', session named 'inbox <id>: <first body line>'"
 
 # Triage runs as the `inbox-triage` agent definition (mesa task 1168), which
 # the watcher seeds to ~/.claude/agents/inbox-triage.md before the spawn —

@@ -66,8 +66,9 @@ OUTPUT
   desktop tool, or the browser window it was asked to photograph).
 
 DATABASE
-  Defaults to ~/Library/Application Support/mesa/mesa.db;
-  override with MESA_DB=<path>.
+  Defaults to ~/Library/Application Support/naru/naru.db; an install from
+  before the rename keeps using .../mesa/mesa.db while no naru.db exists.
+  Override with NARU_DB=<path> (MESA_DB=<path> is still honoured).
 
 EXAMPLES
   mesa project create \"Website redesign\" --description \"Q3 marketing site\"
@@ -82,7 +83,7 @@ SECURITY
 
 /// Local-first project management for humans and agents.
 #[derive(Parser)]
-#[command(name = "mesa", version, after_help = TOP_AFTER_HELP)]
+#[command(name = "naru", version, after_help = TOP_AFTER_HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -145,6 +146,8 @@ enum Command {
     /// project's folder (the Agents tab runs `claude` there) or a raw shell in
     /// ~/.mesa/workspace (the Terminal tab), i.e. run code on this machine.
     /// Only use it on networks you trust.
+    ///
+    /// ~/.mesa here is Naru's config dir: ~/.naru if that exists, else ~/.mesa if that exists, else ~/.naru.
     Serve {
         /// Port to bind
         #[arg(long, default_value_t = 7770)]
@@ -888,16 +891,18 @@ EXAMPLES
     /// Fire the task-execute hook for a task; prints the run outcome
     ///
     /// Runs the shell command configured under "task-execute" in the hooks
-    /// file (hooks.json beside the database; MESA_HOOKS_FILE overrides) with
-    /// the full task JSON on stdin, MESA_HOOK/MESA_TASK_ID/MESA_TASK_NAME/
-    /// MESA_PROJECT_ID/MESA_DB in the environment, and the project's
+    /// file (hooks.json beside the database; NARU_HOOKS_FILE or
+    /// MESA_HOOKS_FILE overrides) with the full task JSON on stdin,
+    /// MESA_HOOK/MESA_TASK_ID/MESA_TASK_NAME/MESA_PROJECT_ID/MESA_DB (each
+    /// also as NARU_*) in the environment, and the project's
     /// local_path as the working directory when that folder exists (else the
     /// caller's own cwd is inherited). The hook's own exit code
     /// lands in `exit_code` — a nonzero hook still exits 0 here. No hook
     /// configured is an error (code "validation").
     #[command(after_help = "\
 EXAMPLES
-  echo '{\"task-execute\": \"say \\\"executing task $MESA_TASK_ID\\\"\"}' > ~/'Library/Application Support/mesa/hooks.json'
+  # hooks.json sits beside the db: .../naru/, or .../mesa/ on a pre-rename install
+  echo '{\"task-execute\": \"say \\\"executing task $MESA_TASK_ID\\\"\"}' > ~/'Library/Application Support/naru/hooks.json'
   mesa task execute 3")]
     Execute {
         /// Task id
@@ -1106,7 +1111,7 @@ EXAMPLES
         ///
         /// A bound script runs in that project's `local_path`; a global one
         /// runs in ~/.mesa/workspace. Deleting the project un-binds rather
-        /// than deletes.
+        /// than deletes. ~/.mesa here is Naru's config dir: ~/.naru if that exists, else ~/.mesa if that exists, else ~/.naru.
         #[arg(long)]
         project: Option<String>,
         /// What the script is for; free text
@@ -1212,6 +1217,7 @@ EXAMPLES
     ///
     /// The working directory is the bound project's `local_path`, or
     /// ~/.mesa/workspace for a global script. It is never caller-supplied.
+    /// ~/.mesa here is Naru's config dir: ~/.naru if that exists, else ~/.mesa if that exists, else ~/.naru.
     ///
     /// A value is never interpolated into a string a shell parses: it arrives
     /// as one positional argument and as MESA_ARG_<NAME>. A declared argument
@@ -1695,6 +1701,8 @@ EXAMPLES
     Check,
     /// Bundle the db, ~/.mesa/config.json and ~/.claude into a tar.gz
     ///
+    /// ~/.mesa here is Naru's config dir: ~/.naru if that exists, else ~/.mesa if that exists, else ~/.naru.
+    ///
     /// The db is snapshotted with `VACUUM INTO` (safe while `serve` runs).
     /// From ~/.claude: CLAUDE.md, settings*.json, keybindings.json,
     /// statusline-command.sh, agents/, hooks/, commands/, skills/,
@@ -1758,6 +1766,8 @@ enum RetroCmd {
     /// in ~/.mesa/workspace. If the spawn fails the run row is deleted again
     /// and the command exits 1 with code "unavailable", so the next attempt
     /// is not a `conflict` against a run that never happened.
+    ///
+    /// ~/.mesa here is Naru's config dir: ~/.naru if that exists, else ~/.mesa if that exists, else ~/.naru.
     #[command(after_help = "\
 EXAMPLES
   mesa retro run             # conflict if one ran inside the interval
@@ -1884,6 +1894,8 @@ enum LiveCmd {
     /// session is ENDED again and the command exits 1 with code "unavailable"
     /// — a live session no agent is listening to would be a conversation that
     /// never answers and would block the next `live start` with a `conflict`.
+    ///
+    /// ~/.mesa here is Naru's config dir: ~/.naru if that exists, else ~/.mesa if that exists, else ~/.naru.
     #[command(after_help = "\
 EXAMPLES
   mesa live start                 # global conversation, runs in ~/.mesa/workspace

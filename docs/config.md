@@ -85,7 +85,12 @@ supplies none. It runs in `~/.mesa/workspace`, since a retrospective spans
 every project.
 
 Everything lives in `src/core/config.rs`; `MESA_CONFIG_FILE` overrides the path
-for tests (mirroring `MESA_DB`/`MESA_HOOKS_FILE`). `~/.mesa` may be the JSON
+for tests (mirroring `MESA_DB`/`MESA_HOOKS_FILE`; like every `MESA_*` variable
+it is read as `NARU_CONFIG_FILE` first, mesa task 1301). The directory is
+`~/.naru` if it exists, else `~/.mesa` if it exists (an install from before
+the rename — nothing is moved), else `~/.naru`: `config::dot_dir_in`, which
+the workspace below follows too. `~/.mesa` in the rest of this doc means
+whichever of the two that picks. `~/.mesa` may be the JSON
 file itself instead of a directory — both are accepted, since "a config in
 `~/.mesa`" reads either way and a user who wrote one file shouldn't get a
 silent no-op.

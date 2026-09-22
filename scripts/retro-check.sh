@@ -6,9 +6,11 @@
 # hour down to test speed.
 #
 # HOME is pointed at a throwaway dir for the server process: a retrospective
-# spans every project, so it runs in $HOME/.mesa/workspace, and the stub logs
+# spans every project, so it runs in $HOME/.naru/workspace, and the stub logs
 # its cwd — the inbox-watcher gate's reasoning, and the same hermeticity.
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 
 cd "$(dirname "$0")/.."
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
@@ -80,7 +82,7 @@ export MESA_CLAUDE_BIN="$STUB_DIR/claude"
 mkdir -p "$TMP/home"
 FAKE_HOME=$(cd "$TMP/home" && pwd -P)
 export HOME="$FAKE_HOME"
-WORKSPACE="$FAKE_HOME/.mesa/workspace"
+WORKSPACE="$FAKE_HOME/.naru/workspace"
 
 # ---- fixtures: a task for the inbox item a finding links to ----
 
@@ -275,7 +277,7 @@ grep -q 'haiku' "$AGENT_FILE" && grep -q 'opus' "$AGENT_FILE" && grep -q 'Never 
   fail "the definition must state the model-per-step rule"
 grep -q 'mesa retro finding record' "$AGENT_FILE" || fail "the definition must route findings through the log"
 grep -q -- '--kind change-request --author retro --task' "$AGENT_FILE" || fail "the definition must file through inbox add"
-ok "retro run records a manual run and spawns --agent mesa-retro in ~/.mesa/workspace, named 'mesa retro <id>', with the definition seeded (sonnet, no Edit/Write, model-per-step rule)"
+ok "retro run records a manual run and spawns --agent mesa-retro in ~/.naru/workspace, named 'mesa retro <id>', with the definition seeded (sonnet, no Edit/Write, model-per-step rule)"
 
 # ---- inside the interval: conflict; --force runs anyway ----
 

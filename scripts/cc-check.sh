@@ -15,6 +15,8 @@
 # count above is pinned to the main tree's exact line set and an `is_error`
 # fixture there would red a dozen unrelated assertions.
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 
 cd "$(dirname "$0")/.."
 

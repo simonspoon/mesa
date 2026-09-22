@@ -117,4 +117,4 @@ npm --prefix frontend run build
 cargo clean --release -p mesa
 cargo build --release
 
-echo "ok: target/release/mesa"
+echo "ok: target/release/naru target/release/mesa"

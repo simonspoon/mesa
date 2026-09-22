@@ -248,8 +248,7 @@ struct AppState {
 const WATCH_TODO_TICK: Duration = Duration::from_secs(60);
 
 fn watch_todo_tick() -> Duration {
-    std::env::var("MESA_WATCH_TODO_TICK_MS")
-        .ok()
+    crate::core::env::var("WATCH_TODO_TICK_MS")
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(WATCH_TODO_TICK)
@@ -265,8 +264,7 @@ fn watch_todo_tick() -> Duration {
 const WATCH_TODO_REAP_TICK: Duration = Duration::from_secs(20);
 
 fn watch_todo_reap_tick() -> Duration {
-    std::env::var("MESA_WATCH_TODO_TICK_MS")
-        .ok()
+    crate::core::env::var("WATCH_TODO_TICK_MS")
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(WATCH_TODO_REAP_TICK)
@@ -278,8 +276,7 @@ fn watch_todo_reap_tick() -> Duration {
 const WATCH_INBOX_TICK: Duration = Duration::from_secs(60);
 
 fn watch_inbox_tick() -> Duration {
-    std::env::var("MESA_WATCH_INBOX_TICK_MS")
-        .ok()
+    crate::core::env::var("WATCH_INBOX_TICK_MS")
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(WATCH_INBOX_TICK)
@@ -293,8 +290,7 @@ fn watch_inbox_tick() -> Duration {
 const WATCH_COST_TICK: Duration = Duration::from_secs(60);
 
 fn watch_cost_tick() -> Duration {
-    std::env::var("MESA_WATCH_COST_TICK_MS")
-        .ok()
+    crate::core::env::var("WATCH_COST_TICK_MS")
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(WATCH_COST_TICK)
@@ -308,8 +304,7 @@ fn watch_cost_tick() -> Duration {
 const WATCH_RETRO_TICK: Duration = Duration::from_secs(60 * 60);
 
 fn watch_retro_tick() -> Duration {
-    std::env::var("MESA_WATCH_RETRO_TICK_MS")
-        .ok()
+    crate::core::env::var("WATCH_RETRO_TICK_MS")
         .and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(WATCH_RETRO_TICK)

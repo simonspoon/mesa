@@ -73,7 +73,7 @@ impl RawWindow {
 /// error string on any failure (no token, network down, bad payload).
 pub fn fetch() -> Result<CcUsage, String> {
     let token = token().ok_or("no Claude Code OAuth token found")?;
-    let url = std::env::var("MESA_CC_USAGE_URL").unwrap_or_else(|_| USAGE_URL.to_string());
+    let url = crate::core::env::var("CC_USAGE_URL").unwrap_or_else(|| USAGE_URL.to_string());
 
     // `--fail` makes curl exit non-zero on a 4xx/5xx (e.g. a 401 from an expired
     // token) instead of handing back an error body — which, being all-`Option`,
@@ -152,7 +152,7 @@ fn parse(bytes: &[u8]) -> Result<CcUsage, String> {
 /// macOS Keychain → `~/.claude/.credentials.json`. Returns `None` if none is
 /// available. The env-var forms are bare token strings (not the credentials JSON).
 fn token() -> Option<String> {
-    if let Ok(t) = std::env::var("MESA_CC_TOKEN")
+    if let Some(t) = crate::core::env::var("CC_TOKEN")
         && !t.is_empty()
     {
         return Some(t);

@@ -4,9 +4,13 @@ Naru is a local-first project/task manager with two surfaces over one SQLite
 store: a machine-first JSON CLI (the primary agent surface) and an HTTP API +
 embedded React web UI.
 
-> Naru was formerly called mesa. The CLI binary (`mesa`), the `MESA_*`
-> environment variables, data paths and `mesa task N` references still use
-> `mesa` until the later rename phases.
+> Naru was formerly called mesa. Since mesa task 1301 the binary is `naru`,
+> with `mesa` still installed beside it as the same program; every
+> `MESA_<NAME>` variable is also read as `NARU_<NAME>` (the new spelling
+> first, the old one still honoured); and a fresh install keeps its data in
+> `naru` paths while an existing one keeps using its `mesa` paths. The crate,
+> the `mesa task N` references and most docs still say `mesa` until the later
+> rename phases.
 
 **This file holds only what applies everywhere.** Every feature has a doc in
 `docs/` — read it *before* touching that surface. Do not re-inline a doc's
@@ -15,9 +19,9 @@ contents here.
 ## Commands
 
 ```bash
-scripts/build.sh      # the ONLY supported release build → target/release/mesa
+scripts/build.sh      # the ONLY supported release build → target/release/naru (+ target/release/mesa, the same program)
 scripts/build.sh --verify   # same chain, types checked against the export not git — for an uncommitted tree
-scripts/install.sh    # build.sh + copy onto PATH (PREFIX=/usr/local overrides ~/.local/bin)
+scripts/install.sh    # build.sh + copy naru onto PATH, mesa a symlink to it (PREFIX=/usr/local overrides ~/.local/bin)
 scripts/release.sh <version>  # the whole release ritual: bump Cargo.toml, commit, push main, tag, push tag (--dry-run prints it); needs MESA_ALLOW_PUSH=1
 scripts/worktree-warm.sh    # seed a fresh worktree's target/ from main's (APFS clone + mtime sync); no args warms .claude/worktrees/*, elsewhere pass the path
 ```
@@ -37,8 +41,9 @@ target/release/mesa serve --port 7770        # API + web UI on 127.0.0.1
 MESA_DB=/tmp/t.db target/release/mesa task list
 ```
 
-`MESA_DB` overrides the default db
-(`~/Library/Application Support/mesa/mesa.db`) — used by every check below for
+`MESA_DB` (or `NARU_DB`, read first) overrides the default db
+(`~/Library/Application Support/naru/naru.db`, or `…/mesa/mesa.db` while only
+that one exists — nothing is moved) — used by every check below for
 isolation.
 
 ### End-to-end gates (`scripts/*-check.sh`)
@@ -54,7 +59,7 @@ isolation.
 | `files-check` | Files-tab reads over a live `serve`: content classification, the `/files/raw` image allowlist (real mime + `inline` + `nosniff` + CSP, byte-identical bytes, 422 for a non-image, 404 for a traversal), `/files/download` still octet-stream + `attachment`, `/files/search` (hits grouped by file, excluded/binary files skipped, both toggles, the `?q=` contract), and the read/write gate pairing in default *and* `--lan` | |
 | `agents-check` | `local_path` plumbing + `/api/projects/{id}/agents` | `MESA_CLAUDE_BIN` (stub) |
 | `todo-watcher-check` | `serve --watch-todo` dispatch loop | `MESA_WATCH_TODO_TICK_MS` |
-| `inbox-watcher-check` | `serve --watch-inbox` triage loop (spawns in `$HOME/.mesa/workspace` — use a throwaway `HOME`) | `MESA_WATCH_INBOX_TICK_MS` |
+| `inbox-watcher-check` | `serve --watch-inbox` triage loop (spawns in `$HOME/.naru/workspace` — use a throwaway `HOME`) | `MESA_WATCH_INBOX_TICK_MS` |
 | `hooks-check` | `task-execute` over CLI + API | `MESA_HOOKS_FILE` |
 | `config-check` | The configurable spawn hooks: configured hook drives each, built-in argv unchanged when absent, multi-line hooks (values quoted in at the slot, absent-is-empty, injection-proof in every position, a space-and-quote value arriving as one argument, the `$MESA_*` read-time migration and save-time refusal), plus the Settings page's `GET`/`PUT /api/config`, `.../pricing`, `.../watchers`, `.../speech` and `.../live`, and the `listen` section (the model `live transcribe` runs `auris` with, reaching its argv as `-m <model>` with no restart, byte-identical argv when unconfigured) | writes a real `~/.mesa` under a throwaway `HOME` |
 | `cc-check` | `mesa cc` contract against a synthetic transcript tree, incl. `cc errors`' per-row `sessions` list and its `--session` filter (mesa task 1255) | `MESA_CC_PROJECTS_DIR` |

@@ -27,7 +27,7 @@ use crate::core::types::{AgentChild, AgentChildKind, AgentChildState, AgentSessi
 /// runs exactly as written, byte for byte. A user who wants a different binary
 /// edits the line in Settings.
 pub fn claude_bin() -> String {
-    std::env::var("MESA_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
+    crate::core::env::var("CLAUDE_BIN").unwrap_or_else(|| "claude".to_string())
 }
 
 /// Lists live Claude Code sessions started under `dir`. Filtered here in

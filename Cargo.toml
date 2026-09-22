@@ -8,6 +8,17 @@ repository = "https://github.com/simonspoon/mesa"
 keywords = ["task-management", "cli", "agent", "sqlite"]
 categories = ["command-line-utilities"]
 
+# The binary is `naru` (mesa task 1301). `mesa` is the same program under its
+# old name, a real second binary so every script and agent that runs `mesa`
+# keeps working; the crate itself is still `mesa` until a later rename phase.
+[[bin]]
+name = "naru"
+path = "src/main.rs"
+
+[[bin]]
+name = "mesa"
+path = "src/bin/mesa.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 axum-embed = "0.1"

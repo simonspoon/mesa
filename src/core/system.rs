@@ -40,7 +40,7 @@ static SYS: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
 /// overrides it — the same test seam as `listen::auris_bin` and
 /// `speech::kokoro_bin`, and how the GPU parse is tested against a stub.
 fn system_profiler_bin() -> String {
-    std::env::var("MESA_SYSTEM_PROFILER_BIN").unwrap_or_else(|_| "system_profiler".to_string())
+    crate::core::env::var("SYSTEM_PROFILER_BIN").unwrap_or_else(|| "system_profiler".to_string())
 }
 
 /// The most `system_profiler` output mesa will read. A display report is a

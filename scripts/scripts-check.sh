@@ -12,7 +12,7 @@
 #     child (`${MESA_ARG_X-UNSET}` under `set -u`), never empty;
 #   * output over 64 KiB is truncated with the `[truncated]` marker;
 #   * cwd is resolved server-side: a project-bound script runs in that
-#     project's `local_path`, an unbound one in `~/.mesa/workspace`, and a
+#     project's `local_path`, an unbound one in `~/.naru/workspace`, and a
 #     bound project with no `local_path` is 422 validation;
 #   * the streamed run (/run/stream, mesa task 1196) interleaves stdout and
 #     stderr in arrival order, ends with one exit event, validates like the
@@ -21,6 +21,8 @@
 #     `require_agent_access` (mesa task 1022) — holds in BOTH `serve` and
 #     `serve --lan`.
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 
 cd "$(dirname "$0")/.."
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
@@ -33,12 +35,12 @@ trap 'rm -rf "$TMP"; [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null;
 export MESA_DB="$TMP/mesa.db"
 
 # A throwaway HOME: the unbound-script cwd rule points inside it, and nothing
-# here should touch the real ~/.mesa. mesa creates `$HOME/.mesa/workspace` on
+# here should touch the real ~/.mesa. mesa creates `$HOME/.naru/workspace` on
 # demand (mesa task 1040) — it deliberately does not exist yet.
 mkdir -p "$TMP/home"
 export HOME="$TMP/home"
 HOME_REAL=$(cd "$TMP/home" && pwd -P)
-WORKSPACE_REAL="$HOME_REAL/.mesa/workspace"
+WORKSPACE_REAL="$HOME_REAL/.naru/workspace"
 
 CHECKS=0
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -365,9 +367,9 @@ ok "CLI script run: a project-bound script runs in that project's local_path"
 run 0 "$MESA" script create whereunbound 'pwd -P'
 run 0 "$MESA" script run whereunbound
 [ "$(jqs '.stdout | rtrimstr("\n")')" = "$WORKSPACE_REAL" ] ||
-  fail "cwd: an unbound script must run in ~/.mesa/workspace, got: $STDOUT"
-[ -d "$WORKSPACE_REAL" ] || fail "cwd: ~/.mesa/workspace must be created on demand"
-ok "CLI script run: an unbound script runs in ~/.mesa/workspace, created on demand"
+  fail "cwd: an unbound script must run in ~/.naru/workspace, got: $STDOUT"
+[ -d "$WORKSPACE_REAL" ] || fail "cwd: ~/.naru/workspace must be created on demand"
+ok "CLI script run: an unbound script runs in ~/.naru/workspace, created on demand"
 
 run 0 "$MESA" script create wherepathless 'pwd -P' --project "$PNOPATH"
 S_NOPATH=$(jqs .id)
@@ -613,8 +615,8 @@ api 201 POST /api/scripts '{"name":"api-where-home","body":"pwd -P"}'
 AHOME=$(jqb .id)
 api 200 POST "/api/scripts/$AHOME/run" '{"values":{}}'
 [ "$(jqb '.stdout | rtrimstr("\n")')" = "$WORKSPACE_REAL" ] ||
-  fail "API cwd: an unbound script must run in ~/.mesa/workspace, got $BODY"
-ok "POST /api/scripts/{id}/run: an unbound script runs in ~/.mesa/workspace"
+  fail "API cwd: an unbound script must run in ~/.naru/workspace, got $BODY"
+ok "POST /api/scripts/{id}/run: an unbound script runs in ~/.naru/workspace"
 
 api 200 GET "/api/projects/$PNOPATH2"
 [ "$(jqb .local_path)" = "null" ] || fail "API cwd fixture: project must have no local_path"
@@ -729,7 +731,7 @@ RID=$(jqb .id)
 [ "$(jqb .script_id)" = "$AECHO" ] || fail "detach: script_id, got $BODY"
 [ "$(jqb .status)" = "running" ] || fail "detach: a fresh run must be running, got $BODY"
 [ "$(jqb '.values.target')" = "detached" ] || fail "detach: values echoed, got $BODY"
-[ "$(jqb .cwd)" = "$HOME/.mesa/workspace" ] || fail "detach: server-resolved cwd, got $BODY"
+[ "$(jqb .cwd)" = "$HOME/.naru/workspace" ] || fail "detach: server-resolved cwd, got $BODY"
 [ "$(jqb .exit_code)" = "null" ] || fail "detach: no exit code while running"
 [ "$(jqb .ended_at)" = "null" ] || fail "detach: no ended_at while running"
 [ "$(jqb 'has("events")')" = "false" ] || fail "detach: the record must never carry the log: $BODY"

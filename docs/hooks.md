@@ -13,7 +13,8 @@ shares the agents' mode-dependent access gate (`require_agent_access`).
   panel's Execute button was removed once the todo watcher took over
   auto-dispatch (`docs/todo-watcher.md`). The command runs under `sh -c` with the full task JSON on
   stdin, `MESA_HOOK`/`MESA_TASK_ID`/`MESA_TASK_NAME`/`MESA_PROJECT_ID`/
-  `MESA_DB` in the environment, and the project's `local_path` as cwd when
+  `MESA_DB` in the environment (each also as `NARU_*`, mesa task 1301), and
+  the project's `local_path` as cwd when
   that folder exists.
 - The result is a `HookRun` object: `{hook, command, exit_code, stdout,
   stderr}` (output capped at 64 KiB). A **nonzero hook exit is data**, not a

@@ -65,18 +65,54 @@ impl From<std::io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// MESA_DB if set and non-empty, else ~/Library/Application Support/mesa/mesa.db
-/// (macOS). An empty MESA_DB counts as unset: SQLite treats the path "" as a
-/// private anonymous temp db, so honoring it would silently answer from an
-/// empty database instead of the real one.
+/// NARU_DB / MESA_DB if set and non-empty (`core::env::var`), else the
+/// platform data dir's db — on macOS `~/Library/Application Support/naru/naru.db`,
+/// or the pre-rename `…/mesa/mesa.db` while only that one exists
+/// ([`choose_db_path`]). An empty value counts as unset: SQLite treats the
+/// path "" as a private anonymous temp db, so honoring it would silently
+/// answer from an empty database instead of the real one.
+///
+/// `attachments/` and `hooks.json` sit beside whichever db this returns, so
+/// they follow it with no rule of their own.
+///
+/// The filesystem choice is made **once per process** and cached: a server
+/// that opened `mesa.db` at startup must not switch its attachments dir,
+/// hooks file or a hook's `MESA_DB` to `naru/` because someone created a
+/// `naru.db` while it ran. The env branch is read fresh on every call, as
+/// before.
 pub fn default_db_path() -> PathBuf {
-    match std::env::var("MESA_DB") {
-        Ok(p) if !p.is_empty() => return PathBuf::from(p),
-        _ => {}
+    if let Some(p) = crate::core::env::var("DB")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
     }
-    let dirs = directories::ProjectDirs::from("", "", "mesa")
-        .expect("could not determine application data directory");
-    dirs.data_dir().join("mesa.db")
+    static CHOSEN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CHOSEN
+        .get_or_init(|| {
+            let data_dir = |app: &str| {
+                directories::ProjectDirs::from("", "", app)
+                    .expect("could not determine application data directory")
+                    .data_dir()
+                    .to_path_buf()
+            };
+            choose_db_path(
+                data_dir("naru").join("naru.db"),
+                data_dir("mesa").join("mesa.db"),
+            )
+        })
+        .clone()
+}
+
+/// The rename's db rule (mesa task 1301): the new db when it exists, else the
+/// old one when *it* exists, else the new one (a fresh install). Nothing is
+/// ever moved or copied — a server still running the old binary may hold the
+/// old db's WAL open — so an existing install simply keeps its db where it is.
+fn choose_db_path(new: PathBuf, old: PathBuf) -> PathBuf {
+    if !new.exists() && old.exists() {
+        old
+    } else {
+        new
+    }
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -8168,17 +8204,50 @@ mod tests {
 
     #[test]
     fn empty_mesa_db_env_counts_as_unset() {
-        // Set + assert + restore in one test: env vars are process-global and
-        // no other test reads MESA_DB.
+        // Set + assert + restore in one test, under the shared env lock.
+        let _lock = crate::core::attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("MESA_DB", "") };
         let empty = default_db_path();
         assert!(
-            empty.ends_with("mesa.db"),
+            empty.ends_with("naru/naru.db") || empty.ends_with("mesa/mesa.db"),
             "empty MESA_DB must fall back to the default path, got {empty:?}"
         );
         unsafe { std::env::set_var("MESA_DB", "/tmp/explicit.db") };
         assert_eq!(default_db_path(), PathBuf::from("/tmp/explicit.db"));
+        // NARU_DB is read first; an empty one does not mask MESA_DB.
+        unsafe { std::env::set_var("NARU_DB", "/tmp/naru-explicit.db") };
+        assert_eq!(default_db_path(), PathBuf::from("/tmp/naru-explicit.db"));
+        unsafe { std::env::set_var("NARU_DB", "") };
+        assert_eq!(default_db_path(), PathBuf::from("/tmp/explicit.db"));
+        unsafe { std::env::remove_var("NARU_DB") };
         unsafe { std::env::remove_var("MESA_DB") };
+    }
+
+    /// The rename's db rule: new if it exists, else old if it exists, else new.
+    #[test]
+    fn db_path_prefers_the_new_db_and_falls_back_to_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join("naru/naru.db");
+        let old = dir.path().join("mesa/mesa.db");
+
+        // Neither exists: a fresh install gets the new path.
+        assert_eq!(choose_db_path(new.clone(), old.clone()), new);
+
+        // Only the old one: an existing install keeps its db.
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"").unwrap();
+        assert_eq!(choose_db_path(new.clone(), old.clone()), old);
+
+        // Both: the new one wins.
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::write(&new, b"").unwrap();
+        assert_eq!(choose_db_path(new.clone(), old.clone()), new);
+
+        // Only the new one.
+        std::fs::remove_file(&old).unwrap();
+        assert_eq!(choose_db_path(new.clone(), old), new);
     }
 
     fn add_task(store: &mut Store, project_id: i64, description: &str) -> Task {

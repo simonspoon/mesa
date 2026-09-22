@@ -18,6 +18,8 @@
 # Same environment as baseline.sh: MESA_BIN, MODEL, OUT, EVAL_DIR,
 # REAL_CLAUDE, BUDGET, EDIT_MAX (the share the fast editor's wipe removes).
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 MODE=$1; N=$2
 # shellcheck source=lib.sh
 . "$EVAL_DIR/lib.sh"

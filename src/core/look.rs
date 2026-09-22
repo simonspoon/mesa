@@ -46,7 +46,7 @@ const STDERR_EXCERPT: usize = 400;
 /// same test seam as `agents::claude_bin` and `speech::kokoro_bin`, and how the
 /// end-to-end checks drive this against a stub instead of a real screen.
 fn loki_bin() -> String {
-    std::env::var("MESA_LOKI_BIN").unwrap_or_else(|_| "loki".to_string())
+    crate::core::env::var("LOKI_BIN").unwrap_or_else(|| "loki".to_string())
 }
 
 /// One window as `loki -f json windows` reports it. Only the three fields mesa

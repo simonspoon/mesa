@@ -3,6 +3,7 @@ pub mod attachments;
 pub mod board;
 pub mod cc;
 pub mod config;
+pub mod env;
 pub mod files;
 pub mod git;
 pub mod guard;

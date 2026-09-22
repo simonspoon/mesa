@@ -20,6 +20,8 @@
 #     `guard` with no stronger gate — answers with that identical header set
 #     under both `serve` and `serve --lan`.
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 
 cd "$(dirname "$0")/.."
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }

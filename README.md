@@ -4,9 +4,13 @@
 
 **Local-first project & task management for humans and agents.**
 
-> Naru was formerly called mesa. The CLI binary (`mesa`), the `MESA_*`
-> environment variables, data paths and `mesa task N` references still use
-> `mesa` until the later rename phases.
+> Naru was formerly called mesa. Since mesa task 1301 the binary is `naru`,
+> with `mesa` still installed beside it as the same program; every
+> `MESA_<NAME>` variable is also read as `NARU_<NAME>` (the new spelling
+> first, the old one still honoured); and a fresh install keeps its data in
+> `naru` paths while an existing one keeps using its `mesa` paths. The crate,
+> the `mesa task N` references and most docs still say `mesa` until the later
+> rename phases.
 
 Naru is a single-binary task manager backed by one SQLite database, exposing two
 surfaces over the same store:
@@ -57,21 +61,30 @@ scripts/build.sh          # tests, builds the frontend, embeds it, compiles
 `scripts/build.sh` is the only supported release build: it runs `cargo test`
 (which re-exports the TypeScript types), fails if `frontend/src/types/` is dirty,
 runs the frontend unit tests, builds the frontend into `frontend/dist`, then
-compiles the binary with the frontend embedded. Output: `target/release/mesa`.
+compiles the binary with the frontend embedded. Output: `target/release/naru`
+(and `target/release/mesa`, the same program under its old name).
 
-`scripts/install.sh` runs the same build and copies the binary onto your PATH
-(default `~/.local/bin`; override with `PREFIX=/usr/local`).
+`scripts/install.sh` runs the same build and copies `naru` onto your PATH, with
+`mesa` as a symlink to it (default `~/.local/bin`; override with
+`PREFIX=/usr/local`).
 
 ## Data location
 
 The database defaults to:
 
 ```
-~/Library/Application Support/mesa/mesa.db
+~/Library/Application Support/naru/naru.db
 ```
 
-Override the path with the `MESA_DB` environment variable — used throughout the
-tests and checks for isolation, and useful for pointing at a throwaway database:
+An install from before the rename keeps using
+`~/Library/Application Support/mesa/mesa.db` for as long as no `naru.db`
+exists — nothing is moved or copied. The config directory follows the same
+rule: `~/.naru` if it exists, else `~/.mesa` if it exists, else `~/.naru`.
+
+Override the path with the `NARU_DB` environment variable (`MESA_DB` is still
+honoured; every `MESA_*` variable is read as `NARU_*` first) — used throughout
+the tests and checks for isolation, and useful for pointing at a throwaway
+database:
 
 ```bash
 MESA_DB=/tmp/test.db mesa task list

@@ -3,8 +3,10 @@
 //!
 //! An archive is a tar.gz, written and read by the system `tar` (argv, never
 //! a shell string), holding `manifest.json`, a `VACUUM INTO` snapshot of the
-//! db as `mesa.db`, and every bundled file at its path relative to `$HOME`
-//! (`.mesa/config.json`, `.claude/...`). Import restores all of it under the
+//! db as `naru.db` (`mesa.db` in an archive from before the rename, still
+//! accepted), and every bundled file at its path relative to `$HOME`
+//! (`.naru/config.json` or `.mesa/config.json`, `.claude/...`). Import
+//! restores all of it under the
 //! current `$HOME`, rewriting absolute paths through a list of prefix
 //! mappings (the old home onto the new one, and optionally the manifest's
 //! `repo_root` onto a new repo root) — in the text files that hold
@@ -30,12 +32,30 @@ use super::store::{Error, ProjectPatch, Result, Store};
 /// other version is refused (`validation`) rather than half-understood.
 pub const FORMAT_VERSION: u64 = 1;
 
-/// What `export` bundles from the home directory, relative to `$HOME`. The
-/// per-project memory dirs (`.claude/projects/*/memory`) are added on top,
-/// or with `--with-sessions` the whole of `.claude/projects` plus
-/// `.claude/history.jsonl`.
+/// The db snapshot's name inside an archive this version writes.
+const DB_MEMBER: &str = "naru.db";
+
+/// Every name an archive's db snapshot may have, the current one first:
+/// archives written before the rename (mesa task 1301) hold `mesa.db`.
+const DB_MEMBERS: &[&str] = &[DB_MEMBER, "mesa.db"];
+
+/// Every place an archive may hold the config file, relative to `$HOME`.
+/// Whichever it is, import restores it into this home's own config
+/// directory (`config::dot_dir_in`), and export bundles it from there.
+const CONFIG_MEMBERS: &[&str] = &[".naru/config.json", ".mesa/config.json"];
+
+/// The config file's path relative to `home`, where Naru reads it.
+fn config_rel(home: &Path) -> String {
+    let dot = super::config::dot_dir_in(home);
+    let name = dot.file_name().unwrap_or_default().to_string_lossy();
+    format!("{name}/config.json")
+}
+
+/// What `export` bundles from the home directory, relative to `$HOME`, on
+/// top of the config file ([`config_rel`]). The per-project memory dirs
+/// (`.claude/projects/*/memory`) are added on top, or with `--with-sessions`
+/// the whole of `.claude/projects` plus `.claude/history.jsonl`.
 const HOME_ITEMS: &[&str] = &[
-    ".mesa/config.json",
     ".claude/CLAUDE.md",
     ".claude/settings.json",
     ".claude/settings.local.json",
@@ -364,7 +384,7 @@ pub fn settings_paths(value: &Value, home: &str) -> Vec<String> {
 /// the files that hold hand-written absolute paths. Everything else — the
 /// memories, session transcripts — is restored byte-identical.
 fn is_rewritable(rel: &str) -> bool {
-    if rel == ".mesa/config.json" {
+    if CONFIG_MEMBERS.contains(&rel) {
         return true;
     }
     let Some(r) = rel.strip_prefix(".claude/") else {
@@ -455,7 +475,8 @@ struct Item {
 /// The items `export` bundles, relative to `home`: present ones with their
 /// files, and the names of the missing ones.
 fn collect(home: &Path, with_sessions: bool) -> Result<(Vec<Item>, Vec<String>)> {
-    let mut rels: Vec<String> = HOME_ITEMS.iter().map(|s| s.to_string()).collect();
+    let mut rels = vec![config_rel(home)];
+    rels.extend(HOME_ITEMS.iter().map(|s| s.to_string()));
     let projects = home.join(".claude/projects");
     if with_sessions {
         rels.push(".claude/projects".into());
@@ -635,7 +656,7 @@ pub fn export(store: &Store, home: &Path, archive: &Path, with_sessions: bool) -
     }
     let (present, missing) = collect(home, with_sessions)?;
     let scratch = Scratch::new()?;
-    store.backup(&scratch.0.join("mesa.db"))?;
+    store.backup(&scratch.0.join(DB_MEMBER))?;
     let (projects, root) = project_rows(store)?;
     let home_s = trim_path(&home.to_string_lossy());
     let username = std::env::var("USER")
@@ -664,7 +685,7 @@ pub fn export(store: &Store, home: &Path, archive: &Path, with_sessions: bool) -
         "-C".as_ref(),
         scratch.0.as_os_str(),
         "manifest.json".as_ref(),
-        "mesa.db".as_ref(),
+        DB_MEMBER.as_ref(),
     ];
     if !present.is_empty() {
         args.push("-C".as_ref());
@@ -896,17 +917,20 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
             )));
         }
     }
-    let snapshot = scratch.0.join("mesa.db");
-    if !snapshot.is_file() {
-        return Err(Error::Validation("the archive holds no mesa.db".into()));
-    }
+    let Some(member) = DB_MEMBERS.iter().find(|m| scratch.0.join(m).is_file()) else {
+        return Err(Error::Validation(format!(
+            "the archive holds no {}",
+            DB_MEMBERS.join(" or ")
+        )));
+    };
+    let snapshot = scratch.0.join(member);
     let mut mappings = import_mappings(&manifest, home, opts)?;
 
     // The db is prepared entirely inside the scratch dir — opened (which
     // migrates an older schema), integrity-checked, and its local_paths
     // moved through the Store — so a snapshot that cannot be used is
     // `validation` before anything at `db_path` is touched.
-    let unusable = |e: Error| Error::Validation(format!("the archive's mesa.db is unusable: {e}"));
+    let unusable = |e: Error| Error::Validation(format!("the archive's {member} is unusable: {e}"));
     let store = Store::open(&snapshot).map_err(unusable)?;
     store.quick_check().map_err(unusable)?;
     let old_root = manifest["repo_root"].as_str().map(trim_path);
@@ -929,7 +953,7 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
     // Plan every write before making any, so a refusal writes nothing.
     let mut extracted = Vec::new();
     let mut empty_dirs = Vec::new();
-    for top in [".claude", ".mesa"] {
+    for top in [".claude", ".naru", ".mesa"] {
         let root = scratch.0.join(top);
         if fs::symlink_metadata(&root).is_ok() {
             walk(&scratch.0, &root, &mut extracted)?;
@@ -946,7 +970,11 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
     for rel in extracted {
         let src = scratch.0.join(&rel);
         let meta = fs::symlink_metadata(&src)?;
-        let (target_rel, rename) = map_rel(&rel, &mappings);
+        let (target_rel, rename) = if CONFIG_MEMBERS.contains(&rel.as_str()) {
+            (config_rel(home), None)
+        } else {
+            map_rel(&rel, &mappings)
+        };
         if let Some(r) = rename {
             renamed.insert(r);
         }
@@ -1043,7 +1071,7 @@ pub fn import(archive: &Path, home: &Path, db_path: &Path, opts: &ImportOptions)
     let file_name = db_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "mesa.db".into());
+        .unwrap_or_else(|| DB_MEMBER.into());
     let staged = dir.join(format!(".{file_name}.migrate-{}", std::process::id()));
     if let Err(e) = fs::copy(&snapshot, &staged) {
         let _ = fs::remove_file(&staged);
@@ -1344,6 +1372,7 @@ mod tests {
     #[test]
     fn rewritable_files() {
         for yes in [
+            ".naru/config.json",
             ".mesa/config.json",
             ".claude/settings.json",
             ".claude/settings.local.json",
@@ -1467,6 +1496,102 @@ mod tests {
         assert!(msg.contains("both restore to"), "{msg}");
         assert!(!db.exists(), "a refused import must not write the db");
         assert!(!new.join(".claude").exists(), "nor any file");
+    }
+
+    /// An archive written before the rename (mesa task 1301) holds its db as
+    /// `mesa.db` and its config at `.mesa/config.json`: it still imports, the
+    /// config landing where this home reads it (`.naru` on a fresh home).
+    #[test]
+    fn a_pre_rename_archive_with_mesa_db_still_imports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = exported(tmp.path());
+        let stage = tmp.path().join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        tar(&[
+            "-xzf".as_ref(),
+            archive.as_os_str(),
+            "-C".as_ref(),
+            stage.as_os_str(),
+        ])
+        .unwrap();
+        assert!(stage.join("naru.db").is_file(), "export writes naru.db");
+        fs::rename(stage.join("naru.db"), stage.join("mesa.db")).unwrap();
+        let old_home = tmp.path().join("Users/old");
+        fs::create_dir_all(stage.join(".mesa")).unwrap();
+        fs::write(
+            stage.join(".mesa/config.json"),
+            format!(
+                "{{\"commands\": {{\"x\": \"cd {}/repo\"}}}}",
+                old_home.display()
+            ),
+        )
+        .unwrap();
+        let legacy = tmp.path().join("legacy.tar.gz");
+        tar(&[
+            "-czf".as_ref(),
+            legacy.as_os_str(),
+            "-C".as_ref(),
+            stage.as_os_str(),
+            "manifest.json".as_ref(),
+            "mesa.db".as_ref(),
+            ".claude".as_ref(),
+            ".mesa".as_ref(),
+        ])
+        .unwrap();
+
+        let home = tmp.path().join("Users/new");
+        let db = tmp.path().join("new.db");
+        let out = import(&legacy, &home, &db, &ImportOptions::default()).unwrap();
+        assert_eq!(out["projects"][0]["to"], format!("{}/repo", home.display()));
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.list_projects_all().unwrap().len(), 1);
+        let config = fs::read_to_string(home.join(".naru/config.json")).unwrap();
+        assert!(
+            config.contains(&format!("cd {}/repo", home.display())),
+            "{config}"
+        );
+        assert!(!home.join(".mesa").exists(), "a fresh home gets .naru only");
+
+        // A home still on .mesa gets the config there instead.
+        let kept = tmp.path().join("Users/kept");
+        fs::create_dir_all(kept.join(".mesa")).unwrap();
+        import(
+            &legacy,
+            &kept,
+            &tmp.path().join("kept.db"),
+            &ImportOptions::default(),
+        )
+        .unwrap();
+        assert!(kept.join(".mesa/config.json").is_file());
+        assert!(!kept.join(".naru").exists());
+    }
+
+    #[test]
+    fn import_names_both_db_members_when_neither_is_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join("manifest.json"), "{\"format_version\": 1}").unwrap();
+        let archive = tmp.path().join("nodb.tar.gz");
+        tar(&[
+            "-czf".as_ref(),
+            archive.as_os_str(),
+            "-C".as_ref(),
+            stage.as_os_str(),
+            "manifest.json".as_ref(),
+        ])
+        .unwrap();
+        let err = import(
+            &archive,
+            &tmp.path().join("h"),
+            &tmp.path().join("d.db"),
+            &ImportOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Validation(ref m) if m.contains("naru.db or mesa.db")),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -16,15 +16,23 @@ mesa migrate import ~/move.tar.gz           # new machine
 ```
 
 Everything keys off `$HOME` (`~/.mesa/config.json`, `~/.claude/...`) and the
-db is `MESA_DB` if set, else the default path — so a throwaway `HOME` and
+db is `NARU_DB`/`MESA_DB` if set, else the default path — so a throwaway `HOME` and
 `MESA_DB` isolate every command completely, which is how the gate runs.
+
+Since the rename (mesa task 1301) the config item is exported from, and
+imported into, whichever config directory Naru reads on that machine
+(`~/.naru` if it exists, else `~/.mesa` if it exists, else `~/.naru` —
+`config::dot_dir_in`), and import accepts it at either `.naru/config.json` or
+`.mesa/config.json` in the archive. New archives hold the db as `naru.db`;
+import accepts `naru.db` or `mesa.db`, so an archive written before the
+rename still imports.
 
 ## What is bundled
 
 | Item | Notes |
 | --- | --- |
-| `mesa.db` | A `VACUUM INTO` snapshot (`Store::backup`, the path `mesa backup` uses) — safe while `serve` runs |
-| `.mesa/config.json` | |
+| `naru.db` (`mesa.db` before the rename) | A `VACUUM INTO` snapshot (`Store::backup`, the path `mesa backup` uses) — safe while `serve` runs |
+| `.naru/config.json` or `.mesa/config.json` | whichever this machine uses |
 | `.claude/CLAUDE.md`, `settings.json`, `settings.local.json`, `keybindings.json`, `statusline-command.sh` | |
 | `.claude/agents/`, `hooks/`, `commands/`, `skills/`, `output-styles/` | whole trees; symlinks archived as symlinks |
 | `.claude/plugins/installed_plugins.json`, `known_marketplaces.json` | the lists only — plugin caches are re-downloaded |
@@ -36,7 +44,7 @@ never an error. Binaries (`mesa`, `qorvex`, `khora`, `loki`) and project
 repos are **not** bundled: they are built and cloned on the new machine.
 
 The archive is a tar.gz written and read by the system `tar` (argv, never a
-shell string; no new crate): `manifest.json`, `mesa.db`, and every file at its
+shell string; no new crate): `manifest.json`, `naru.db`, and every file at its
 path relative to `$HOME`. The manifest records `format_version` (1),
 `created_at`, `mesa_version`, `source_home`, `username`, `repo_root`,
 `projects` (`id`, `name`, `local_path`), `files` and `with_sessions`. An

@@ -18,6 +18,8 @@
 # haiku). Never writes the person's db: it is copied once and read from the
 # copy. See docs/live.md, "The eval harness".
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export EVAL_DIR="$ROOT/scripts/memory-eval"
 
@@ -54,7 +56,10 @@ mkdir -p "$OUT"
 [ "$TABLE_ONLY" = 1 ] || : > "$OUT/calls"
 
 # The person's db, copied once; every read of the real turns is off the copy.
-SRC_DB="${MESA_EVAL_SOURCE_DB:-$HOME/Library/Application Support/mesa/mesa.db}"
+# Naru's own default (mesa task 1301): naru.db when it exists, else mesa.db.
+DEFAULT_SRC_DB="$HOME/Library/Application Support/naru/naru.db"
+[ -f "$DEFAULT_SRC_DB" ] || DEFAULT_SRC_DB="$HOME/Library/Application Support/mesa/mesa.db"
+SRC_DB="${MESA_EVAL_SOURCE_DB:-$DEFAULT_SRC_DB}"
 export REAL_DB="$OUT/real.db"
 cp "$SRC_DB" "$REAL_DB"; rm -f "$REAL_DB-wal" "$REAL_DB-shm"
 # shellcheck source=memory-eval/lib.sh

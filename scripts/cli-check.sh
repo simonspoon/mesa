@@ -4,6 +4,8 @@
 # -> delete -> backup — against a throwaway MESA_DB. Asserts JSON fields
 # (including error.code and the always-present `blocked`) and exit codes 0/1/2.
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 
 cd "$(dirname "$0")/.."
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }

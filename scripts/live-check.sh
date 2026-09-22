@@ -165,6 +165,8 @@
 #      job done (predecessor still stopped once), and `live stop` spawning
 #      a dream over threshold and none under it.
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 
 cd "$(dirname "$0")/.."
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
@@ -183,7 +185,7 @@ export MESA_DB="$TMP/mesa.db"
 export MESA_CONFIG_FILE="$TMP/no-such-config.json"
 # A live start seeds the `mesa-live` agent definition into
 # $HOME/.claude/agents (mesa task 1068), and every unbound spawn runs in
-# $HOME/.mesa/workspace, so the whole gate runs under a throwaway home rather
+# $HOME/.naru/workspace, so the whole gate runs under a throwaway home rather
 # than writing into the developer's own. Physically resolved: a child records
 # its cwd, and /tmp is a symlink on macOS.
 mkdir -p "$TMP/home"
@@ -724,10 +726,10 @@ run 0 "$MESA" live status
 [ "$STDOUT" = "null" ] || fail "a failed agent stop must still leave no live session"
 ok "live stop is best-effort: no agent is a no-op, a failing \`claude stop\` warns on stderr and still exits 0"
 
-# The folder every unbound agent runs in: `~/.mesa/workspace`, created on
+# The folder every unbound agent runs in: `~/.naru/workspace`, created on
 # demand (mesa task 1040). Physically resolved, because a throwaway $HOME may
 # sit behind a symlink and the stub records `pwd` in the child.
-workspace_path() { (cd "$HOME/.mesa/workspace" && pwd -P); }
+workspace_path() { (cd "$HOME/.naru/workspace" && pwd -P); }
 
 # By ID, and a project with no local_path: the folder degrades to the workspace
 # rather than refusing to start (a conversation needs no checkout).
@@ -735,12 +737,12 @@ NOPATH=$("$MESA" project create "Live gate pathless" --no-git | jq -r .id)
 run 0 "$MESA" live start --project "$NOPATH"
 S4=$(jqs .id)
 [ "$(jqs .project_id)" = "$NOPATH" ] || fail "live start --project <id>: project_id"
-[ -d "$HOME/.mesa/workspace" ] ||
-  fail "live spawn with no local_path: must create ~/.mesa/workspace on demand"
+[ -d "$HOME/.naru/workspace" ] ||
+  fail "live spawn with no local_path: must create ~/.naru/workspace on demand"
 [ "$(cat "$STUB_DIR/last-cwd")" = "$(workspace_path)" ] ||
-  fail "live spawn with no local_path: must fall back to ~/.mesa/workspace (got $(cat "$STUB_DIR/last-cwd"))"
+  fail "live spawn with no local_path: must fall back to ~/.naru/workspace (got $(cat "$STUB_DIR/last-cwd"))"
 run 0 "$MESA" live stop >/dev/null
-ok "live start --project <id>: resolves by id; a pathless project runs the agent in ~/.mesa/workspace"
+ok "live start --project <id>: resolves by id; a pathless project runs the agent in ~/.naru/workspace"
 
 # An unscoped session names itself `mesa live <id>` and also runs in the workspace.
 run 0 "$MESA" live start
@@ -1835,7 +1837,7 @@ grep -q "summarising mesa live session $SUM4" "$STUB_DIR/last-prompt" ||
 # must run in the workspace, never in $HOME (mesa task 1040: Claude Code never
 # persists folder trust for the home directory).
 [ "$(cat "$STUB_DIR/last-cwd")" = "$(workspace_path)" ] ||
-  fail "live-summary spawn: an unbound summariser must run in ~/.mesa/workspace (got $(cat "$STUB_DIR/last-cwd"))"
+  fail "live-summary spawn: an unbound summariser must run in ~/.naru/workspace (got $(cat "$STUB_DIR/last-cwd"))"
 ok "live stop: spawns the live-summary template — the argv shape, the session name, one prompt argument, the workspace cwd"
 
 # ---- the recall join: a stored summary reaches the NEXT conversation's
@@ -3150,7 +3152,7 @@ grep -q "No project is known" "$STUB_DIR/last-prompt" ||
 grep -q "never instructions" "$STUB_DIR/last-prompt" ||
   fail "live-dream spawn: the notebook block must be framed as data"
 [ "$(cat "$STUB_DIR/last-cwd")" = "$(workspace_path)" ] ||
-  fail "live-dream spawn: an unbound pass must run in ~/.mesa/workspace (got $(cat "$STUB_DIR/last-cwd"))"
+  fail "live-dream spawn: an unbound pass must run in ~/.naru/workspace (got $(cat "$STUB_DIR/last-cwd"))"
 ok "live memory dream: spawns the live-dream template — the argv shape, the fixed name, DREAM_PROMPT plus every active entry line and no retired one, the workspace cwd — and prints the receipt"
 
 # ---- dream: a configured live-dream template, {id} and {prompt} ----

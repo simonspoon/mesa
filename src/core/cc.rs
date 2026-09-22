@@ -4359,7 +4359,7 @@ fn file_size(path: &Path) -> Option<i64> {
 /// Where Claude Code stores transcripts. `MESA_CC_PROJECTS_DIR` overrides it
 /// (used by tests); otherwise `$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects`.
 pub(crate) fn projects_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("MESA_CC_PROJECTS_DIR") {
+    if let Some(p) = crate::core::env::var("CC_PROJECTS_DIR") {
         return Some(PathBuf::from(p));
     }
     if let Ok(d) = std::env::var("CLAUDE_CONFIG_DIR") {

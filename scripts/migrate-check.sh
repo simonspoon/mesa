@@ -5,7 +5,7 @@
 # ~/.claude, ~/.mesa or db: HOME and MESA_DB are set on every call.
 #
 # The load-bearing assertions:
-#   * export bundles the db snapshot, ~/.mesa/config.json and the chosen
+#   * export bundles the db snapshot (as naru.db), ~/.mesa/config.json and the chosen
 #     ~/.claude items, per-project memory but NOT session transcripts (unless
 #     --with-sessions), with missing items listed under `skipped`;
 #   * import into a HOME under a different username maps every project's
@@ -13,6 +13,8 @@
 #     while a dir that only shares a textual prefix is left alone, rewrites
 #     the old home in settings.json / an agent / .mesa/config.json, and keeps
 #     the hook executable;
+#   * the config lands in the fresh HOME's ~/.naru (mesa task 1301), and an
+#     archive from before the rename (db member `mesa.db`) still imports;
 #   * a second import without --force is `conflict`, exit 1, and writes
 #     nothing; --force overwrites;
 #   * --repo-root maps the manifest's repo_root ahead of the home map;
@@ -23,6 +25,8 @@
 #   * --quiet is refused (exit 2) on all three; bad --home-map / a garbage
 #     archive are `validation`, exit 1.
 set -euo pipefail
+# Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
+unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
 
 cd "$(dirname "$0")/.."
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
@@ -152,7 +156,8 @@ grep -q "bash $DST/.claude/statusline-command.sh" "$DST/.claude/settings.json" |
 ! grep -q "$SRC" "$DST/.claude/settings.json" || fail "import: old home left in settings.json"
 grep -q "Work in $DST/inaros/mesa, not ${SRC}X." "$DST/.claude/agents/sup.md" ||
   fail "import: agent rewrite (boundary): $(cat "$DST/.claude/agents/sup.md")"
-grep -q "cd $DST/inaros" "$DST/.mesa/config.json" || fail "import: config.json rewritten"
+grep -q "cd $DST/inaros" "$DST/.naru/config.json" || fail "import: config.json rewritten (into the fresh HOME's .naru)"
+[ ! -e "$DST/.mesa" ] || fail "import: a fresh HOME must get .naru, not .mesa"
 [ -x "$DST/.claude/hooks/guard.sh" ] || fail "import: hook lost its executable bit"
 jqs '.rewritten[]' | grep -qx '.claude/settings.json' || fail "import: rewritten list"
 jqs '.todo[]' | grep -q "clone mesa to $DST/inaros/mesa" || fail "import: todo clone line"
@@ -175,21 +180,37 @@ grep -q "$DST/.claude/hooks/guard.sh" "$DST/.claude/settings.json" || fail "--fo
 ok "--force overwrites"
 
 # ================= a corrupt snapshot never replaces the db =================
-# A valid archive whose mesa.db is truncated: even --force must refuse it as
+# A valid archive whose naru.db is truncated: even --force must refuse it as
 # validation before the existing db (or anything else) is touched.
 mkdir -p "$TMP/bad"
 tar -xzf "$TMP/move.tar.gz" -C "$TMP/bad"
-head -c 4096 "$TMP/bad/mesa.db" >"$TMP/bad/mesa.db.cut"
-mv "$TMP/bad/mesa.db.cut" "$TMP/bad/mesa.db"
-(cd "$TMP/bad" && tar -czf "$TMP/corrupt.tar.gz" manifest.json mesa.db .claude .mesa)
+[ -f "$TMP/bad/naru.db" ] && [ ! -e "$TMP/bad/mesa.db" ] || fail "export: the db member is naru.db"
+head -c 4096 "$TMP/bad/naru.db" >"$TMP/bad/naru.db.cut"
+mv "$TMP/bad/naru.db.cut" "$TMP/bad/naru.db"
+(cd "$TMP/bad" && tar -czf "$TMP/corrupt.tar.gz" manifest.json naru.db .claude .mesa)
 BEFORE=$(cd "$DST" && find . -type f -exec shasum {} + | sort; shasum "$DST_DB")
 run 1 as_dst migrate import "$TMP/corrupt.tar.gz" --force
 [ "$(jqe .error.code)" = validation ] || fail "corrupt snapshot: validation, got $STDERR"
-jqe .error.message | grep -q "mesa.db is unusable" || fail "corrupt snapshot: message names the db"
+jqe .error.message | grep -q "naru.db is unusable" || fail "corrupt snapshot: message names the db"
 AFTER=$(cd "$DST" && find . -type f -exec shasum {} + | sort; shasum "$DST_DB")
 [ "$BEFORE" = "$AFTER" ] || fail "corrupt snapshot: the existing db or a file changed"
 [ "$(as_dst project list | jq length)" -eq 2 ] || fail "corrupt snapshot: existing db still opens"
-ok "a truncated mesa.db + --force is validation and leaves the db unchanged"
+ok "a truncated naru.db + --force is validation and leaves the db unchanged"
+
+# ================= an archive from before the rename (mesa task 1301) =================
+# The same archive with its db member named mesa.db, as every archive written
+# before the rename has it: it imports, config included.
+mkdir -p "$TMP/legacy"
+tar -xzf "$TMP/move.tar.gz" -C "$TMP/legacy"
+mv "$TMP/legacy/naru.db" "$TMP/legacy/mesa.db"
+(cd "$TMP/legacy" && tar -czf "$TMP/legacy.tar.gz" manifest.json mesa.db .claude .mesa)
+LEGACY="$TMP/Users/legacy"
+mkdir -p "$LEGACY"
+run 0 env HOME="$LEGACY" MESA_DB="$TMP/legacy.db" "$MESA" migrate import "$TMP/legacy.tar.gz"
+[ "$(HOME="$LEGACY" MESA_DB="$TMP/legacy.db" "$MESA" project list | jq -r '[.[].local_path] | join(",")')" = \
+  "$LEGACY/inaros/mesa,$LEGACY/inaros/qorvex" ] || fail "legacy archive: local_paths"
+grep -q "cd $LEGACY/inaros" "$LEGACY/.naru/config.json" || fail "legacy archive: .mesa/config.json restored into .naru"
+ok "a pre-rename archive (mesa.db, .mesa/config.json) still imports"
 
 # ================= --with-sessions + --repo-root =================
 run 0 as_src migrate export "$TMP/full.tar.gz" --with-sessions

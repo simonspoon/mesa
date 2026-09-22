@@ -227,10 +227,11 @@ already use.
     DONE); `agents::job_running` counts any state outside
     `done`/`failed`/`stopped` as running, so such a job holds a resting
     `listen` waiting to its 10-minute cap (mesa task 1155); and
-    `agents::blocked_on`'s `unwrap_or("blocked")` fallback — deliberate,
-    and unchanged by this — lets it reach `GET /api/live`'s derived
-    `blocked` with no reason, which the page's watchdog can turn into a
-    spoken `notice: permission` turn (mesa task 1157).
+    such a row no longer reaches `GET /api/live`'s derived `blocked` at
+    all — since mesa task 1293 `agents::blocked_on` requires a `waitingFor`
+    naming a permission, so a blocked row with no reason (which is every one
+    of those 188) answers nothing and the page's watchdog has no rising edge
+    to turn into a spoken `notice: permission` turn.
 - **Two mesa-derived counts report what a session is doing**
   (mesa task 802): `liveShells` and `liveSubagents` on every `AgentSession`.
   Upstream's `state` reaches `done` the moment a turn ends, while the work

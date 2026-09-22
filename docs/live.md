@@ -303,8 +303,27 @@ it created it or found it: the page does not care which.
 stored**. When the session is live and has an `agent_id`, `get_live` looks the
 job up in `claude agents --json --all` (`agents::job_blocked_on`, the same
 loosely-read payload `find_job_for_session` uses) and answers the job's
-`waitingFor` string when its `state` is `blocked` — `"permission prompt"` —
-else null. The lookup runs off the store lock on `spawn_blocking`, through a
+`waitingFor` string — `"permission prompt"` — else null.
+
+`state: "blocked"` alone is **not** the signal (mesa task 1293). Upstream it
+is one `requires_action` bucket covering five distinct reasons, of which only
+the first is a permission prompt: `"permission prompt"` (the dialog the
+notice's sentence names), `"input needed"` (a queued elicitation), `"worker
+request"`, `"sandbox request"` and `"dialog open"` — the last being exactly
+the shape an idle background session sitting in a background `mesa live
+listen` presents, which is how a notice came to be spoken at a conversation
+where no prompt existed at all. So the state is read as a **positive**
+indication rather than a bucket: the notice is produced only when the row's
+`waitingFor` is present and, trimmed and lowercased, **contains**
+`"permission"` — a substring so a variant like `"tool permission prompt"`
+still counts while the four reasons above do not. A `blocked` row carrying no
+`waitingFor` at all likewise answers null: an unexplained block is not
+evidence of a prompt, and asserting one is worse than saying nothing. An
+ordinary in-flight tool call is `state: "working"` and never reached this
+path. The gate lives in `agents::blocked_on`, the pure half, because
+`GET /api/live`'s derived `blocked` is its only consumer;
+`frontend/src/liveWatchdog.ts` is unchanged and still never inspects the
+content of `blocked`. The lookup runs off the store lock on `spawn_blocking`, through a
 small `AppState` cache keyed on the job id **and `working_since`** with a
 5-second TTL (`LIVE_BLOCKED_TTL`), so the page's 2-second poll costs at most
 one shell-out per five seconds, a handoff's successor is simply a new key, and

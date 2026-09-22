@@ -647,8 +647,17 @@ fn session_for_job(bytes: &[u8], job_id: &str) -> Result<Option<String>, String>
 }
 
 /// Pure half of [`job_blocked_on`], read as loosely as [`job_for_session`]
-/// and for the same reason. A row that is `blocked` without saying on what
-/// still answers `"blocked"`, so the signal is never lost to a missing key.
+/// and for the same reason. `state: "blocked"` is upstream's single
+/// `requires_action` bucket and covers five distinct reasons — a permission
+/// prompt, a queued elicitation (`input needed`), a worker request, a sandbox
+/// request and a plain open dialog, the last of which is exactly the shape an
+/// idle background session sitting in a background `listen` presents. Only
+/// the first is what the live notice speaks about, so the signal needs a
+/// **positive** indication (mesa task 1293): `waitingFor` must be present and
+/// name a permission, matched as a substring so a variant like `tool
+/// permission prompt` still counts while the other four do not. A blocked row
+/// that says nothing about why answers `None` — an unexplained block is not
+/// evidence of a prompt.
 fn blocked_on(bytes: &[u8], job_id: &str) -> Result<Option<String>, String> {
     let rows: Vec<serde_json::Value> = serde_json::from_slice(bytes)
         .map_err(|e| format!("unexpected claude agents payload: {e}"))?;
@@ -659,12 +668,12 @@ fn blocked_on(bytes: &[u8], job_id: &str) -> Result<Option<String>, String> {
         if row.get("state").and_then(|v| v.as_str()) != Some("blocked") {
             return None;
         }
-        Some(
-            row.get("waitingFor")
-                .and_then(|v| v.as_str())
-                .unwrap_or("blocked")
-                .to_string(),
-        )
+        let waiting = row.get("waitingFor").and_then(|v| v.as_str())?;
+        waiting
+            .trim()
+            .to_ascii_lowercase()
+            .contains("permission")
+            .then(|| waiting.to_string())
     }))
 }
 
@@ -785,10 +794,12 @@ mod tests {
       }
     ]"#;
 
-    /// `blocked_on` reads a job's `state`/`waitingFor` pair (mesa task 1157):
-    /// the captured blocked row answers its prompt, a working row and an
-    /// unknown id answer nothing, and a blocked row with no `waitingFor`
-    /// still reads as blocked.
+    /// `blocked_on` reads a job's `state`/`waitingFor` pair (mesa task 1157),
+    /// and since mesa task 1293 only a reason naming a permission counts: the
+    /// captured blocked row answers its prompt, a working row and an unknown
+    /// id answer nothing, and a blocked row whose reason is one of the four
+    /// other `requires_action` cases — or which gives no reason at all —
+    /// answers nothing too.
     #[test]
     fn blocked_on_reads_the_waiting_for_string_of_a_blocked_job() {
         let bytes = SESSIONS_JSON.as_bytes();
@@ -801,8 +812,25 @@ mod tests {
                            {"id": "bbbb", "sessionId": "t", "state": "blocked"}]"#;
         assert_eq!(blocked_on(working, "aaaa").unwrap(), None);
         assert_eq!(
-            blocked_on(working, "bbbb").unwrap().as_deref(),
-            Some("blocked")
+            blocked_on(working, "bbbb").unwrap(),
+            None,
+            "a blocked row with no reason is not evidence of a prompt"
+        );
+        // The four `requires_action` reasons that are not a permission prompt
+        // — `dialog open` being what an idle background `listen` presents.
+        let others = br#"[{"id": "cccc", "state": "blocked", "waitingFor": "dialog open"},
+                          {"id": "dddd", "state": "blocked", "waitingFor": "input needed"},
+                          {"id": "eeee", "state": "blocked", "waitingFor": "worker request"},
+                          {"id": "ffff", "state": "blocked", "waitingFor": "sandbox request"},
+                          {"id": "gggg", "state": "blocked", "waitingFor": "Tool Permission Prompt"}]"#;
+        assert_eq!(blocked_on(others, "cccc").unwrap(), None);
+        assert_eq!(blocked_on(others, "dddd").unwrap(), None);
+        assert_eq!(blocked_on(others, "eeee").unwrap(), None);
+        assert_eq!(blocked_on(others, "ffff").unwrap(), None);
+        assert_eq!(
+            blocked_on(others, "gggg").unwrap().as_deref(),
+            Some("Tool Permission Prompt"),
+            "a variant naming a permission still counts, and comes back verbatim"
         );
         assert!(blocked_on(b"not json", "aaaa").is_err());
     }

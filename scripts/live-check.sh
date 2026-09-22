@@ -249,12 +249,17 @@ case "\$1" in
     # under the throwaway HOME, so the pulse answers null — what it answers
     # for any transcript it cannot read. A \`blocked-id\` file naming a job
     # makes that row a session stuck on a permission prompt, the shape
-    # \`GET /api/live\`'s derived \`blocked\` reads (mesa task 1157).
+    # \`GET /api/live\`'s derived \`blocked\` reads (mesa task 1157); a
+    # \`blocked-reason\` file beside it names the \`waitingFor\` instead, so a
+    # test can present one of the four \`requires_action\` reasons that are
+    # NOT a permission prompt (mesa task 1293).
     # A \`done-ids\` file listing the job makes its row \`state: "done"\`, the
     # shape \`agents::job_running\` reads as finished (mesa task 1155).
     ID=\$(cat "$STUB_DIR/last-id" 2>/dev/null)
     if [ "\$ID" = "\$(cat "$STUB_DIR/blocked-id" 2>/dev/null)" ]; then
-      printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"blocked","waitingFor":"permission prompt"}]\n' "\$ID"
+      REASON=\$(cat "$STUB_DIR/blocked-reason" 2>/dev/null)
+      [ -n "\$REASON" ] || REASON="permission prompt"
+      printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"blocked","waitingFor":"%s"}]\n' "\$ID" "\$REASON"
     elif grep -qx "\$ID" "$STUB_DIR/done-ids" 2>/dev/null; then
       printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"done"}]\n' "\$ID"
     else
@@ -3511,11 +3516,26 @@ api 200 GET "/api/live"
 [ "$(jqb .blocked)" = "permission prompt" ] ||
   fail "GET /api/live: blocked must carry the job's waitingFor once the stub reports it blocked (got $(jqb .blocked))"
 [ "$(jqb .session.id)" = "$NS" ] || fail "GET /api/live: the same session"
+BLOCKED_AT=$(date +%s)
+
+# …but only when the reason names a permission prompt (mesa task 1293).
+# `state: "blocked"` is upstream's single `requires_action` bucket and covers
+# five reasons; `dialog open` is what an idle background `listen` presents,
+# and speaking "the agent is blocked on a permission prompt" over it is a
+# false alarm. The job is still blocked, the reason is not a prompt, so the
+# derived `blocked` is null and the page's watchdog sees no rising edge.
+printf '%s\n' "dialog open" > "$STUB_DIR/blocked-reason"
+ELAPSED=$(( $(date +%s) - BLOCKED_AT ))
+[ "$ELAPSED" -ge 6 ] || sleep $(( 6 - ELAPSED ))
+api 200 GET "/api/live"
+[ "$(jqb .blocked)" = "null" ] ||
+  fail "GET /api/live: a blocked job whose reason is not a permission prompt must read null (got $(jqb .blocked))"
+rm -f "$STUB_DIR/blocked-reason"
 rm -f "$STUB_DIR/blocked-id"
 # The CLI never reads it: `live status` is the stored session alone.
 run 0 "$MESA" live status
 [ "$(jq -c 'has("blocked")' <<<"$STDOUT")" = "false" ] || fail "blocked is derived on the API read, never a session field"
-ok "GET /api/live: blocked is null for a working job and the job's waitingFor when claude agents reports it blocked"
+ok "GET /api/live: blocked is null for a working job, the job's waitingFor when claude agents reports a permission prompt, and null again when the blocked reason is not one"
 
 # ---- the archive never sees a notice ----
 run 0 "$MESA" live say "The heron says the agent is fine."

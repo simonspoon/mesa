@@ -19,6 +19,16 @@ import type { LiveTurn } from './types/LiveTurn'
  */
 
 /**
+ * Whether a turn's role is Naru's side of the conversation. The server still
+ * writes `mesa` (the iOS app compares against it), but a later build will
+ * write `naru` (mesa task 1302), so every "is this Naru's turn" check reads
+ * both — the generated `LiveRole` type names only the first, hence `string`.
+ */
+export function isNaruRole(role: string): boolean {
+  return role === 'mesa' || role === 'naru'
+}
+
+/**
  * The `after=` cursor for the next poll: the highest turn id seen. Turns arrive
  * ascending, but the max is taken rather than the last element — a cursor that
  * could go *backwards* would re-deliver turns the page has already merged, and
@@ -97,7 +107,7 @@ export function pendingTurns(
   handled: ReadonlySet<number>,
 ): LiveTurn[] {
   return turns.filter(
-    (turn) => turn.role === 'mesa' && turn.played_at === null && !handled.has(turn.id),
+    (turn) => isNaruRole(turn.role) && turn.played_at === null && !handled.has(turn.id),
   )
 }
 
@@ -157,7 +167,7 @@ export function releaseForReplay(
  * synthesiser would refuse.
  */
 export function spokenText(turn: LiveTurn): string | null {
-  if (turn.role !== 'mesa') return null
+  if (!isNaruRole(turn.role)) return null
   const text = turn.text.trim()
   return text === '' ? null : text
 }
@@ -213,7 +223,8 @@ export function turnGroups(turns: readonly LiveTurn[]): TurnGroup[] {
   for (const turn of turns) {
     const last = groups[groups.length - 1]
     const notice = turn.notice !== null
-    if (last && last.role === turn.role && last.notice === notice) last.turns.push(turn)
+    if (last && isNaruRole(last.role) === isNaruRole(turn.role) && last.notice === notice)
+      last.turns.push(turn)
     else groups.push({ role: turn.role, notice, turns: [turn] })
   }
   return groups

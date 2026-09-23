@@ -16,7 +16,7 @@
 //!     "todo-watcher":   "claude --bg --agent supervisor --name {name} -- \"/execute-mesa-task {id}\"",
 //!     "inbox-watcher":  "claude --bg --agent inbox-triage --name {name} -- \"Triage mesa inbox item {id}.\"",
 //!     "agent-spawn":    "claude --bg --model opus --agent supervisor -- {prompt}",
-//!     "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
+//!     "live-agent":     "claude --bg --agent naru-live --name {name} -- {prompt}",
 //!     "live-summary":   "claude --bg --name {name} -- {prompt}",
 //!     "live-dream":     "claude --bg --name {name} -- {prompt}"
 //!   }
@@ -131,7 +131,7 @@
 //! ([`DEFAULT_LIVE_AUTO_SEND_MS`]). The instruction block a live
 //! conversation's agent is spawned with **used to** live here too
 //! (`live.prompt`) but moved to the library as of mesa task 919 — it is now
-//! the `mesa-live` agent definition in the library (mesa task 1068 turned it
+//! the `naru-live` agent definition in the library (mesa task 1068 turned it
 //! from a `prompt` into a real agent definition). A `live.prompt` key left
 //! behind in a
 //! hand-edited file is silently ignored: `LiveSection` simply has no field
@@ -265,12 +265,12 @@ pub const DEFAULT_AGENT_SPAWN: &str = "claude --bg --model opus --agent supervis
 /// live session is a mesa record (so it has an `{id}` and a `{name}`) *and*
 /// carries a prompt mesa supplies — `core::live::agent_prompt`, the session
 /// line and any recalled memory — so the feature works with no user
-/// configuration. The conversation runs as the `mesa-live` agent definition
+/// configuration. The conversation runs as the `naru-live` agent definition
 /// (mesa task 1068, `core::live::AGENT_DEFINITION`, seeded to
-/// `~/.claude/agents/mesa-live.md` by `core::live::ensure_agent_definition`),
+/// `~/.claude/agents/naru-live.md` by `core::live::ensure_agent_definition`),
 /// which is where its instructions live; a user who wants another agent edits
 /// the name here.
-pub const DEFAULT_LIVE_AGENT: &str = "claude --bg --agent mesa-live --name {name} -- {prompt}";
+pub const DEFAULT_LIVE_AGENT: &str = "claude --bg --agent naru-live --name {name} -- {prompt}";
 /// Built-in default for [`LIVE_SUMMARY`] — identical in shape to
 /// [`DEFAULT_LIVE_AGENT`]: the summariser is also a mesa record (a session
 /// id and a name) carrying a prompt mesa supplies
@@ -285,13 +285,13 @@ pub const DEFAULT_LIVE_SUMMARY: &str = "claude --bg --name {name} -- {prompt}";
 pub const DEFAULT_LIVE_DREAM: &str = "claude --bg --name {name} -- {prompt}";
 /// Built-in default for [`RETRO`] — [`DEFAULT_INBOX_WATCHER`]'s shape: the
 /// run is a mesa record (`retro_runs`, so `{id}` is the run id and `{name}`
-/// the `mesa retro <id>` session name) and the prompt is one sentence, since
-/// the `mesa-retro` agent definition (mesa task 1158,
-/// `core::retro::RETRO_DEFINITION`, seeded to `.claude/agents/mesa-retro.md`
+/// the `naru retro <id>` session name) and the prompt is one sentence, since
+/// the `naru-retro` agent definition (mesa task 1158,
+/// `core::retro::RETRO_DEFINITION`, seeded to `.claude/agents/naru-retro.md`
 /// before the spawn) holds the whole procedure. No `{prompt}`: mesa supplies
 /// none.
 pub const DEFAULT_RETRO: &str =
-    r#"claude --bg --agent mesa-retro --name {name} -- "Run mesa session retrospective {id}.""#;
+    r#"claude --bg --agent naru-retro --name {name} -- "Run mesa session retrospective {id}.""#;
 
 /// The built-in template for `action`, or `None` if `action` isn't one of
 /// [`ACTIONS`]. Public so the docs check and the API can report the shipped
@@ -405,7 +405,11 @@ fn command_in(path: &Path, action: &str) -> Result<Option<String>, String> {
     Ok(config
         .commands
         .get(action)
-        .map(|s| migrate_env_references(&migrate_retired_placeholders(s.trim())))
+        .map(|s| {
+            migrate_renamed_agents(&migrate_env_references(&migrate_retired_placeholders(
+                s.trim(),
+            )))
+        })
         .filter(|s| !s.is_empty()))
 }
 
@@ -433,6 +437,58 @@ pub fn migrate_retired_placeholders(template: &str) -> String {
     template
         .replace("{bin}", "claude")
         .replace("{agent}", "supervisor")
+}
+
+/// Rewrites an `--agent` argument naming an agent definition mesa task 1302
+/// renamed (`core::library::RENAMED_BUILTINS`: `mesa-live` is `naru-live`,
+/// `mesa-retro` is `naru-retro`) to its new name — bare, `"…"`-quoted or
+/// `'…'`-quoted, after a space or an `=`. Applied on every read, in memory,
+/// exactly like [`migrate_retired_placeholders`]: the file is never
+/// rewritten, and the Settings page's next Save writes the new name. Without
+/// it, a saved `--agent mesa-live` would spawn a definition nothing seeds any
+/// more.
+///
+/// Only the `--agent` value is touched: a `--name "mesa-live"` beside it is a
+/// session label, and a longer name (`mesa-live-v2`) is a different agent.
+pub fn migrate_renamed_agents(template: &str) -> String {
+    const FLAG: &str = "--agent";
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(at) = rest.find(FLAG) {
+        let (head, tail) = rest.split_at(at + FLAG.len());
+        out.push_str(head);
+        rest = tail;
+        let sep_len = if rest.starts_with('=') {
+            1
+        } else {
+            rest.len() - rest.trim_start_matches([' ', '\t']).len()
+        };
+        if sep_len == 0 {
+            continue;
+        }
+        let (sep, value) = rest.split_at(sep_len);
+        let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let inner = if quote.is_some() { &value[1..] } else { value };
+        let renamed = crate::core::library::RENAMED_BUILTINS
+            .iter()
+            .find(|(old, _)| {
+                inner.strip_prefix(old).is_some_and(|after| match quote {
+                    Some(q) => after.starts_with(q),
+                    None => after
+                        .chars()
+                        .next()
+                        .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')')),
+                })
+            });
+        if let Some((old, new)) = renamed {
+            out.push_str(sep);
+            out.extend(quote);
+            out.push_str(new);
+            rest = &inner[old.len()..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Every action's current setting, for the Settings page
@@ -3611,6 +3667,53 @@ mod tests {
         );
     }
 
+    /// mesa task 1302: a saved template spawning the pre-rename agent names
+    /// is read with the new ones — bare, `"…"` and `'…'` — while `--name`, a
+    /// longer agent name and a template without them come through unchanged,
+    /// and the file itself is never rewritten.
+    #[test]
+    fn a_saved_template_naming_a_renamed_agent_reads_with_the_new_name() {
+        assert_eq!(
+            migrate_renamed_agents("claude --bg --agent mesa-live --name {name} -- {prompt}"),
+            "claude --bg --agent naru-live --name {name} -- {prompt}"
+        );
+        assert_eq!(
+            migrate_renamed_agents(
+                r#"claude --bg --name "mesa-live" --agent "mesa-live" -- {prompt}"#
+            ),
+            r#"claude --bg --name "mesa-live" --agent "naru-live" -- {prompt}"#
+        );
+        assert_eq!(
+            migrate_renamed_agents("claude --agent 'mesa-retro' --name {name}"),
+            "claude --agent 'naru-retro' --name {name}"
+        );
+        assert_eq!(
+            migrate_renamed_agents("claude --agent=mesa-retro\nclaude --agent mesa-live"),
+            "claude --agent=naru-retro\nclaude --agent naru-live"
+        );
+        for untouched in [
+            "claude --bg --agent supervisor --name mesa-live -- {prompt}",
+            "claude --agent mesa-live-v2 -- x",
+            "claude --agent \"mesa-live-v2\" -- x",
+            "claude --agents mesa-live",
+            DEFAULT_LIVE_AGENT,
+            DEFAULT_RETRO,
+            "",
+        ] {
+            assert_eq!(migrate_renamed_agents(untouched), untouched);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let before = r#"{"commands": {"live-agent": "claude --bg --name \"mesa-live\" --agent \"mesa-live\" -- {prompt}"}}"#;
+        std::fs::write(&path, before).unwrap();
+        assert_eq!(
+            command_in(&path, LIVE_AGENT).unwrap().as_deref(),
+            Some(r#"claude --bg --name "mesa-live" --agent "naru-live" -- {prompt}"#)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
     #[test]
     fn command_in_treats_blank_and_missing_section_as_unconfigured() {
         let dir = tempfile::tempdir().unwrap();
@@ -3706,7 +3809,7 @@ mod tests {
         };
         assert_eq!(
             resolve(RETRO, DEFAULT_RETRO, &vars).unwrap(),
-            r#"claude --bg --agent mesa-retro --name 'mesa retro 7' -- "Run mesa session retrospective 7.""#
+            r#"claude --bg --agent naru-retro --name 'mesa retro 7' -- "Run mesa session retrospective 7.""#
         );
     }
 
@@ -3880,7 +3983,7 @@ mod tests {
         );
         // The live agent takes both halves: a named session id *and* the
         // prompt mesa supplies. The prompt is one argument however long or
-        // hostile its text. Its agent is the literal `mesa-live` definition
+        // hostile its text. Its agent is the literal `naru-live` definition
         // (mesa task 1068).
         let live = Vars {
             id: Some(12),
@@ -3890,7 +3993,7 @@ mod tests {
         };
         assert_eq!(
             resolve(LIVE_AGENT, DEFAULT_LIVE_AGENT, &live).unwrap(),
-            r#"claude --bg --agent mesa-live --name 'mesa live 12' -- 'listen; then say "hi"'"#
+            r#"claude --bg --agent naru-live --name 'mesa live 12' -- 'listen; then say "hi"'"#
         );
         // …and a real bash agrees about the argv each of those makes.
         assert_eq!(
@@ -3912,7 +4015,7 @@ mod tests {
                 "claude",
                 "--bg",
                 "--agent",
-                "mesa-live",
+                "naru-live",
                 "--name",
                 "mesa live 12",
                 "--",

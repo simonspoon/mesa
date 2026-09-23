@@ -44,7 +44,7 @@ use crate::core::{
     GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree, InboxItem,
     InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP, LibraryBundle, LibraryImportResult, LibraryKind,
     LibraryPatch, LibraryScope, LiveBoardKind, LiveContext, LiveNotebookEntry, LiveNotice,
-    LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, MesaVersion, ModelRates,
+    LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, ModelRates, NaruVersion,
     NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
     ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, STALE_CLAIM_MINUTES, Script,
     ScriptArg, ScriptPatch, ScriptRunEvent, Status, Store, SystemInfo, Task, TaskPatch,
@@ -312,7 +312,7 @@ fn watch_retro_tick() -> Duration {
 
 /// One retro-watcher pass (mesa task 1158, `docs/retro.md`): if no
 /// retrospective has run in the last `watchers.retro-interval-hours`, claim a
-/// `watcher` run row and spawn the `mesa-retro` agent on it.
+/// `watcher` run row and spawn the `naru-retro` agent on it.
 ///
 /// The run row is the claim, written **before** the spawn — the
 /// inbox-watcher's dedup set, but in the db rather than memory, because the
@@ -356,7 +356,7 @@ fn retro_watcher_tick(state: &AppState) {
                 return;
             }
         };
-        // The default template spawns `--agent mesa-retro`, so the definition
+        // The default template spawns `--agent naru-retro`, so the definition
         // has to be on disk before the spawn — `claude --agent` errors on an
         // agent it has never seen. A failure is a failed spawn, rolled back
         // below with the rest.
@@ -2152,7 +2152,7 @@ fn router(state: AppState) -> Router {
         // Header decoration: mesa's own version. A compile-time constant —
         // no store, no gate (it leaks nothing and the header needs it under
         // `--lan` too).
-        .route("/api/version", get(get_mesa_version))
+        .route("/api/version", get(get_naru_version))
         // Settings page: how the host the server runs on is doing. Read-only
         // external state and no store, so the same standard-guard-only
         // posture as /api/version and /api/git-status — it names no project,
@@ -3968,7 +3968,7 @@ fn live_agent_dir(
                 format!("{}: live {session_id}", project.name),
             )
         }
-        None => (None, format!("mesa live {session_id}")),
+        None => (None, format!("naru live {session_id}")),
     };
     let dir = live_spawn_dir(local_path);
     Ok((dir, name))
@@ -3993,8 +3993,8 @@ async fn spawn_live_agent(
     let (dir, name) = live_agent_dir(&state.store.lock().unwrap(), project_id, session_id)?;
     let path = dir.clone();
     let prompt = live::agent_prompt(&state.store.lock().unwrap(), session_id);
-    // The `mesa-live` agent definition is seeded to disk before the spawn
-    // (mesa task 1068): the default template spawns `--agent mesa-live`, which
+    // The `naru-live` agent definition is seeded to disk before the spawn
+    // (mesa task 1068): the default template spawns `--agent naru-live`, which
     // errors on an agent Claude Code has never seen. A failure is treated
     // exactly like a failed spawn — `unavailable`, and the caller ends the
     // session it just opened.
@@ -6026,8 +6026,8 @@ async fn get_git_status(State(state): State<AppState>) -> ApiResult<Response> {
 /// `GET /api/version` — the running binary's own version, for the header.
 /// Infallible and always 200: it is `CARGO_PKG_VERSION`, baked in at compile
 /// time. Not to be confused with `get_project_version` below.
-async fn get_mesa_version() -> Json<MesaVersion> {
-    Json(MesaVersion {
+async fn get_naru_version() -> Json<NaruVersion> {
+    Json(NaruVersion {
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
@@ -13635,7 +13635,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
     }
 
     /// The retro-watcher (mesa task 1158) dispatches exactly once per
-    /// interval: the first tick over a fresh db spawns the `mesa-retro`
+    /// interval: the first tick over a fresh db spawns the `naru-retro`
     /// agent under `~/.mesa/workspace` with the run id in its prompt, and a
     /// second tick inside the interval spawns nothing, because the run row
     /// it wrote is the claim.
@@ -13669,7 +13669,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             );
             assert!(
                 log.contains(&format!(
-                    "|mesa retro {}|Run mesa session retrospective {}.",
+                    "|naru retro {}|Run mesa session retrospective {}.",
                     run.id, run.id
                 )),
                 "the session name and prompt carry the run id: {log:?}"
@@ -13678,10 +13678,10 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 std::fs::read_to_string(stub_dir.path().join("last-agent"))
                     .unwrap()
                     .trim(),
-                "mesa-retro"
+                "naru-retro"
             );
             assert!(
-                home.join(".claude/agents/mesa-retro.md").is_file(),
+                home.join(".claude/agents/naru-retro.md").is_file(),
                 "the definition is seeded before the spawn"
             );
 
@@ -15218,7 +15218,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         let _env = attachments::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // A live start seeds the `mesa-live` agent definition under `$HOME`
+        // A live start seeds the `naru-live` agent definition under `$HOME`
         // (mesa task 1068), so this runs against a throwaway one rather than
         // writing into whoever is running the tests.
         crate::core::library::test_home::with_home_dir(|_| {
@@ -15327,7 +15327,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             store
                 .add_live_turn(
                     session.id,
-                    LiveRole::Mesa,
+                    LiveRole::Naru,
                     "",
                     Some(crate::core::LiveAction::Navigate),
                     Some("#/inbox"),

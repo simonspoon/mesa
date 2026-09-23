@@ -26,7 +26,7 @@ The definition is the `inbox-triage` library built-in
 (`core::inbox_triage::INBOX_TRIAGE_DEFINITION`, `docs/library.md`), seeded to
 `~/.claude/agents/inbox-triage.md` by
 `core::inbox_triage::ensure_agent_definition` **before every spawn** —
-exactly as `mesa-live` and `supervisor` are — from the effective row (a fork
+exactly as `naru-live` and `supervisor` are — from the effective row (a fork
 if the user made one, else the built-in) and **never overwriting an existing
 file**; after the first seed the file belongs to the sync flow. A seed failure
 is a failed spawn: the item's claim is released and the next tick retries.

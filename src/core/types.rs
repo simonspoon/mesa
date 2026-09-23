@@ -418,7 +418,7 @@ pub struct ConfigListen {
 ///
 /// This used to carry the instruction block a live agent is spawned with too
 /// (`prompt`/`default_prompt`), but that moved to the library as of mesa task
-/// 919 — it is now the `mesa-live` agent definition (mesa task 1068), edited
+/// 919 — it is now the `naru-live` agent definition (mesa task 1068), edited
 /// on `#/library` rather than here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
@@ -556,7 +556,7 @@ pub struct ProjectVersion {
 /// Unrelated to `ProjectVersion` above, which reads a *project's* manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../frontend/src/types/")]
-pub struct MesaVersion {
+pub struct NaruVersion {
     pub version: String,
 }
 
@@ -2461,13 +2461,31 @@ impl<'de> Deserialize<'de> for LibraryBundleItem {
                 wire.export_command,
             ),
         };
+        // mesa task 1302: a fork of a renamed built-in (`mesa-live`,
+        // `mesa-retro`) is read as a fork of its new id, with the same name and
+        // frontmatter rewrite migration index 71 made of the stored forks.
+        let (mut name, mut body, mut builtin_id) = (wire.name, wire.body, wire.builtin_id);
+        if let Some(old) = builtin_id.clone() {
+            let new = crate::core::library::canonical_builtin_id(&old);
+            if new != old {
+                if name == old {
+                    name = new.to_string();
+                }
+                if let Some(renamed) =
+                    crate::core::library::rename_frontmatter_name(&body, &old, new)
+                {
+                    body = renamed;
+                }
+                builtin_id = Some(new.to_string());
+            }
+        }
         Ok(LibraryBundleItem {
-            name: wire.name,
+            name,
             kind,
             scope: wire.scope,
             project: wire.project,
-            body: wire.body,
-            builtin_id: wire.builtin_id,
+            body,
+            builtin_id,
             export_command,
         })
     }
@@ -3788,21 +3806,30 @@ impl LiveStatus {
 #[ts(export, export_to = "../frontend/src/types/")]
 pub enum LiveRole {
     User,
-    Mesa,
+    // Written and serialized as `mesa`; `parse` reads a stored `mesa` or
+    // `naru` — see `as_str` for why the wire value has not flipped yet.
+    #[serde(rename = "mesa")]
+    Naru,
 }
 
 impl LiveRole {
+    /// The stored and wire spelling. Naru's own turn is still written as
+    /// `mesa` (mesa task 1302): the iOS app compares a turn's role against
+    /// `"mesa"` to tell Naru's turns from the person's, so writing `naru`
+    /// would break it. The flip to writing `naru` waits until the iOS app
+    /// accepts both (mesa-ios task 1304); `parse` already reads either
+    /// spelling, so a row a later build writes as `naru` reads back.
     pub fn as_str(self) -> &'static str {
         match self {
             LiveRole::User => "user",
-            LiveRole::Mesa => "mesa",
+            LiveRole::Naru => "mesa",
         }
     }
 
     pub fn parse(s: &str) -> Option<LiveRole> {
         match s {
             "user" => Some(LiveRole::User),
-            "mesa" => Some(LiveRole::Mesa),
+            "mesa" | "naru" => Some(LiveRole::Naru),
             _ => None,
         }
     }

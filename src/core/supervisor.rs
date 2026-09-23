@@ -1,7 +1,7 @@
 //! The `supervisor` agent definition (mesa task 1075) — the contract an
 //! `/execute-todo` run is supervised under, moved out of the dispatched
 //! prompt and into a named Claude Code agent, exactly as mesa task 1068 moved
-//! the live conversation's loop into `mesa-live`.
+//! the live conversation's loop into `naru-live`.
 //!
 //! The shape mirrors the agent bits of [`crate::core::live`]: a const holding
 //! the definition, a const holding the built-in's id (which is also the agent

@@ -609,6 +609,7 @@ const COMMAND_MULTIPLEXERS: &[&str] = &[
     "cargo",
     "npm",
     "mesa",
+    "naru",
     "python3",
     "gh",
     "docker",

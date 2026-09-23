@@ -407,7 +407,7 @@ start locations in the global Agents sidebar.
   descendants. See `docs/todo-watcher.md`.
 - **Retrospective** (`mesa serve --watch-retro`, off by default; `mesa retro
   run` on demand): every `watchers.retro-interval-hours` (default 72) starts
-  the `mesa-retro` agent, which reviews the task sessions finished since the
+  the `naru-retro` agent, which reviews the task sessions finished since the
   last run for friction — denials, retry loops, a missing skill, a tool that
   keeps failing — and files each *new* finding into the inbox as a change
   request for the inbox-watcher to triage. It proposes and never edits; a
@@ -442,7 +442,7 @@ start locations in the global Agents sidebar.
   rebuilding. Placeholders `{id}`, `{name}`, `{prompt}`; the program and the
   agent are spelled out literally. Templates are argv, not shell: no config file means the built-in
   `claude --bg --agent supervisor …` command, unchanged (the live conversation's own
-  default names its agent `mesa-live`, the definition it runs as). A multi-line value opts that
+  default names its agent `naru-live`, the definition it runs as). A multi-line value opts that
   one command into a `bash -c` script instead, whose values arrive as `MESA_*`
   environment variables rather than being substituted into the body — either
   way, no Naru data is ever spliced into a string a shell parses. The same file

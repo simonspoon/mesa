@@ -1027,7 +1027,7 @@ ok "both speech verbs sit behind the config routes' gate — a request that isn'
 # The fifth section of the file. It used to hold two keys — the instruction
 # block a live agent is spawned with, and how long a settled dictation draft
 # waits before the page sends it — but the prompt moved out to the library as
-# of mesa task 919 — and as of mesa task 1068 it is the `mesa-live` agent
+# of mesa task 919 — and as of mesa task 1068 it is the `naru-live` agent
 # definition there, spawned by name rather than injected — leaving this
 # section with the one key. The
 # "a configured prompt replaces the built-in at spawn" contract now belongs to

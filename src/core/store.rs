@@ -1102,6 +1102,87 @@ const MIGRATIONS: &[&str] = &[
     // `ON DELETE SET NULL`, not CASCADE: deleting the created task must not
     // destroy the archived record of the request that asked for it.
     "ALTER TABLE inbox ADD COLUMN converted_task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL;",
+    // Task 1302: the `mesa-live` and `mesa-retro` built-ins are `naru-live`
+    // and `naru-retro` now (`core::library::RENAMED_BUILTINS`), so a stored
+    // fork moves with them — or it would stop shadowing its built-in and the
+    // spawn would seed the unedited default. Per fork: `builtin_id` moves; a
+    // `name` equal to the old id moves too; and the frontmatter line
+    // `name: mesa-live` becomes `name: naru-live`, so `claude --agent
+    // naru-live` finds the file seeded from it. Only that one line of the body
+    // changes — the first `\nname: <old>\n` of a body opening `---\n`, and
+    // only before the frontmatter's closing `\n---`; a CRLF body (opening
+    // `---\r\n`, line `\nname: <old>\r\n`) is matched too and keeps its
+    // `\r\n` (`library::rename_frontmatter_name` is the Rust twin, for an old
+    // bundle). When the name moves, so does the row's path
+    // (`.claude/agents/naru-live.md`), and the sync baseline was agreement
+    // about the old file, so it is cleared: the new path reads `mesa-new`
+    // until it is seeded or synced, never `both-changed`. The old file on
+    // disk is left alone. `library_versions` is history and is untouched.
+    //
+    // A row is skipped rather than failing the migration — which would stop
+    // mesa from opening at all — when the new `builtin_id` is already taken
+    // or, for a row whose name moves, another row already holds the new name
+    // at the same identity (`library_items_identity`).
+    "UPDATE library_items
+        SET body = CASE
+              WHEN (substr(body, 1, 4) = '---' || char(10)
+                    OR substr(body, 1, 5) = '---' || char(13) || char(10))
+               AND instr(body, char(10) || 'name: mesa-live' || char(10)) > 0
+               AND instr(body, char(10) || 'name: mesa-live' || char(10))
+                   < instr(substr(body, 4), char(10) || '---') + 3
+              THEN substr(body, 1, instr(body, char(10) || 'name: mesa-live' || char(10)))
+                   || 'name: naru-live' || char(10)
+                   || substr(body, instr(body, char(10) || 'name: mesa-live' || char(10)) + 17)
+              WHEN (substr(body, 1, 4) = '---' || char(10)
+                    OR substr(body, 1, 5) = '---' || char(13) || char(10))
+               AND instr(body, char(10) || 'name: mesa-live' || char(13) || char(10)) > 0
+               AND instr(body, char(10) || 'name: mesa-live' || char(13) || char(10))
+                   < instr(substr(body, 4), char(10) || '---') + 3
+              THEN substr(body, 1, instr(body, char(10) || 'name: mesa-live' || char(13) || char(10)))
+                   || 'name: naru-live' || char(13) || char(10)
+                   || substr(body, instr(body, char(10) || 'name: mesa-live' || char(13) || char(10)) + 18)
+              ELSE body END,
+            synced_body = CASE WHEN name = 'mesa-live' THEN NULL ELSE synced_body END,
+            synced_at = CASE WHEN name = 'mesa-live' THEN NULL ELSE synced_at END,
+            name = CASE WHEN name = 'mesa-live' THEN 'naru-live' ELSE name END,
+            builtin_id = 'naru-live'
+      WHERE builtin_id = 'mesa-live'
+        AND NOT EXISTS (SELECT 1 FROM library_items n WHERE n.builtin_id = 'naru-live')
+        AND NOT (name = 'mesa-live' AND EXISTS (
+              SELECT 1 FROM library_items n
+               WHERE n.kind = library_items.kind AND n.scope = library_items.scope
+                 AND COALESCE(n.project_id, -1) = COALESCE(library_items.project_id, -1)
+                 AND n.name = 'naru-live'));
+     UPDATE library_items
+        SET body = CASE
+              WHEN (substr(body, 1, 4) = '---' || char(10)
+                    OR substr(body, 1, 5) = '---' || char(13) || char(10))
+               AND instr(body, char(10) || 'name: mesa-retro' || char(10)) > 0
+               AND instr(body, char(10) || 'name: mesa-retro' || char(10))
+                   < instr(substr(body, 4), char(10) || '---') + 3
+              THEN substr(body, 1, instr(body, char(10) || 'name: mesa-retro' || char(10)))
+                   || 'name: naru-retro' || char(10)
+                   || substr(body, instr(body, char(10) || 'name: mesa-retro' || char(10)) + 18)
+              WHEN (substr(body, 1, 4) = '---' || char(10)
+                    OR substr(body, 1, 5) = '---' || char(13) || char(10))
+               AND instr(body, char(10) || 'name: mesa-retro' || char(13) || char(10)) > 0
+               AND instr(body, char(10) || 'name: mesa-retro' || char(13) || char(10))
+                   < instr(substr(body, 4), char(10) || '---') + 3
+              THEN substr(body, 1, instr(body, char(10) || 'name: mesa-retro' || char(13) || char(10)))
+                   || 'name: naru-retro' || char(13) || char(10)
+                   || substr(body, instr(body, char(10) || 'name: mesa-retro' || char(13) || char(10)) + 19)
+              ELSE body END,
+            synced_body = CASE WHEN name = 'mesa-retro' THEN NULL ELSE synced_body END,
+            synced_at = CASE WHEN name = 'mesa-retro' THEN NULL ELSE synced_at END,
+            name = CASE WHEN name = 'mesa-retro' THEN 'naru-retro' ELSE name END,
+            builtin_id = 'naru-retro'
+      WHERE builtin_id = 'mesa-retro'
+        AND NOT EXISTS (SELECT 1 FROM library_items n WHERE n.builtin_id = 'naru-retro')
+        AND NOT (name = 'mesa-retro' AND EXISTS (
+              SELECT 1 FROM library_items n
+               WHERE n.kind = library_items.kind AND n.scope = library_items.scope
+                 AND COALESCE(n.project_id, -1) = COALESCE(library_items.project_id, -1)
+                 AND n.name = 'naru-retro'));",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -5500,7 +5581,7 @@ impl Store {
                     ));
                 }
             }
-            LiveRole::Mesa => {
+            LiveRole::Naru => {
                 if text.is_empty() && action.is_none() {
                     return Err(Error::Validation(
                         "a mesa turn must have text or an action".into(),
@@ -5626,7 +5707,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
             (
                 session_id,
-                LiveRole::Mesa.as_str(),
+                LiveRole::Naru.as_str(),
                 live::notice_text(kind),
                 kind.as_str(),
                 session.agent_id.as_deref(),
@@ -7203,7 +7284,7 @@ impl Store {
         self.conn
             .query_row(
                 &format!("SELECT {LIBRARY_COLUMNS} FROM library_items WHERE builtin_id = ?1"),
-                [builtin_id],
+                [crate::core::library::canonical_builtin_id(builtin_id)],
                 row_to_library_item,
             )
             .optional()
@@ -7233,6 +7314,8 @@ impl Store {
         validate_library_export(kind, export_command)?;
         self.ensure_library_scope(scope, project_id)?;
         self.ensure_library_name_free(kind, scope, project_id, &name, None)?;
+        // A pre-rename id (`mesa-live`, mesa task 1302) forks its new one.
+        let builtin_id = builtin_id.map(crate::core::library::canonical_builtin_id);
         if let Some(builtin_id) = builtin_id {
             self.ensure_library_builtin(builtin_id)?;
         }
@@ -12598,7 +12681,7 @@ mod tests {
             .hand_off_live_session(session.id, Some("second"), None)
             .unwrap();
         let after = store
-            .add_live_turn(session.id, LiveRole::Mesa, "under the second", None, None)
+            .add_live_turn(session.id, LiveRole::Naru, "under the second", None, None)
             .unwrap();
         assert_eq!(after.agent_id.as_deref(), Some("second"));
 
@@ -13078,6 +13161,40 @@ mod tests {
         assert_eq!(taken.speaker.as_deref(), Some("the-tab-left"));
     }
 
+    /// Naru's turns are still written as `mesa` for the iOS app (mesa task
+    /// 1302), but a row a later build writes as `naru` must read back as the
+    /// same role rather than panicking in `row_to_live_turn`.
+    #[test]
+    fn a_turn_stored_as_naru_reads_back_as_naru() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO live_turns (session_id, role, text, created_at) \
+                 VALUES (?1, 'naru', 'from a later build', datetime('now'))",
+                [session.id],
+            )
+            .unwrap();
+        let written = store
+            .add_live_turn(session.id, LiveRole::Naru, "from this one", None, None)
+            .unwrap();
+        let turns = store.list_live_turns(session.id, None, 10).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, LiveRole::Naru);
+        assert_eq!(turns[0].text, "from a later build");
+        let stored: String = store
+            .conn
+            .query_row(
+                "SELECT role FROM live_turns WHERE id = ?1",
+                [written.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "mesa");
+        assert_eq!(serde_json::to_value(LiveRole::Naru).unwrap(), "mesa");
+    }
+
     #[test]
     fn add_live_turn_records_both_sides_of_the_conversation() {
         let (mut store, _dir) = temp_store();
@@ -13100,18 +13217,18 @@ mod tests {
         let reply = store
             .add_live_turn(
                 session.id,
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "Three tasks are open.",
                 None,
                 None,
             )
             .unwrap();
-        assert_eq!(reply.role, LiveRole::Mesa);
+        assert_eq!(reply.role, LiveRole::Naru);
         // A pure navigate speaks nothing — the one place empty text is legal.
         let moved = store
             .add_live_turn(
                 session.id,
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "",
                 Some(LiveAction::Navigate),
                 Some("#/projects/1"),
@@ -13144,42 +13261,42 @@ mod tests {
             ),
             (
                 "a mesa turn that neither speaks nor acts",
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "",
                 None,
                 None,
             ),
             (
                 "a navigate with no target",
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "opening",
                 Some(LiveAction::Navigate),
                 None,
             ),
             (
                 "a target with no action",
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "opening",
                 None,
                 Some("#/inbox"),
             ),
             (
                 "a target that is not a route",
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "opening",
                 Some(LiveAction::Navigate),
                 Some("/inbox"),
             ),
             (
                 "text past the spoken bound",
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 long.as_str(),
                 None,
                 None,
             ),
             (
                 "a sidebar action carrying a route",
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "making room",
                 Some(LiveAction::CollapseSidebars),
                 Some("#/inbox"),
@@ -13228,7 +13345,7 @@ mod tests {
         let quiet = store
             .add_live_turn(
                 session.id,
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "",
                 Some(LiveAction::CollapseSidebars),
                 None,
@@ -13241,7 +13358,7 @@ mod tests {
         let spoken = store
             .add_live_turn(
                 session.id,
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "Bringing those back.",
                 Some(LiveAction::ExpandSidebars),
                 None,
@@ -13299,7 +13416,7 @@ mod tests {
         // Speaking does not end it: the agent may say "one moment" and carry
         // on working, which is the span this column exists to cover.
         store
-            .add_live_turn(session.id, LiveRole::Mesa, "one moment", None, None)
+            .add_live_turn(session.id, LiveRole::Naru, "one moment", None, None)
             .unwrap();
         assert!(
             store
@@ -13369,7 +13486,7 @@ mod tests {
             .unwrap();
         // A mesa turn is not something to listen for.
         store
-            .add_live_turn(session.id, LiveRole::Mesa, "hello there", None, None)
+            .add_live_turn(session.id, LiveRole::Naru, "hello there", None, None)
             .unwrap();
 
         let got = store.next_user_turn(session.id).unwrap().unwrap();
@@ -13471,7 +13588,7 @@ mod tests {
         let turn = store
             .add_live_turn(
                 session.id,
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "Three tasks are open.",
                 None,
                 None,
@@ -13500,7 +13617,7 @@ mod tests {
             .add_live_turn(session.id, LiveRole::User, "hello", None, None)
             .unwrap();
         store
-            .add_live_turn(session.id, LiveRole::Mesa, "Hello back.", None, None)
+            .add_live_turn(session.id, LiveRole::Naru, "Hello back.", None, None)
             .unwrap();
         store
             .conn
@@ -13562,15 +13679,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            71,
-            "a fresh db should report user_version 71"
+            72,
+            "a fresh db should report user_version 72"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 71);
+        assert_eq!(version, 72);
     }
 
     // ---- the session retrospective (mesa task 1158) ----
@@ -14081,6 +14198,188 @@ mod tests {
         assert_eq!(turns[0].notice, None);
     }
 
+    /// Pins the agent rename (mesa task 1302) at index 71. A db from before
+    /// it holds hand-tuned forks of `mesa-live` and `mesa-retro`: each moves
+    /// to its new built-in id and name, its body changes in exactly the one
+    /// frontmatter line, its sync baseline is cleared because its path moved,
+    /// and its version history is untouched. A fork whose name was already
+    /// changed keeps that name, and a line `name: mesa-live` below the
+    /// frontmatter is prose, not the agent's name.
+    #[test]
+    fn forks_of_the_renamed_agents_move_with_them_at_migration_71() {
+        const RENAME: usize = 71;
+        assert!(
+            MIGRATIONS[RENAME].contains("builtin_id = 'naru-live'"),
+            "migration {RENAME} is no longer the naru agent rename — a shipped \
+             migration was edited or reordered, which is never allowed"
+        );
+        let live_body = "---\nname: mesa-live\ndescription: tuned\neffort: high\n---\n\n\
+                         Keep it short.\nname: mesa-live\n";
+        let retro_body = "---\ndescription: tuned\nname: mesa-retro\n---\nReview.\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..RENAME] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", RENAME as i64)
+                .unwrap();
+            conn.execute(
+                "INSERT INTO library_items (id, name, kind, scope, body, builtin_id, \
+                 synced_body, synced_at, created_at, updated_at) \
+                 VALUES (21, 'mesa-live', 'agent', 'user', ?1, 'mesa-live', ?1, \
+                 '2026-09-22 18:28:03', datetime('now'), datetime('now'))",
+                [live_body],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO library_items (id, name, kind, scope, body, builtin_id, \
+                 synced_body, synced_at, created_at, updated_at) \
+                 VALUES (22, 'my-retro', 'agent', 'user', ?1, 'mesa-retro', ?1, \
+                 '2026-09-22 17:02:00', datetime('now'), datetime('now'))",
+                [retro_body],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO library_versions (item_id, body, source, created_at) \
+                 VALUES (21, ?1, 'edit', datetime('now'))",
+                [live_body],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+
+        let live = store.find_library_fork("naru-live").unwrap().unwrap();
+        assert_eq!(live.id, Some(21));
+        assert_eq!(live.name, "naru-live");
+        assert_eq!(live.builtin_id.as_deref(), Some("naru-live"));
+        assert_eq!(
+            live.body,
+            "---\nname: naru-live\ndescription: tuned\neffort: high\n---\n\n\
+             Keep it short.\nname: mesa-live\n"
+        );
+        assert_eq!(live.synced_body, None);
+        assert_eq!(live.synced_at, None);
+        // The old id still finds the moved fork.
+        assert_eq!(
+            store.find_library_fork("mesa-live").unwrap().unwrap().id,
+            Some(21)
+        );
+
+        let retro = store.find_library_fork("naru-retro").unwrap().unwrap();
+        assert_eq!(retro.id, Some(22));
+        assert_eq!(retro.name, "my-retro");
+        assert_eq!(
+            retro.body,
+            "---\ndescription: tuned\nname: naru-retro\n---\nReview.\n"
+        );
+        // Its name, and so its path, did not move: the baseline stays.
+        assert_eq!(retro.synced_body.as_deref(), Some(retro_body));
+
+        let history: Vec<String> = store
+            .conn
+            .prepare("SELECT body FROM library_versions WHERE item_id = 21")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(history, vec![live_body.to_string()]);
+    }
+
+    /// A fork saved with CRLF line endings has its frontmatter name line
+    /// rewritten by migration 71 too, keeping the `\r\n` — otherwise its name
+    /// and path would move while the body still named `mesa-live`, and
+    /// `claude --agent naru-live` would not find it.
+    #[test]
+    fn a_crlf_fork_is_renamed_by_migration_71_keeping_its_line_endings() {
+        const RENAME: usize = 71;
+        let live_body =
+            "---\r\nname: mesa-live\r\ndescription: tuned\r\n---\r\n\r\nKeep it short.\r\n";
+        let retro_body = "---\r\ndescription: tuned\r\nname: mesa-retro\r\n---\r\nReview.";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..RENAME] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", RENAME as i64)
+                .unwrap();
+            for (name, body) in [("mesa-live", live_body), ("mesa-retro", retro_body)] {
+                conn.execute(
+                    "INSERT INTO library_items (name, kind, scope, body, builtin_id, \
+                     created_at, updated_at) \
+                     VALUES (?1, 'agent', 'user', ?2, ?1, datetime('now'), datetime('now'))",
+                    [name, body],
+                )
+                .unwrap();
+            }
+        }
+        let store = Store::open(&path).unwrap();
+        let live = store.find_library_fork("naru-live").unwrap().unwrap();
+        assert_eq!(live.name, "naru-live");
+        assert_eq!(
+            live.body,
+            "---\r\nname: naru-live\r\ndescription: tuned\r\n---\r\n\r\nKeep it short.\r\n"
+        );
+        let retro = store.find_library_fork("naru-retro").unwrap().unwrap();
+        assert_eq!(retro.name, "naru-retro");
+        assert_eq!(
+            retro.body,
+            "---\r\ndescription: tuned\r\nname: naru-retro\r\n---\r\nReview."
+        );
+    }
+
+    /// A fork that would collide with an existing row of the new id or name
+    /// is skipped by migration 71 rather than failing it — a failed
+    /// migration would stop mesa from opening at all.
+    #[test]
+    fn a_colliding_fork_is_skipped_by_migration_71_not_fatal() {
+        const RENAME: usize = 71;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for sql in &MIGRATIONS[..RENAME] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", RENAME as i64)
+                .unwrap();
+            conn.execute_batch(
+                "INSERT INTO library_items (name, kind, scope, body, builtin_id, created_at, \
+                 updated_at) VALUES \
+                 ('mesa-live', 'agent', 'user', 'old', 'mesa-live', datetime('now'), datetime('now')), \
+                 ('naru-live', 'agent', 'user', 'mine', NULL, datetime('now'), datetime('now')), \
+                 ('mesa-retro', 'agent', 'user', 'old', 'mesa-retro', datetime('now'), datetime('now')), \
+                 ('other', 'agent', 'user', 'taken', 'naru-retro', datetime('now'), datetime('now'));",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let rows: Vec<(String, Option<String>, String)> = store
+            .conn
+            .prepare("SELECT name, builtin_id, body FROM library_items ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let row = |n: &str, b: Option<&str>, body: &str| {
+            (n.to_string(), b.map(String::from), body.to_string())
+        };
+        assert_eq!(
+            rows,
+            vec![
+                row("mesa-live", Some("mesa-live"), "old"),
+                row("naru-live", None, "mine"),
+                row("mesa-retro", Some("mesa-retro"), "old"),
+                row("other", Some("naru-retro"), "taken"),
+            ]
+        );
+    }
+
     /// Pins the `stalled` clearing (mesa task 1218) at index 63: a db from
     /// before it that holds a `stalled` notice turn reads it back — text
     /// intact, kind cleared — instead of failing on the removed variant,
@@ -14144,7 +14443,7 @@ mod tests {
             .add_live_notice(session.id, LiveNotice::Permission)
             .unwrap();
         assert!(created);
-        assert_eq!(first.role, LiveRole::Mesa);
+        assert_eq!(first.role, LiveRole::Naru);
         assert_eq!(first.notice, Some(LiveNotice::Permission));
         assert_eq!(first.text, live::notice_text(LiveNotice::Permission));
         assert_eq!(first.action, None);
@@ -14236,7 +14535,7 @@ mod tests {
             .add_live_notice(session.id, LiveNotice::Permission)
             .unwrap();
         store
-            .add_live_turn(session.id, LiveRole::Mesa, "a spoken sentence", None, None)
+            .add_live_turn(session.id, LiveRole::Naru, "a spoken sentence", None, None)
             .unwrap();
         let indexed: i64 = store
             .conn
@@ -15100,7 +15399,7 @@ mod tests {
         store
             .add_live_turn(
                 session.id,
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 "",
                 Some(LiveAction::Navigate),
                 Some("#/inbox"),

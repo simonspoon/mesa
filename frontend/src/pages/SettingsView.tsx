@@ -939,7 +939,7 @@ function WatchersSection() {
  *
  * The instruction block the conversation's agent is spawned with used to
  * live here too (mesa task 867), but moved to the library as of mesa task
- * 919 — it is now the `mesa-live` agent definition (mesa task 1068), edited
+ * 919 — it is now the `naru-live` agent definition (mesa task 1068), edited
  * on `#/library` like any other row, so this section only links there instead
  * of holding a second editor for it.
  *
@@ -1010,7 +1010,7 @@ function LivePromptSection() {
         <p className="muted settings-command-blurb">
           What the agent driving a spoken conversation is told to do now
           lives in the library — see <a href="#/library">the library</a>,
-          under the <code>mesa-live</code> agent.
+          under the <code>naru-live</code> agent.
         </p>
       </section>
 

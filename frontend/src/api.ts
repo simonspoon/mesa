@@ -67,7 +67,7 @@ import type { LiveState } from './types/LiveState'
 import type { LiveTranscript } from './types/LiveTranscript'
 import type { LiveTurn } from './types/LiveTurn'
 import type { LiveWindow } from './types/LiveWindow'
-import type { MesaVersion } from './types/MesaVersion'
+import type { NaruVersion } from './types/NaruVersion'
 import type { ModelRates } from './types/ModelRates'
 import type { ProjectFileSearch } from './types/ProjectFileSearch'
 import type { ProjectFileTree } from './types/ProjectFileTree'
@@ -377,8 +377,8 @@ export function getGitStatus(): Promise<ProjectGitStatus[]> {
   return request('/api/git-status')
 }
 
-/** mesa's own version (the running binary's CARGO_PKG_VERSION). */
-export function getMesaVersion(): Promise<MesaVersion> {
+/** Naru's own version (the running binary's CARGO_PKG_VERSION). */
+export function getNaruVersion(): Promise<NaruVersion> {
   return request('/api/version')
 }
 

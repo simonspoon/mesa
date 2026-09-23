@@ -44,8 +44,8 @@
 #      mutation in both modes;
 #   9. the live conversation's agent definition comes from the library (mesa
 #      task 1068, replacing the `live-agent-prompt` prompt task 919 had made
-#      of `config.json`'s `live.prompt`): `mesa-live` starts unshadowed as a
-#      user-scope `agent` at `.claude/agents/mesa-live.md`, appears in `sync
+#      of `config.json`'s `live.prompt`): `naru-live` starts unshadowed as a
+#      user-scope `agent` at `.claude/agents/naru-live.md`, appears in `sync
 #      status` and is written to disk by `sync apply`, the spawned prompt
 #      carries the session line ALONE, and editing it forks it with the
 #      forked body replacing the built-in;
@@ -227,11 +227,11 @@ ok "CLI library create with a duplicate (kind,scope,name): exit 1 conflict"
 
 run 0 "$MESA" library list
 [ "$(jqs type)" = "array" ] || fail "CLI list: bare array"
-[ "$(jqs 'map(select(.builtin_id=="mesa-live")) | length')" = "1" ] ||
-  fail "CLI list: the mesa-live built-in must be present, got $STDOUT"
-[ "$(jqs '.[] | select(.builtin_id=="mesa-live") | .id')" = "null" ] ||
+[ "$(jqs 'map(select(.builtin_id=="naru-live")) | length')" = "1" ] ||
+  fail "CLI list: the naru-live built-in must be present, got $STDOUT"
+[ "$(jqs '.[] | select(.builtin_id=="naru-live") | .id')" = "null" ] ||
   fail "CLI list: an unshadowed built-in must report id:null"
-[ "$(jqs '.[] | select(.builtin_id=="mesa-live") | .builtin')" = "true" ] ||
+[ "$(jqs '.[] | select(.builtin_id=="naru-live") | .builtin')" = "true" ] ||
   fail "CLI list: an unshadowed built-in must report builtin:true"
 ok "CLI library list: bare array including every unshadowed built-in (id:null, builtin:true)"
 
@@ -375,7 +375,7 @@ ok "CLI library create: '../evil', 'a/b', '..', '.', and an empty name are each 
 # section 7, once it is up.
 
 # ================= 4. built-ins: fork / restore =================
-# `stop-notify.sh` is the fixture for this section, leaving `mesa-live`
+# `stop-notify.sh` is the fixture for this section, leaving `naru-live`
 # untouched for section 9.
 
 run 0 "$MESA" library list
@@ -472,6 +472,30 @@ RESULT=$(jqs '.[0]')
 [ "$(cat "$CLAUDE_DIR/agents/syncnew.md")" = "version A" ] ||
   fail "sync apply mesa: file content, got $(cat "$CLAUDE_DIR/agents/syncnew.md")"
 ok "sync apply (mesa) on a mesa-new row writes the file at the right path with the mesa body"
+
+# mesa task 1302: `naru` is the same choice as `mesa` under the new name, and
+# the result echoes whichever spelling was given.
+run 0 "$MESA" library sync apply --resolve '.claude/agents/syncnew.md=naru'
+RESULT=$(jqs '.[0]')
+[ "$(jq -r .applied <<<"$RESULT")" = "true" ] || fail "sync apply naru: must apply, got $RESULT"
+[ "$(jq -r .choice <<<"$RESULT")" = "naru" ] || fail "sync apply naru: echoes the choice as given, got $RESULT"
+[ "$(cat "$CLAUDE_DIR/agents/syncnew.md")" = "version A" ] ||
+  fail "sync apply naru: file content, got $(cat "$CLAUDE_DIR/agents/syncnew.md")"
+# `--all-naru` and its old spelling `--all-mesa`, each against its own
+# throwaway HOME and db so resolving every row cannot disturb this script's
+# fixtures: a fresh library is its unshadowed built-ins, all mesa-new.
+for FLAG in --all-naru --all-mesa; do
+  ALL_DIR="$TMP/sync${FLAG#--}"
+  mkdir -p "$ALL_DIR/home"
+  run 0 env HOME="$ALL_DIR/home" MESA_DB="$ALL_DIR/naru.db" NARU_DB="$ALL_DIR/naru.db" \
+    "$MESA" library sync apply "$FLAG"
+  [ "$(jqs 'length')" -gt 0 ] || fail "sync apply $FLAG: resolves the built-ins, got $STDOUT"
+  [ "$(jqs 'map(select(.applied != true or .choice != "mesa")) | length')" = "0" ] ||
+    fail "sync apply $FLAG: every row applied toward naru, got $STDOUT"
+  [ -f "$ALL_DIR/home/.claude/agents/naru-live.md" ] ||
+    fail "sync apply $FLAG: must write the naru-live definition"
+done
+ok "sync apply: \`=naru\` is the mesa choice echoed as given, and --all-naru/--all-mesa both resolve every row toward naru"
 
 run 0 "$MESA" library sync status
 ROW=$(jqs '.[] | select(.name=="syncnew" and .kind=="agent")')
@@ -1039,36 +1063,36 @@ LAN_PID=
 echo "== library-check: sections 7-8 (API + gates) passed ($CHECKS checks so far) =="
 
 # ========== 9. the named agent definitions come from the library ===========
-# mesa task 1068: the live conversation runs as the `mesa-live` agent
+# mesa task 1068: the live conversation runs as the `naru-live` agent
 # definition — an `agent` row with a real path, seeded to disk before the
 # spawn and synced like any other — rather than as a `prompt` glued into the
 # prompt argument.
 
-run 0 "$MESA" library show mesa-live
-[ "$(jqs .id)" = "null" ] || fail "fixture: mesa-live must start unshadowed for this section"
-[ "$(jqs .kind)" = "agent" ] || fail "mesa-live must be an agent definition, got $(jqs .kind)"
-[ "$(jqs .scope)" = "user" ] || fail "mesa-live must be user-scoped, got $(jqs .scope)"
-[ "$(jqs .path)" = ".claude/agents/mesa-live.md" ] ||
-  fail "mesa-live must map to .claude/agents/mesa-live.md, got $(jqs .path)"
+run 0 "$MESA" library show naru-live
+[ "$(jqs .id)" = "null" ] || fail "fixture: naru-live must start unshadowed for this section"
+[ "$(jqs .kind)" = "agent" ] || fail "naru-live must be an agent definition, got $(jqs .kind)"
+[ "$(jqs .scope)" = "user" ] || fail "naru-live must be user-scoped, got $(jqs .scope)"
+[ "$(jqs .path)" = ".claude/agents/naru-live.md" ] ||
+  fail "naru-live must map to .claude/agents/naru-live.md, got $(jqs .path)"
 BUILTIN_DEF=$(jqs .body)
 grep -q "mesa live listen" <<<"$BUILTIN_DEF" ||
   fail "fixture: the built-in definition must state the loop"
-grep -q "^name: mesa-live$" <<<"$BUILTIN_DEF" ||
+grep -q "^name: naru-live$" <<<"$BUILTIN_DEF" ||
   fail "fixture: the built-in definition must carry YAML frontmatter naming the agent"
-ok "mesa-live starts unshadowed as a user-scope agent definition at .claude/agents/mesa-live.md"
+ok "naru-live starts unshadowed as a user-scope agent definition at .claude/agents/naru-live.md"
 
 # Having a path means the sync flow carries it, unlike the prompt it replaced.
-rm -f "$CLAUDE_DIR/agents/mesa-live.md"
+rm -f "$CLAUDE_DIR/agents/naru-live.md"
 run 0 "$MESA" library sync status
-[ "$(jqs 'map(select(.path==".claude/agents/mesa-live.md")) | length')" = "1" ] ||
-  fail "sync status must report a row for the mesa-live definition, got $STDOUT"
-MESA_LIVE_STATUS=$(jqs '.[] | select(.path==".claude/agents/mesa-live.md") | .status')
+[ "$(jqs 'map(select(.path==".claude/agents/naru-live.md")) | length')" = "1" ] ||
+  fail "sync status must report a row for the naru-live definition, got $STDOUT"
+MESA_LIVE_STATUS=$(jqs '.[] | select(.path==".claude/agents/naru-live.md") | .status')
 [ "$MESA_LIVE_STATUS" = "mesa-new" ] ||
-  fail "with no file on disk, mesa-live must be mesa-new, got $MESA_LIVE_STATUS"
-run 0 "$MESA" library sync apply --resolve '.claude/agents/mesa-live.md=mesa' 
-grep -q "mesa live listen" "$CLAUDE_DIR/agents/mesa-live.md" ||
-  fail "sync apply (mesa wins) must write the definition to \$HOME/.claude/agents/mesa-live.md"
-ok "the mesa-live definition appears in sync status and sync apply writes it to \$HOME/.claude/agents"
+  fail "with no file on disk, naru-live must be mesa-new, got $MESA_LIVE_STATUS"
+run 0 "$MESA" library sync apply --resolve '.claude/agents/naru-live.md=mesa' 
+grep -q "mesa live listen" "$CLAUDE_DIR/agents/naru-live.md" ||
+  fail "sync apply (mesa wins) must write the definition to \$HOME/.claude/agents/naru-live.md"
+ok "the naru-live definition appears in sync status and sync apply writes it to \$HOME/.claude/agents"
 
 # The prompt mesa injects is the session line alone: the loop travels as the
 # definition now, never as the prompt argument.
@@ -1085,21 +1109,21 @@ run 0 "$MESA" live stop
 ok "the spawned prompt carries the session line only — the instructions are the agent definition"
 
 # Editing the built-in forks it, exactly as for any other library row.
-run 0 "$MESA" library update mesa-live --body '---
-name: mesa-live
+run 0 "$MESA" library update naru-live --body '---
+name: naru-live
 ---
 
 You are a custom live agent. Be terse.'
-[ "$(jqs .builtin_id)" = "mesa-live" ] || fail "forking mesa-live: builtin_id"
-[ "$(jqs .id)" != "null" ] || fail "forking mesa-live: the fork must be a real row"
-[ "$(jqs .kind)" = "agent" ] || fail "forking mesa-live: the fork keeps its kind"
-run 0 "$MESA" library show mesa-live
+[ "$(jqs .builtin_id)" = "naru-live" ] || fail "forking naru-live: builtin_id"
+[ "$(jqs .id)" != "null" ] || fail "forking naru-live: the fork must be a real row"
+[ "$(jqs .kind)" = "agent" ] || fail "forking naru-live: the fork keeps its kind"
+run 0 "$MESA" library show naru-live
 grep -q "Be terse." <<<"$(jqs .body)" ||
   fail "the forked body must REPLACE the built-in: $STDOUT"
 if grep -q "mesa live listen" <<<"$(jqs .body)"; then
   fail "a fork replaces the built-in rather than extending it: $STDOUT"
 fi
-ok "editing mesa-live forks it, and the forked body replaces the built-in definition"
+ok "editing naru-live forks it, and the forked body replaces the built-in definition"
 
 # ---- the supervisor definition is the same shape one step up (task 1075) ----
 # The auto-dispatched `/execute-todo` run is supervised by a named agent for
@@ -1124,7 +1148,7 @@ if grep -qE "^tools:.*(Edit|Write)" <<<"$SUPERVISOR_DEF"; then
 fi
 ok "supervisor starts unshadowed as a user-scope agent definition at .claude/agents/supervisor.md"
 
-# Having a path means the sync flow carries it, exactly as for mesa-live.
+# Having a path means the sync flow carries it, exactly as for naru-live.
 rm -f "$CLAUDE_DIR/agents/supervisor.md"
 run 0 "$MESA" library sync status
 [ "$(jqs 'map(select(.path==".claude/agents/supervisor.md")) | length')" = "1" ] ||

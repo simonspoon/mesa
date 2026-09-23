@@ -2,7 +2,7 @@
 //! `serve --watch-inbox` dispatch triages one inbox item under, as a named
 //! Claude Code agent rather than a slash command, exactly as mesa task 1075
 //! moved the todo-watcher's run into `supervisor` and mesa task 1068 moved the
-//! live conversation's loop into `mesa-live`.
+//! live conversation's loop into `naru-live`.
 //!
 //! The shape mirrors [`crate::core::supervisor`]: a const holding the
 //! definition, a const holding the built-in's id (which is also the agent

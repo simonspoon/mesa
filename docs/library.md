@@ -10,7 +10,7 @@ template splices in as `{prompt:<name>}` (mesa task 1138) — each of which may
 *also* be exported to `.claude/commands/<name>.md` as a slash command (mesa
 task 1139, see [Prompts that are also slash
 commands](#prompts-that-are-also-slash-commands)). The live agent's own
-instructions are the `mesa-live` **agent definition** (mesa task 1068) — see
+instructions are the `naru-live` **agent definition** (mesa task 1068) — see
 [Where the live prompt went](#where-the-live-prompt-went).
 
 ## The record
@@ -114,7 +114,7 @@ The starter set is deliberately tiny — seven rows:
 
 | `id` | kind | scope | what it is |
 | --- | --- | --- | --- |
-| `mesa-live` | `agent` | `user` | The agent definition the live conversation runs as — literally `core::live::AGENT_DEFINITION`, YAML frontmatter plus `core::live::AGENT_PROMPT`, moved here rather than duplicated (mesa task 1068) |
+| `naru-live` | `agent` | `user` | The agent definition the live conversation runs as — literally `core::live::AGENT_DEFINITION`, YAML frontmatter plus `core::live::AGENT_PROMPT`, moved here rather than duplicated (mesa task 1068) |
 | `supervisor` | `agent` | `user` | The agent definition an auto-dispatched `/execute-todo` run is supervised as — literally `core::supervisor::SUPERVISOR_DEFINITION` (mesa task 1075), seeded to `~/.claude/agents/supervisor.md` by `core::supervisor::ensure_agent_definition` before the `todo-watcher` spawn |
 | `inbox-triage` | `agent` | `user` | The agent definition a `serve --watch-inbox` dispatch triages one inbox item as — literally `core::inbox_triage::INBOX_TRIAGE_DEFINITION` (mesa task 1168, `docs/inbox-watcher.md`): `sonnet`, no `Edit`/`Write`, seeded to `~/.claude/agents/inbox-triage.md` by `core::inbox_triage::ensure_agent_definition` before the `inbox-watcher` spawn |
 | `live-summary-prompt` | `prompt` | `user` | The instructions for the short-lived agent that writes a live conversation's memory once it ends (mesa task 921) — literally `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it belongs beside |
@@ -122,11 +122,29 @@ The starter set is deliberately tiny — seven rows:
 | `stop-notify` | `hook` | `user` | A minimal shell hook that echoes when Claude Code stops — its *name* is `stop-notify.sh`, since a hook's name carries its own extension |
 | `task-stop-guard` | `hook` | `user` | A `Stop` hook that keeps a task agent from ending its turn before its Naru task is handled — literally `core::stop_guard::STOP_GUARD_HOOK` (mesa task 1190, "The task-stop-guard hook" below); name `task-stop-guard.sh` |
 
-`mesa-live`'s body being the literal `AGENT_DEFINITION` constant (and
+`naru-live`'s body being the literal `AGENT_DEFINITION` constant (and
 `live-summary-prompt`'s the literal `SUMMARY_PROMPT`) is what lets
 `docs/live.md`'s tests of "the loop is fully stated" keep passing unchanged —
 each built-in and its constant are the same text, never two copies that could
 drift.
+
+The two Naru agent definitions were `mesa-live` and `mesa-retro` until mesa
+task 1302. The old ids still name them (`core::library::RENAMED_BUILTINS`,
+read through `canonical_builtin_id` by `builtin`, `Store::find_library_fork`
+and `Store::create_library_item`). Migration index 71 moved each stored
+fork. Its `builtin_id` moved, a `name` equal to the old id moved too, and so
+did the frontmatter line `name: mesa-live` (or `mesa-retro`), with LF or
+CRLF line endings. When the name
+moved, the sync baseline was cleared, because the path moved with it. The
+rest of the body and the version history are untouched, and a row that
+would collide is skipped. A bundle exported before the rename is read the
+same way, so its `mesa-live` fork imports as the fork of `naru-live`. The
+old `~/.claude/agents/mesa-live.md` is left on disk; sync lists it as
+`disk-new`.
+A fork whose frontmatter name line is not the plain `name: mesa-live` form
+(quoted, or with trailing whitespace) keeps that line, and so does a
+pre-1302 version restored from history; fix the line by hand, or
+`claude --agent naru-live` will not find the agent.
 
 ### A name collision folds into the row that owns the file
 
@@ -977,8 +995,11 @@ or a name — a built-in resolves by name too, since its name and its
   that differs, the `diff`. There is deliberately no `--diff` flag and no
   second subcommand: CLI output is JSON only, so the fields on these rows
   *are* the CLI exposure. `sync apply [PROJECT]` takes either repeatable
-  `--resolve PATH=mesa|disk|skip` flags or one of `--all-mesa`/`--all-disk`
-  (resolve every non-`in-sync` row toward one side at once) — the three are
+  `--resolve PATH=naru|mesa|disk|skip` flags (`naru` and `mesa` are one
+  choice, echoed as given, while `--all-naru`/`--all-mesa` report the choice
+  as `mesa`) or one of `--all-naru` (alias
+  `--all-mesa`)/`--all-disk` (resolve every non-`in-sync` row toward one
+  side at once) — the three are
   mutually exclusive — and prints the resulting `LibrarySyncResult[]`.
 - `hook status ITEM`, `hook enable ITEM --event EVENT [--matcher M]` and
   `hook disable ITEM [--event EVENT] [--matcher M]` read and write the
@@ -1025,7 +1046,7 @@ with no field flag, is still the usage error rather than a legal no-op call.
 
 `~/.mesa/config.json`'s `live.prompt` (mesa task 867, `docs/config.md`) is
 **gone**, not shadowed — the library is the only place the live agent's
-instructions live now. Since mesa task 1068 they are the `mesa-live` **agent
+instructions live now. Since mesa task 1068 they are the `naru-live` **agent
 definition** (kind `agent`, user scope) rather than the `live-agent-prompt`
 *prompt* they were between tasks 919 and 1068: `core::live::AGENT_DEFINITION`
 is YAML frontmatter (`name`, `description`, `model`, `tools: Bash, Read, Agent`
@@ -1034,15 +1055,15 @@ jobs through, mesa task 1156) followed by `core::live::AGENT_PROMPT`,
 the loop text, unchanged.
 
 Being an `agent` rather than a `prompt` gives it a real path,
-`.claude/agents/mesa-live.md`, so it rides the ordinary sync flow like every
+`.claude/agents/naru-live.md`, so it rides the ordinary sync flow like every
 other agent definition instead of being invisible to it. The `live-agent`
-command template spawns `claude --bg --agent mesa-live …`
+command template spawns `claude --bg --agent naru-live …`
 (`core::config::DEFAULT_LIVE_AGENT`), and Claude Code errors on an agent it has
 never seen, so **the first spawn seeds the file**:
 `core::live::ensure_agent_definition(store)` runs at both spawn sites
 (`api.rs`'s `spawn_live_agent`, `cli.rs`'s `LiveCmd::Start`) before
 `agents::spawn_bg`. It resolves the effective row — the fork
-(`store.find_library_fork("mesa-live")`) if there is one, the built-in
+(`store.find_library_fork("naru-live")`) if there is one, the built-in
 otherwise — computes the target through this module's own `relative_path`,
 `scope_base` and `resolve`, so `$HOME` is honoured and the traversal check
 holds exactly as it does on the sync path, creates the parent directory, and
@@ -1057,7 +1078,7 @@ as an error and both spawn sites treat it exactly like a failed spawn —
 
 What `core::live::agent_prompt(store, session_id)` injects is now only what the
 definition cannot know: `Drive mesa live session <id> (lease <n>).`, plus the recall block
-of earlier session summaries when there are any. Forking `mesa-live`
+of earlier session summaries when there are any. Forking `naru-live`
 **replaces** the built-in rather than extending it — the same rule the old
 config key followed, just moved: what the forked row holds is the whole of what
 the agent is.
@@ -1148,10 +1169,10 @@ API:
   `import` is the unknown-argument error, exit 2. `--output` to a path that
   already exists refuses rather than overwriting.
 - **The live conversation's agent definition coming from the library**:
-  `mesa-live` starts unshadowed (`id: null`, kind `agent`, path
-  `.claude/agents/mesa-live.md`) and appears in `sync status`; `sync apply`
-  with mesa winning writes it to `$HOME/.claude/agents/mesa-live.md`; editing
-  it forks it (`builtin_id: mesa-live`, `id` no longer null); and the prompt that
+  `naru-live` starts unshadowed (`id: null`, kind `agent`, path
+  `.claude/agents/naru-live.md`) and appears in `sync status`; `sync apply`
+  with mesa winning writes it to `$HOME/.claude/agents/naru-live.md`; editing
+  it forks it (`builtin_id: naru-live`, `id` no longer null); and the prompt that
   `mesa live start` spawns the stub `claude` with carries the session line
   only — never the loop text, which now travels as the definition.
 - **Hook registration**: `status` on a fresh hook reporting its settings
@@ -1199,4 +1220,4 @@ API:
 The same pairing `api-check.sh` holds for tasks and `config-check.sh` holds
 for the config-write routes. The "a configured prompt replaces the built-in
 at spawn" assertion that used to live in `config-check.sh` lives here now,
-proved through the `mesa-live` library row instead of a config key.
+proved through the `naru-live` library row instead of a config key.

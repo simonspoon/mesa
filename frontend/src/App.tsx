@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import './App.css'
-import { getCcUsage, getMesaVersion, getTask, listInbox } from './api'
+import { getCcUsage, getNaruVersion, getTask, listInbox } from './api'
 import { AgentSidebar } from './components/AgentSidebar'
 import { CommandPalette } from './components/CommandPalette'
 import { PhoneTabBar } from './components/PhoneTabBar'
@@ -235,7 +235,7 @@ function App() {
   // Which build am I looking at? Fetched once — a running server's version
   // cannot change, so no `pollMs`. Pure decoration: no error branch, and
   // nothing renders until it lands (a placeholder would be noise).
-  const { data: mesaVersion } = useFetch(() => getMesaVersion(), 'mesa-version')
+  const { data: naruVersion } = useFetch(() => getNaruVersion(), 'naru-version')
 
   // The inbox and its three sub-views (mesa task 845). One page, one fetch:
   // capture group 1 names the slice to show, and its absence is the "New"
@@ -608,8 +608,8 @@ function App() {
           </svg>
           <span className="brand-text">
             Naru
-            {mesaVersion && (
-              <span className="brand-version">v{mesaVersion.version}</span>
+            {naruVersion && (
+              <span className="brand-version">v{naruVersion.version}</span>
             )}
           </span>
         </a>

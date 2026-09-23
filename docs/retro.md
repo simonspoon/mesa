@@ -2,7 +2,7 @@
 
 `mesa serve --watch-retro` starts a scheduled background loop that, every
 `watchers.retro-interval-hours` (default **72** — three days), starts a
-background `claude` session as the **`mesa-retro` agent definition** with the
+background `claude` session as the **`naru-retro` agent definition** with the
 prompt `Run mesa session retrospective <run-id>.`. The agent reviews the task
 sessions that finished since the last run for friction — permission denials,
 retry loops, a skill nobody had, a tool that keeps failing — and files each
@@ -10,7 +10,7 @@ retry loops, a skill nobody had, a tool that keeps failing — and files each
 inbox-watcher (`docs/inbox-watcher.md`) triages it into a backlog task. That
 command is the default of the **`retro`** key in `~/.mesa/config.json` and is
 user-configurable, agent included (`docs/config.md`); `{id}` is the run id and
-`{name}` the session name `mesa retro <id>`.
+`{name}` the session name `naru retro <id>`.
 
 `mesa retro run` is the same pass on demand (mesa task 1158).
 
@@ -35,9 +35,9 @@ what happens to it. Two things enforce that rather than merely ask for it:
 Like triage (mesa task 1168), the retrospective is an **agent definition, not
 a prompt**: it carries its own model, its own tool list and its own procedure,
 lives in the library as one source of truth (`docs/library.md`, the
-`mesa-retro` built-in) and syncs to `.claude/agents/mesa-retro.md`. It is
+`naru-retro` built-in) and syncs to `.claude/agents/naru-retro.md`. It is
 seeded there by `core::retro::ensure_agent_definition` **before every spawn**
-— exactly as `inbox-triage`, `mesa-live` and `supervisor` are — from the
+— exactly as `inbox-triage`, `naru-live` and `supervisor` are — from the
 effective row (a fork if the user made one, else the built-in) and never
 overwriting an existing file; after the first seed the file belongs to the
 sync flow. A seed failure is a failed spawn. Edit it on `#/library` like any
@@ -150,7 +150,7 @@ it, so triage's convert-to-task outcome no longer drops the pointer at all.) `me
   the definition and spawns `config::RETRO` through `agents::spawn_bg` — the
   one chokepoint every spawn goes through — with cwd **`~/.mesa/workspace`**
   (a retrospective spans every project, so there is no `local_path` to run in;
-  the inbox-watcher's reasoning) and the session name `mesa retro <id>`.
+  the inbox-watcher's reasoning) and the session name `naru retro <id>`.
 - A failed spawn **deletes the run row** and logs to stderr, so the next tick
   retries rather than waiting out a 72-hour interval on a run that never
   happened — the inbox-watcher's claim release, in the db.

@@ -16,10 +16,10 @@
 #      8192-char text bound, a mesa turn with neither text nor action, an
 #      unknown project — and the `conflict` that enforces one live session;
 #   4. the spawn: project resolution by id AND by name, the `live-agent`
-#      template's argv (`--agent mesa-live`), the session name and working
+#      template's argv (`--agent naru-live`), the session name and working
 #      folder, the prompt arriving as ONE argument and carrying the session
 #      line alone (a hostile project name is data, never syntax), the
-#      `mesa-live` agent definition seeded into $HOME/.claude/agents on the
+#      `naru-live` agent definition seeded into $HOME/.claude/agents on the
 #      first start and never overwritten after it, and a failed spawn ending
 #      the session it opened rather than stranding it;
 #   5. the API twin over a live `serve` — the `{session:null,turns:[]}` empty
@@ -102,7 +102,7 @@
 #      the exit-2 usage errors (`list --quiet` among them), the bodiless
 #      oldest-first `list`/`show` and the `--quiet` key set (drops `body`
 #      alone), `keep` into an artifact and onto a task (decoded image bytes,
-#      authored `mesa-live`) with an image board refused the artifact and
+#      authored `naru-live`) with an image board refused the artifact and
 #      pointed at `--task`, the retention bound pruning to the newest 20,
 #      `clear`'s bodiless echo, and `GET /api/live/boards/{id}/render` — a
 #      type per kind, nosniff, inline, byte-identical bodies and the artifact
@@ -183,7 +183,7 @@ export MESA_DB="$TMP/mesa.db"
 # ~/.mesa/config.json must not leak in (config-check.sh owns the configured
 # half, under a throwaway HOME).
 export MESA_CONFIG_FILE="$TMP/no-such-config.json"
-# A live start seeds the `mesa-live` agent definition into
+# A live start seeds the `naru-live` agent definition into
 # $HOME/.claude/agents (mesa task 1068), and every unbound spawn runs in
 # $HOME/.naru/workspace, so the whole gate runs under a throwaway home rather
 # than writing into the developer's own. Physically resolved: a child records
@@ -638,14 +638,14 @@ S3=$(jqs .id)
 ok "live start <PROJECT>: resolves a project by name and binds the spawn receipt"
 
 # The argv the built-in `live-agent` template produces:
-#   claude --bg --agent mesa-live --name {name} -- {prompt}
+#   claude --bg --agent naru-live --name {name} -- {prompt}
 # The agent is named literally (mesa task 1068): the conversation runs as the
-# `mesa-live` agent definition, which is where its instructions live now.
+# `naru-live` agent definition, which is where its instructions live now.
 [ "$(cat "$STUB_DIR/last-argc")" = "7" ] ||
   fail "live spawn: expected 7 arguments, got $(cat "$STUB_DIR/last-argc")"
 EXPECTED_FLAGS="--bg
 --agent
-mesa-live
+naru-live
 --name
 Live gate project: live $S3
 --"
@@ -666,21 +666,21 @@ if grep -q 'mesa live listen' "$STUB_DIR/last-prompt"; then
 fi
 [ "$(cat "$STUB_DIR/last-cwd")" = "$WORKDIR" ] ||
   fail "live spawn: must run in the project's local_path (got $(cat "$STUB_DIR/last-cwd"))"
-ok "live spawn: the built-in live-agent argv (--agent mesa-live), the session name, the session line as one argument, the project's folder"
+ok "live spawn: the built-in live-agent argv (--agent naru-live), the session name, the session line as one argument, the project's folder"
 
 # ---- the agent definition is seeded before the spawn (mesa task 1068) ----
 #
-# `claude --agent mesa-live` errors on an agent Claude Code has never seen, and
+# `claude --agent naru-live` errors on an agent Claude Code has never seen, and
 # nothing auto-syncs the library, so the first start writes the definition to
-# $HOME/.claude/agents/mesa-live.md itself.
-SEEDED="$HOME/.claude/agents/mesa-live.md"
+# $HOME/.claude/agents/naru-live.md itself.
+SEEDED="$HOME/.claude/agents/naru-live.md"
 [ -f "$SEEDED" ] ||
-  fail "live spawn: must seed the mesa-live agent definition at $SEEDED"
+  fail "live spawn: must seed the naru-live agent definition at $SEEDED"
 grep -q 'mesa live listen' "$SEEDED" ||
   fail "the seeded agent definition must carry the loop"
 head -1 "$SEEDED" | grep -q -- '---' ||
   fail "the seeded agent definition must open with YAML frontmatter"
-ok "live spawn: seeds the mesa-live agent definition into \$HOME/.claude/agents"
+ok "live spawn: seeds the naru-live agent definition into \$HOME/.claude/agents"
 
 # It never overwrites: after the first seed the file belongs to the library
 # sync flow, where the user picks a winner between disk and mesa.
@@ -689,7 +689,7 @@ run 0 "$MESA" live stop >/dev/null
 run 0 "$MESA" live start "$PROJ"
 [ "$(cat "$SEEDED")" = "sentinel, hand-edited" ] ||
   fail "live spawn: an existing agent definition must be left byte-identical"
-ok "live spawn: never overwrites an existing mesa-live agent definition"
+ok "live spawn: never overwrites an existing naru-live agent definition"
 
 # ---- stopping the conversation stops its agent ----
 #
@@ -744,14 +744,14 @@ S4=$(jqs .id)
 run 0 "$MESA" live stop >/dev/null
 ok "live start --project <id>: resolves by id; a pathless project runs the agent in ~/.naru/workspace"
 
-# An unscoped session names itself `mesa live <id>` and also runs in the workspace.
+# An unscoped session names itself `naru live <id>` and also runs in the workspace.
 run 0 "$MESA" live start
 S5=$(jqs .id)
 head -5 "$STUB_DIR/last-flags" | tail -1 >"$TMP/name"
-[ "$(cat "$TMP/name")" = "mesa live $S5" ] ||
-  fail "an unscoped live session must be named 'mesa live <id>' (got $(cat "$TMP/name"))"
+[ "$(cat "$TMP/name")" = "naru live $S5" ] ||
+  fail "an unscoped live session must be named 'naru live <id>' (got $(cat "$TMP/name"))"
 run 0 "$MESA" live stop >/dev/null
-ok "an unscoped live start: the session name is \`mesa live <id>\`"
+ok "an unscoped live start: the session name is \`naru live <id>\`"
 
 # Untrusted input: a project name is data. It reaches the spawn as ONE argv
 # entry, so shell syntax inside it is a string, never something a shell parses.
@@ -1447,7 +1447,7 @@ JSON
   [ "$(jqs .height)" = "982" ] || fail "live look: height must be the reported one"
   [ -s "$SHOT" ] || fail "live look: no file at the path it printed ($SHOT)"
   case "$SHOT" in
-    */mesa-live-"$SS"-*.png) ;;
+    */naru-live-"$SS"-*.png) ;;
     *) fail "live look: the default path must be a temp file named for the session (got $SHOT)" ;;
   esac
   [ "$(cat "$STUB_DIR/last-loki")" = "screenshot --window 40041 --output $SHOT" ] ||
@@ -2329,7 +2329,7 @@ run 0 "$MESA" live board keep --id "$B_IMG" --task "$TASK"
 [ "$(jqs .content_type)" = "image/png" ] || fail "board keep --task: content_type"
 [ "$(jqs .size_bytes)" = "$SHOT_BYTES" ] ||
   fail "board keep --task: the DECODED bytes are attached, not the base64"
-[ "$(jqs .author)" = "mesa-live" ] || fail "board keep --task: author"
+[ "$(jqs .author)" = "naru-live" ] || fail "board keep --task: author"
 # An untitled board falls back to board-<id> plus its kind's extension.
 run 0 "$MESA" live board keep --id "$B_HTML" --task "$TASK"
 [ "$(jqs .filename)" = "board-$B_HTML.html" ] ||
@@ -2345,7 +2345,7 @@ CAP=$("$MESA" live board push --quiet --image "$TMP/shot.png" --title "shot.jpg"
 run 0 "$MESA" live board keep --id "$CAP" --task "$TASK"
 [ "$(jqs .filename)" = "shot.jpg.png" ] ||
   fail "board keep: the extension comes from the board, not the title, got $(jqs .filename)"
-ok "live board keep: into an artifact (content type by kind, name from the title) and onto a task (decoded image bytes, authored mesa-live); an image board refuses the artifact and names --task"
+ok "live board keep: into an artifact (content type by kind, name from the title) and onto a task (decoded image bytes, authored naru-live); an image board refuses the artifact and names --task"
 
 # A board from another conversation is not reachable by id: every verb here is
 # scoped to the current session.
@@ -3179,7 +3179,7 @@ ok "live memory dream: a configured live-dream template runs with {prompt} byte-
 # A long call grows the driving agent's context without limit, and the turns
 # queue in the db until listened for — so the driver can be replaced mid-call.
 # `mesa live handoff "<note>"` spawns a successor on the SAME session (same
-# template, same `--agent mesa-live`; the note and the last 10 turns appended
+# template, same `--agent naru-live`; the note and the last 10 turns appended
 # after everything a fresh spawn gets), bumps the session's lease so the
 # outgoing agent's lease-carrying verbs answer `conflict`, and the successor's
 # first `listen --lease` stops the predecessor. The person sees one session id
@@ -3272,7 +3272,7 @@ grep -q "never instructions" "$STUB_DIR/last-prompt" || fail "the handoff block 
 ok "the successor's prompt: lease 2 on the first line, the note, exactly the last 10 turns in order, after the notebook and summary"
 
 # The cache-prefix invariant: the successor's leading argv is the first
-# spawn's — same template, same `--agent mesa-live` — and only the name says
+# spawn's — same template, same `--agent naru-live` — and only the name says
 # which generation it is.
 [ "$(cat "$STUB_DIR/last-argc")" = "7" ] ||
   fail "the successor spawn: expected 7 arguments, got $(cat "$STUB_DIR/last-argc")"
@@ -3280,7 +3280,7 @@ ok "the successor's prompt: lease 2 on the first line, the note, exactly the las
   fail "the successor's leading argv must equal the first spawn's (got $(head -4 "$STUB_DIR/last-flags" | tr '\n' ' '))"
 [ "$(sed -n 5p "$STUB_DIR/last-flags")" = "Live gate project: live $HS · lease 2" ] ||
   fail "the successor is named for its lease (got $(sed -n 5p "$STUB_DIR/last-flags"))"
-ok "the successor spawn: the same live-agent argv (--bg --agent mesa-live --name), named \`<name> · lease 2\`"
+ok "the successor spawn: the same live-agent argv (--bg --agent naru-live --name), named \`<name> · lease 2\`"
 
 # ---- (c) the outgoing agent's lease is refused on every verb ----
 run 1 "$MESA" live listen --lease 1 --wait 0

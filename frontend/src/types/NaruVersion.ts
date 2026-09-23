@@ -5,4 +5,4 @@
  * (`CARGO_PKG_VERSION`), shown under the wordmark in the app header.
  * Unrelated to `ProjectVersion` above, which reads a *project's* manifest.
  */
-export type MesaVersion = { version: string, };
+export type NaruVersion = { version: string, };

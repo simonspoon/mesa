@@ -155,7 +155,7 @@ for exactly this. Quiet time is still spent inside `listen` — the wait happens
 in the command, as before — only now the agent's turn ends instead of blocking
 on it.
 
-The instructions the agent is spawned with are the **`mesa-live` agent
+The instructions the agent is spawned with are the **`naru-live` agent
 definition** (mesa task 1068) — `core::live::AGENT_DEFINITION`, YAML
 frontmatter plus `core::live::AGENT_PROMPT`, one constant in `core` because
 both spawn sites (the CLI's `live start` and `POST /api/live`) drive the same
@@ -168,13 +168,13 @@ rendered rather than on which page is open (task 895) — the "this is
 speech, so write prose" rule (a bulleted reply gets read aloud as punctuation)
 and the untrusted-input posture below.
 
-The definition is a **library** row (`docs/library.md`): the `mesa-live`
+The definition is a **library** row (`docs/library.md`): the `naru-live`
 built-in, kind `agent`, user scope, which is why it has a real path —
-`.claude/agents/mesa-live.md` — and rides the ordinary library sync. The
-`live-agent` template spawns `claude --bg --agent mesa-live …`, and Claude Code
+`.claude/agents/naru-live.md` — and rides the ordinary library sync. The
+`live-agent` template spawns `claude --bg --agent naru-live …`, and Claude Code
 errors on an agent it has never seen, so **the first start seeds the file**:
 `live::ensure_agent_definition(store)` runs at both spawn sites, before
-`spawn_bg`, resolves the effective `mesa-live` row (its fork if one exists, the
+`spawn_bg`, resolves the effective `naru-live` row (its fork if one exists, the
 built-in otherwise), computes the target through the library's own
 `relative_path`/`scope_base`/`resolve` machinery — so `$HOME` is honoured and
 the traversal check holds — creates the parent directory and writes the body.
@@ -407,7 +407,7 @@ pending, any promise it made — and runs `mesa live handoff "<note>"`. Naru
 then, in order:
 
 1. Spawns a **successor** on the same session through the same `live-agent`
-   template (`agents::spawn_bg`, `--agent mesa-live`, working folder and
+   template (`agents::spawn_bg`, `--agent naru-live`, working folder and
    name from `live_agent_dir`, the name suffixed `· lease <n>` so the Agents
    sidebar can tell the generations apart), with `live::handoff_prompt` as
    its prompt.
@@ -474,7 +474,7 @@ clears any predecessor nobody came to stop.
 
 `live::handoff_prompt` is `agent_prompt` plus one block, and the shape is
 the whole point. The successor runs the same template with the same
-`--agent mesa-live`, so its system prompt, tool list and agent definition
+`--agent naru-live`, so its system prompt, tool list and agent definition
 are byte-identical to its predecessor's — and everything that is
 per-session is **appended** after that shared prefix, never prepended, so
 the cached prefix carries over. The order is:
@@ -765,7 +765,7 @@ takes a month off has not changed their mind.
 
 ### What goes in it, and who writes it
 
-The `mesa-live` agent definition (`core::live::AGENT_DEFINITION`) gained a
+The `naru-live` agent definition (`core::live::AGENT_DEFINITION`) gained a
 rule for the notebook, numbered 9 and sitting **before** the untrusted-input
 rule that closes the list (now 10): keep it with `mesa live memory add "<one
 bullet>"`, `replace <id> "<text>"` and `delete <id>`, one item per command,
@@ -781,7 +781,7 @@ confirmed an earlier one said too, otherwise none — and a reminder that these
 bullets ride into every later prompt, so the untrusted-input rule (now step
 5) applies to them doubly.
 
-Because `~/.claude/agents/mesa-live.md` is seeded once and **never
+Because `~/.claude/agents/naru-live.md` is seeded once and **never
 overwritten** (`live::ensure_agent_definition`, the library's sync posture),
 an install that already has the file keeps the old rules until the library
 sync is applied and the built-in picked as the winner. That is the existing
@@ -1285,7 +1285,7 @@ the group (with none live, `not_found` naming `mesa live start`).
 - **`keep` is how a board outlives its conversation.** `--project` writes an
   `Artifact` (`text/markdown`, `text/html` or `image/svg+xml`, by kind) and
   takes an id **or a name**, the house rule; `--task` writes an `Attachment`
-  authored `mesa-live`, carrying the decoded bytes for an image board and the
+  authored `naru-live`, carrying the decoded bytes for an image board and the
   document's own bytes otherwise. An `image` board **cannot** be an artifact —
   `ARTIFACT_CONTENT_TYPES` has no raster mime — and the refusal says so and
   names `--task`. `--name` defaults from the board's title, else
@@ -1392,7 +1392,7 @@ in a conversation whose whole point is that they are not at the keyboard.
 conversation is being held in, writes a PNG and prints where it landed:
 
 ```json
-{"path":"/var/folders/…/mesa-live-12-1755702312.png","window_id":40041,"width":1600,"height":1000}
+{"path":"/var/folders/…/naru-live-12-1755702312.png","window_id":40041,"width":1600,"height":1000}
 ```
 
 The agent opens that path with its own image tool. Nothing else in Naru reads
@@ -1524,7 +1524,7 @@ reachable only by something already running as the person, which is exactly
 what the agent driving the conversation is.
 
 The file lands in a temp file named for the conversation and the second —
-`mesa-live-<session id>-<unix seconds>.png` in `std::env::temp_dir()` — so two
+`naru-live-<session id>-<unix seconds>.png` in `std::env::temp_dir()` — so two
 looks at one conversation do not land on one path and an `ls` reads in order.
 `--output <PATH>` puts it wherever the caller wants instead. `live look` takes
 no `--quiet`: it prints a four-key bounded object with nothing to drop, so the
@@ -1612,7 +1612,7 @@ takes exactly one value.
   to a checkout (its `project_id` is optional and it outlives that project), so
   a missing or stale path is a session with no working folder, not a bad
   request. Both surfaces name the session the same way — `<project>: live <id>`,
-  or `mesa live <id>` when the conversation is bound to no project — so one
+  or `naru live <id>` when the conversation is bound to no project — so one
   conversation reads the same in the Agents sidebar however it was started.
 - **A failed spawn ends the session it just opened**, on both surfaces —
   `live start` exits **1** with code **`unavailable`** (the code reserved for
@@ -2676,12 +2676,12 @@ conversation") working with no backend change.
 ## Config
 
 The spawn is the fourth configurable command: **`live-agent`**, defaulting to
-`claude --bg --agent mesa-live --name {name} -- {prompt}` — the union of the two
+`claude --bg --agent naru-live --name {name} -- {prompt}` — the union of the two
 existing shapes, since a live session is a Naru record (so it has an `{id}` and
 a `{name}`) *and* carries a prompt Naru supplies. That prompt is
 `live::agent_prompt`, so the feature works with **no user configuration**. The
 agent is named **literally** here (mesa task 1068): the conversation runs as
-the `mesa-live` agent definition, which is where its instructions live, and a
+the `naru-live` agent definition, which is where its instructions live, and a
 user who wants another edits the name (since mesa task 1141 every default
 spells its program and agent out; `docs/config.md`). The instructions used to be the
 config file's fifth section, `live.prompt` (mesa task 867); as of mesa task 919
@@ -2881,7 +2881,7 @@ title and that a later canvas edit does not reach the snapshot — the
 required-source and required-destination `ArgGroup`s and the rest of the exit-2
 usage errors, the bodiless oldest-first listing, `--quiet` dropping exactly
 `body`, `keep` into an artifact and onto a task (decoded bytes, authored
-`mesa-live`) with an image board refused the artifact and pointed at `--task`,
+`naru-live`) with an image board refused the artifact and pointed at `--task`,
 the newest-20 prune, `clear`'s echo, and the render route's exact header set —
 a type per kind, `nosniff`, `inline`, byte-identical bodies and the artifact
 CSP verbatim — asserted **identically in default mode and under `--lan`**,

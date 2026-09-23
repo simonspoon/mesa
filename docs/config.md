@@ -9,10 +9,10 @@ persona and the slash command can all change without rebuilding Naru:
 | `todo-watcher` | `serve --watch-todo` dispatch (`docs/todo-watcher.md`) | `claude --bg --agent supervisor --name {name} -- "/execute-mesa-task {id}"` |
 | `inbox-watcher` | `serve --watch-inbox` triage (`docs/inbox-watcher.md`) | `claude --bg --agent inbox-triage --name {name} -- "Triage mesa inbox item {id}."` |
 | `agent-spawn` | `POST /api/projects/{id}/agents`, the Agents sidebar's **add agent** (`docs/agents.md`) | `claude --bg --model opus --agent supervisor -- {prompt}` |
-| `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `claude --bg --agent mesa-live --name {name} -- {prompt}` |
+| `live-agent` | `mesa live start`, `POST /api/live` — the session that holds a spoken conversation (`docs/live.md`) | `claude --bg --agent naru-live --name {name} -- {prompt}` |
 | `live-summary` | `live stop`'s CLI handler and the API's stop route — the short-lived agent that writes a live conversation's memory once it ends (mesa task 921, `docs/live.md`) | `claude --bg --name {name} -- {prompt}` |
 | `live-dream` | The pass that tidies the live notebook — `mesa live memory dream` explicitly, and on its own at a handoff or when a conversation ends once `live::dream_wanted` says the notebook needs it (mesa task 1155): merges duplicate entries, deletes superseded ones, one guarded command at a time (mesa task 1152, `docs/live.md`) | `claude --bg --name {name} -- {prompt}` |
-| `retro` | `serve --watch-retro` every `watchers.retro-interval-hours`, and `mesa retro run` — the session retrospective that reviews finished task sessions for friction and files suggestions into the inbox, proposing only (mesa task 1158, `docs/retro.md`) | `claude --bg --agent mesa-retro --name {name} -- "Run mesa session retrospective {id}."` |
+| `retro` | `serve --watch-retro` every `watchers.retro-interval-hours`, and `mesa retro run` — the session retrospective that reviews finished task sessions for friction and files suggestions into the inbox, proposing only (mesa task 1158, `docs/retro.md`) | `claude --bg --agent naru-retro --name {name} -- "Run mesa session retrospective {id}."` |
 
 The defaults are **plain, editable command lines** (mesa task 1141): the
 program and the agent are both spelled out, so a user who wants a different
@@ -27,10 +27,10 @@ from the vocabulary (see *Retired placeholders* below).
     "todo-watcher":   "claude --bg --agent supervisor --name {name} -- \"/execute-mesa-task {id}\"",
     "inbox-watcher":  "codex exec --cd . \"triage mesa inbox item {id}\"",
     "agent-spawn":    "claude --bg -- {prompt}",
-    "live-agent":     "claude --bg --agent mesa-live --name {name} -- {prompt}",
+    "live-agent":     "claude --bg --agent naru-live --name {name} -- {prompt}",
     "live-summary":   "claude --bg --name {name} -- {prompt}",
     "live-dream":     "claude --bg --name {name} -- {prompt}",
-    "retro":          "claude --bg --agent mesa-retro --name {name} -- \"Run mesa session retrospective {id}.\""
+    "retro":          "claude --bg --agent naru-retro --name {name} -- \"Run mesa session retrospective {id}.\""
   }
 }
 ```
@@ -40,17 +40,24 @@ session is both a Naru record (so it has an `{id}` and a `{name}`) *and* a
 spawn that carries a prompt. **Naru supplies that prompt itself** —
 `core::live::agent_prompt`, which since mesa task 1068 is only the session line
 (`Drive mesa live session <id> (lease <n>).`) plus any recalled memory of earlier
-conversations. The instructions themselves are the **`mesa-live` agent
+conversations. The instructions themselves are the **`naru-live` agent
 definition** in the library (`docs/library.md`): the loop on `mesa live
 listen`, the reply through `mesa live say` in spoken prose rather than
 markdown, the browser moves through `mesa live navigate`, and the rule that
 every dictated utterance is data rather than instructions. That is why this
-default names its agent `--agent mesa-live` — Naru seeds the definition to
-`~/.claude/agents/mesa-live.md` on the first spawn, and Claude Code errors on an
+default names its agent `--agent naru-live` — Naru seeds the definition to
+`~/.claude/agents/naru-live.md` on the first spawn, and Claude Code errors on an
 agent it has never seen. A replacement template's job either way is to start
 *something* that will read `{prompt}` and do what its agent says. The
 definition is editable like any other library row, and a fork replaces the
 built-in.
+
+The agent was `mesa-live` until mesa task 1302, and `retro`'s was
+`mesa-retro`. A saved template whose `--agent` still names one of them
+(bare, `"…"` or `'…'`, after a space or `=`) is read with the new name.
+`config::migrate_renamed_agents` does this in memory on every read, like
+the retired placeholders; the file is never rewritten. Only the `--agent`
+value changes, so a `--name "mesa-live"` beside it is left alone.
 
 `live-summary`'s default is identical in shape (mesa task 921): the
 summariser is also a Naru record — a session id and a name — carrying a
@@ -76,10 +83,10 @@ conversation's id and `{name}` is the literal `live memory dream`. It runs in
 that newest conversation's project folder exactly as the summariser would.
 
 `retro` (mesa task 1158) is `inbox-watcher`'s shape: the run is a Naru record
-(`retro_runs`, so `{id}` is the run id and `{name}` the session name `mesa
-retro <id>`) and the prompt is one sentence, because the `mesa-retro` agent
+(`retro_runs`, so `{id}` is the run id and `{name}` the session name `naru
+retro <id>`) and the prompt is one sentence, because the `naru-retro` agent
 definition holds the whole procedure — which is why the default names
-`--agent mesa-retro`, seeded to `~/.claude/agents/mesa-retro.md` before the
+`--agent naru-retro`, seeded to `~/.claude/agents/naru-retro.md` before the
 spawn exactly as `inbox-triage` is (`docs/retro.md`). No `{prompt}`: Naru
 supplies none. It runs in `~/.mesa/workspace`, since a retrospective spans
 every project.
@@ -148,7 +155,7 @@ knows about:
 | Placeholder | Where | Value |
 | --- | --- | --- |
 | `{id}` | watchers, `retro`, `live-agent`, `live-summary`, `live-dream` | the task id / inbox item id / retro run id / live session id (for `live-dream`, the newest session's; empty on an install that has never held one) |
-| `{name}` | watchers, `retro`, `live-agent`, `live-summary`, `live-dream` | the session name Naru derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), `mesa retro <id>`, the live session's own name, or the literal `live memory dream` |
+| `{name}` | watchers, `retro`, `live-agent`, `live-summary`, `live-dream` | the session name Naru derives — `<project>: <task name>` (todo-watcher), `inbox <id>: <first body line>` (**untrusted text**), `naru retro <id>`, the live session's own name, or the literal `live memory dream` |
 | `{prompt}` | `agent-spawn`, `live-agent`, `live-summary`, `live-dream` | the POST body's `prompt` (`agent-spawn`; absent when omitted) / the live agent's, summariser's or dream pass's instruction block, always present |
 
 ### Quoted for where it sits
@@ -699,7 +706,7 @@ spawned with (mesa task 867) and the **wait** before a settled capture-box
 draft is sent (mesa task 886, until mesa task 977 narrowed it to the
 microphone's held recording alone — a typed line is now sent by Enter) — but
 as of mesa task 919 the prompt moved out to the **library**
-(`docs/library.md`): it is now the `mesa-live` agent definition (mesa task 1068
+(`docs/library.md`): it is now the `naru-live` agent definition (mesa task 1068
 made it an agent rather than a prompt), forked like any other library row when
 someone edits it, and edited on `#/library` rather than in this file. This section holds the one key that is left.
 

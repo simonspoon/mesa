@@ -775,27 +775,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
-name = "mesa"
-version = "1.7.0"
-dependencies = [
- "axum",
- "axum-embed",
- "base64",
- "clap",
- "directories",
- "portable-pty",
- "rusqlite",
- "rust-embed",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "tokio",
- "tokio-stream",
- "ts-rs",
-]
-
-[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -820,6 +799,27 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "naru"
+version = "1.7.0"
+dependencies = [
+ "axum",
+ "axum-embed",
+ "base64",
+ "clap",
+ "directories",
+ "portable-pty",
+ "rusqlite",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "ts-rs",
 ]
 
 [[package]]

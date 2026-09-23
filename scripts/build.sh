@@ -113,8 +113,8 @@ npm --prefix frontend run build
 # not enough: under checksum-based freshness the unchanged content still looks
 # fresh and the stale dist stays embedded. Drop this crate's release artifacts so
 # the next build is forced to recompile src/api.rs and re-read frontend/dist.
-# (Only mesa's own units are removed; cached dependencies keep the rebuild cheap.)
-cargo clean --release -p mesa
+# (Only naru's own units are removed; cached dependencies keep the rebuild cheap.)
+cargo clean --release -p naru
 cargo build --release
 
 echo "ok: target/release/naru target/release/mesa"

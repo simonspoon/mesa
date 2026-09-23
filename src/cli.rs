@@ -207,7 +207,7 @@ enum Command {
         /// background `claude` agent that reviews the task sessions finished
         /// since the last retrospective for friction and files each NEW
         /// finding into the inbox as a change request (default: the
-        /// `mesa-retro` agent definition, configurable in ~/.mesa/config.json;
+        /// `naru-retro` agent definition, configurable in ~/.mesa/config.json;
         /// cwd `~/.mesa/workspace`). It proposes only — it never edits an
         /// agent, a skill or project code. Off by default: this spawns real
         /// agents (API cost) with no user request behind it. Independent of
@@ -1648,19 +1648,20 @@ EXAMPLES
         /// Flag form of [PROJECT]
         #[arg(long, conflicts_with = "project_pos")]
         project: Option<String>,
-        /// Resolve one path: PATH=mesa|disk|skip (repeatable)
+        /// Resolve one path: PATH=naru|mesa|disk|skip (repeatable; naru and
+        /// mesa are the same choice)
         #[arg(
             long = "resolve",
             value_name = "PATH=CHOICE",
             value_parser = parse_library_resolution,
-            conflicts_with_all = ["all_mesa", "all_disk"],
+            conflicts_with_all = ["all_naru", "all_disk"],
         )]
         resolve: Vec<(String, String)>,
-        /// Resolve every non-in-sync row toward mesa
-        #[arg(long, conflicts_with_all = ["all_disk", "resolve"])]
-        all_mesa: bool,
+        /// Resolve every non-in-sync row toward naru (alias: --all-mesa)
+        #[arg(long, alias = "all-mesa", conflicts_with_all = ["all_disk", "resolve"])]
+        all_naru: bool,
         /// Resolve every non-in-sync row toward disk
-        #[arg(long, conflicts_with_all = ["all_mesa", "resolve"])]
+        #[arg(long, conflicts_with_all = ["all_naru", "resolve"])]
         all_disk: bool,
     },
 }
@@ -1762,7 +1763,7 @@ enum RetroCmd {
     /// Prints the run row. Inside the interval since the last run this is
     /// `conflict` naming when the next is due — `--force` runs it anyway. The
     /// agent is spawned through `agents::spawn_bg` with the `retro` template
-    /// from ~/.mesa/config.json (default: `claude --bg --agent mesa-retro …`),
+    /// from ~/.mesa/config.json (default: `claude --bg --agent naru-retro …`),
     /// in ~/.mesa/workspace. If the spawn fails the run row is deleted again
     /// and the command exits 1 with code "unavailable", so the next attempt
     /// is not a `conflict` against a run that never happened.
@@ -3226,10 +3227,11 @@ fn parse_library_scope(s: &str) -> std::result::Result<LibraryScope, String> {
     LibraryScope::parse(s).ok_or_else(|| format!("'{s}' is not one of user|project"))
 }
 
-/// Whether `--all-mesa` resolves a row of this status toward mesa: every
-/// status except `in-sync` (nothing to do) and `disk-new` (no mesa body
-/// exists to write — that row has no id in the library at all yet).
-fn library_sync_all_mesa_selects(status: LibrarySyncStatus) -> bool {
+/// Whether `--all-naru` (or `--all-mesa`) resolves a row of this status
+/// toward naru: every status except `in-sync` (nothing to do) and `disk-new`
+/// (no naru body exists to write — that row has no id in the library at all
+/// yet).
+fn library_sync_all_naru_selects(status: LibrarySyncStatus) -> bool {
     !matches!(
         status,
         LibrarySyncStatus::InSync | LibrarySyncStatus::DiskNew
@@ -3248,7 +3250,9 @@ fn library_sync_all_disk_selects(status: LibrarySyncStatus) -> bool {
 }
 
 /// `--resolve PATH=CHOICE` for `library sync apply`: rejects a missing `=`,
-/// an empty path, and a choice that is not `mesa`/`disk`/`skip`.
+/// an empty path, and a choice that is not `naru`/`mesa`/`disk`/`skip`
+/// (`naru` and `mesa` are one choice, mesa task 1302). The choice is kept
+/// as given, so the result echoes the spelling the caller used.
 fn parse_library_resolution(s: &str) -> std::result::Result<(String, String), String> {
     let (path, choice) = s
         .split_once('=')
@@ -3256,8 +3260,8 @@ fn parse_library_resolution(s: &str) -> std::result::Result<(String, String), St
     if path.is_empty() {
         return Err(format!("'{s}': PATH must not be empty"));
     }
-    if !matches!(choice, "mesa" | "disk" | "skip") {
-        return Err(format!("'{choice}' is not one of mesa|disk|skip"));
+    if !matches!(choice, "naru" | "mesa" | "disk" | "skip") {
+        return Err(format!("'{choice}' is not one of naru|mesa|disk|skip"));
     }
     Ok((path.to_string(), choice.to_string()))
 }
@@ -4893,7 +4897,7 @@ fn current_live_session(store: &Store) -> Result<LiveSession> {
 ///
 /// The session NAME is what a person reads in the Agents sidebar, so it is the
 /// project name plus the session id when the conversation is scoped to a
-/// project (the todo-watcher's `"{project}: {task}"` idiom), and `mesa live
+/// project (the todo-watcher's `"{project}: {task}"` idiom), and `naru live
 /// <id>` when it is not. The id is in both halves because two conversations
 /// about the same project would otherwise be indistinguishable. **The API's
 /// `POST /api/live` builds the same name** — the two spawn sites must not
@@ -4905,7 +4909,7 @@ fn live_agent_dir(
 ) -> Result<(String, String)> {
     let workspace = || config::workspace_dir().to_string_lossy().into_owned();
     let Some(id) = project_id else {
-        return Ok((workspace(), format!("mesa live {session_id}")));
+        return Ok((workspace(), format!("naru live {session_id}")));
     };
     let project = store.get_project(id)?;
     let dir = match project.local_path {
@@ -5075,9 +5079,9 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                 // — comes from `~/.mesa/config.json`'s `live-agent` entry. The
                 // prompt is one argument, never spliced into a shell string.
                 let spawned = match live_agent_dir(&store, project_id, session.id) {
-                    // The `mesa-live` agent definition is seeded to disk first
+                    // The `naru-live` agent definition is seeded to disk first
                     // (mesa task 1068): the default template spawns
-                    // `--agent mesa-live`, which errors on an agent Claude Code
+                    // `--agent naru-live`, which errors on an agent Claude Code
                     // has never seen. A failure here is a failed spawn like any
                     // other and goes through the same rollback below.
                     Ok((dir, name)) => live::ensure_agent_definition(&store).and_then(|_| {
@@ -5169,7 +5173,7 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                 store.check_live_lease(session.id, lease)?;
             }
             let turn =
-                store.add_live_turn(session.id, LiveRole::Mesa, &text.join(" "), None, None)?;
+                store.add_live_turn(session.id, LiveRole::Naru, &text.join(" "), None, None)?;
             print_live_turn(&turn, quiet);
         }
         LiveCmd::Navigate {
@@ -5187,7 +5191,7 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             // anything being read aloud.
             let turn = store.add_live_turn(
                 session.id,
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 say.as_deref().unwrap_or(""),
                 Some(LiveAction::Navigate),
                 Some(&route),
@@ -5208,7 +5212,7 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             // route — the verb is the whole instruction.
             let turn = store.add_live_turn(
                 session.id,
-                LiveRole::Mesa,
+                LiveRole::Naru,
                 say.as_deref().unwrap_or(""),
                 Some(state),
                 None,
@@ -5250,7 +5254,7 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                 )));
             }
             let lease = session.lease + 1;
-            // The same template and the same `--agent mesa-live` as `start`,
+            // The same template and the same `--agent naru-live` as `start`,
             // deliberately: everything the successor shares with its
             // predecessor sits in front of everything per-session, so its
             // cached prefix is the same bytes. Only the name says which
@@ -5374,7 +5378,7 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             let path = match output {
                 Some(path) => PathBuf::from(path),
                 None => std::env::temp_dir().join(format!(
-                    "mesa-live-{}-{}.png",
+                    "naru-live-{}-{}.png",
                     session.id,
                     unix_seconds()
                 )),
@@ -5446,8 +5450,8 @@ fn run_retro(cmd: RetroCmd) -> Result<()> {
                 )));
             }
             let run = store.record_retro_run("manual")?;
-            // The `mesa-retro` definition is seeded first: the default
-            // template spawns `--agent mesa-retro`, which errors on an agent
+            // The `naru-retro` definition is seeded first: the default
+            // template spawns `--agent naru-retro`, which errors on an agent
             // Claude Code has never seen. cwd is ~/.mesa/workspace — a
             // retrospective spans every project, so there is no local_path.
             let dir = config::workspace_dir().to_string_lossy().into_owned();
@@ -5813,7 +5817,7 @@ fn run_live_board(store: &mut Store, cmd: LiveBoardCmd) -> Result<()> {
             // spoken as the picture appears, exactly as `navigate --say` is
             // spoken as the page changes.
             if let Some(say) = say {
-                store.add_live_turn(session.id, LiveRole::Mesa, &say, None, None)?;
+                store.add_live_turn(session.id, LiveRole::Naru, &say, None, None)?;
             }
             print_live_board(&board, quiet);
         }
@@ -5871,7 +5875,7 @@ fn run_live_board(store: &mut Store, cmd: LiveBoardCmd) -> Result<()> {
                         _ => board.body.clone().into_bytes(),
                     };
                     let attachment =
-                        store.create_attachment(task_id, &name, &bytes, Some("mesa-live"))?;
+                        store.create_attachment(task_id, &name, &bytes, Some("naru-live"))?;
                     print_json(&attachment);
                 }
                 (None, None) => unreachable!("clap requires --project or --task"),
@@ -6457,13 +6461,13 @@ fn run_library_sync_cmd(store: &mut Store, cmd: LibrarySyncCmd) -> Result<()> {
             project_pos,
             project,
             resolve,
-            all_mesa,
+            all_naru,
             all_disk,
         } => {
             let project = resolve_project_opt(store, project.or(project_pos).as_deref())?;
-            let resolutions = if all_mesa || all_disk {
-                let (choice, selects): (&str, fn(LibrarySyncStatus) -> bool) = if all_mesa {
-                    ("mesa", library_sync_all_mesa_selects)
+            let resolutions = if all_naru || all_disk {
+                let (choice, selects): (&str, fn(LibrarySyncStatus) -> bool) = if all_naru {
+                    ("mesa", library_sync_all_naru_selects)
                 } else {
                     ("disk", library_sync_all_disk_selects)
                 };
@@ -6698,7 +6702,7 @@ mod tests {
             scope: LibraryScope::Project,
             project_id: Some(2),
             body: "# reviewer\n".into(),
-            builtin_id: Some("mesa-live".into()),
+            builtin_id: Some("naru-live".into()),
             builtin: false,
             export_command: false,
             path: Some(".claude/agents/reviewer.md".into()),
@@ -6742,7 +6746,7 @@ mod tests {
         LiveTurn {
             id: 1,
             session_id: 2,
-            role: LiveRole::Mesa,
+            role: LiveRole::Naru,
             text: "Opening the board.".into(),
             action: Some(LiveAction::Navigate),
             target: Some("#/projects/2".into()),
@@ -7124,17 +7128,17 @@ mod tests {
     ];
 
     #[test]
-    fn all_mesa_selects_every_status_but_in_sync_and_disk_new() {
+    fn all_naru_selects_every_status_but_in_sync_and_disk_new() {
         use crate::core::LibrarySyncStatus::*;
         let selected: Vec<_> = ALL_LIBRARY_SYNC_STATUSES
             .iter()
             .copied()
-            .filter(|s| library_sync_all_mesa_selects(*s))
+            .filter(|s| library_sync_all_naru_selects(*s))
             .collect();
         assert_eq!(
             selected,
             vec![MesaNew, DiskDeleted, MesaChanged, DiskChanged, BothChanged],
-            "a new LibrarySyncStatus needs a decision: does --all-mesa select it?",
+            "a new LibrarySyncStatus needs a decision: does --all-naru select it?",
         );
     }
 
@@ -7161,6 +7165,11 @@ mod tests {
         assert_eq!(
             parse_library_resolution("a/b.md=mesa").unwrap(),
             ("a/b.md".to_string(), "mesa".to_string()),
+        );
+        // `naru` is the same choice under the new name, echoed as given.
+        assert_eq!(
+            parse_library_resolution("a/b.md=naru").unwrap(),
+            ("a/b.md".to_string(), "naru".to_string()),
         );
     }
 

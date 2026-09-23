@@ -263,13 +263,13 @@ RUN1=$(jqs .id)
 [ "$(jqs .spawned_at)" != "null" ] || fail "a run that spawned prints spawned_at: $STDOUT"
 [ "$(wc -l < "$BG_LOG")" -eq 1 ] || fail "one spawn: $(cat "$BG_LOG")"
 LINE=$(head -1 "$BG_LOG")
-EXPECT="$WORKSPACE|mesa retro $RUN1|Run mesa session retrospective $RUN1."
+EXPECT="$WORKSPACE|naru retro $RUN1|Run mesa session retrospective $RUN1."
 [ "$LINE" = "$EXPECT" ] || fail "expected '$EXPECT', got '$LINE'"
-[ "$(cat "$STUB_DIR/last-agent")" = "mesa-retro" ] ||
-  fail "the run must pass --agent mesa-retro, got '$(cat "$STUB_DIR/last-agent")'"
-AGENT_FILE="$FAKE_HOME/.claude/agents/mesa-retro.md"
-[ -f "$AGENT_FILE" ] || fail "the mesa-retro agent definition must be seeded at $AGENT_FILE before the spawn"
-grep -q '^name: mesa-retro$' "$AGENT_FILE" || fail "the seeded definition must name the agent: $(head -3 "$AGENT_FILE")"
+[ "$(cat "$STUB_DIR/last-agent")" = "naru-retro" ] ||
+  fail "the run must pass --agent naru-retro, got '$(cat "$STUB_DIR/last-agent")'"
+AGENT_FILE="$FAKE_HOME/.claude/agents/naru-retro.md"
+[ -f "$AGENT_FILE" ] || fail "the naru-retro agent definition must be seeded at $AGENT_FILE before the spawn"
+grep -q '^name: naru-retro$' "$AGENT_FILE" || fail "the seeded definition must name the agent: $(head -3 "$AGENT_FILE")"
 grep -q '^model: sonnet$' "$AGENT_FILE" || fail "the retrospective clusters and writes on sonnet"
 grep -q '^tools: ' "$AGENT_FILE" || fail "the seeded definition must carry a tool list"
 ! grep -E '^tools: .*\b(Edit|Write)\b' "$AGENT_FILE" || fail "the retro agent must not be able to Edit/Write: $(grep '^tools:' "$AGENT_FILE")"
@@ -277,7 +277,7 @@ grep -q 'haiku' "$AGENT_FILE" && grep -q 'opus' "$AGENT_FILE" && grep -q 'Never 
   fail "the definition must state the model-per-step rule"
 grep -q 'mesa retro finding record' "$AGENT_FILE" || fail "the definition must route findings through the log"
 grep -q -- '--kind change-request --author retro --task' "$AGENT_FILE" || fail "the definition must file through inbox add"
-ok "retro run records a manual run and spawns --agent mesa-retro in ~/.naru/workspace, named 'mesa retro <id>', with the definition seeded (sonnet, no Edit/Write, model-per-step rule)"
+ok "retro run records a manual run and spawns --agent naru-retro in ~/.naru/workspace, named 'naru retro <id>', with the definition seeded (sonnet, no Edit/Write, model-per-step rule)"
 
 # ---- inside the interval: conflict; --force runs anyway ----
 
@@ -295,7 +295,7 @@ RUN2=$(jqs .id)
 [ "$RUN2" -gt "$RUN1" ] || fail "--force records a new run: $STDOUT"
 [ "$(keys "$STDOUT")" = "id,spawned_at,started_at,trigger" ] || fail "a run has nothing to drop under --quiet: $(keys "$STDOUT")"
 [ "$(wc -l < "$BG_LOG")" -eq 2 ] || fail "--force spawns: $(cat "$BG_LOG")"
-grep -q "|mesa retro $RUN2|Run mesa session retrospective $RUN2." "$BG_LOG" || fail "the forced run carries its own id"
+grep -q "|naru retro $RUN2|Run mesa session retrospective $RUN2." "$BG_LOG" || fail "the forced run carries its own id"
 ok "retro run inside the interval is conflict; --force runs and records a new run; next_due_at is started_at + interval"
 
 # ---- the interval is the config's `watchers.retro-interval-hours`, read fresh ----
@@ -416,9 +416,9 @@ RUN_W=$(jqs .last_run.id)
 [ "$(jqs .last_run.trigger)" = "watcher" ] || fail "a watcher run is trigger watcher: $STDOUT"
 [ "$(jqs .due)" = "false" ] || fail "just dispatched: not due: $STDOUT"
 LINE=$(head -1 "$BG_LOG")
-EXPECT="$WORKSPACE|mesa retro $RUN_W|Run mesa session retrospective $RUN_W."
+EXPECT="$WORKSPACE|naru retro $RUN_W|Run mesa session retrospective $RUN_W."
 [ "$LINE" = "$EXPECT" ] || fail "expected '$EXPECT', got '$LINE'"
-[ "$(cat "$STUB_DIR/last-agent")" = "mesa-retro" ] || fail "the watcher spawns --agent mesa-retro"
+[ "$(cat "$STUB_DIR/last-agent")" = "naru-retro" ] || fail "the watcher spawns --agent naru-retro"
 sleep 1
 [ "$(wc -l < "$BG_LOG")" -eq 1 ] || fail "inside the interval the watcher must not dispatch again: $(cat "$BG_LOG")"
 # The run row is the claim the CLI sees too.

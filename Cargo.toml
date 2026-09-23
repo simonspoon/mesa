@@ -1,5 +1,5 @@
 [package]
-name = "mesa"
+name = "naru"
 version = "1.7.0"
 edition = "2024"
 description = "Local-first project & task management for humans and agents"
@@ -10,7 +10,7 @@ categories = ["command-line-utilities"]
 
 # The binary is `naru` (mesa task 1301). `mesa` is the same program under its
 # old name, a real second binary so every script and agent that runs `mesa`
-# keeps working; the crate itself is still `mesa` until a later rename phase.
+# keeps working. The crate is `naru` since mesa task 1302.
 [[bin]]
 name = "naru"
 path = "src/main.rs"

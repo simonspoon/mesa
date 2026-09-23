@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   actsOn,
   advanceCursor,
+  isNaruRole,
   mergeTurns,
   navigateTarget,
   nextUnplayed,
@@ -322,5 +323,32 @@ describe('actsOn', () => {
 
   it('is false for a turn that only speaks', () => {
     expect(actsOn(turn(7), new Set())).toBe(false)
+  })
+})
+
+describe('a turn written as naru (mesa task 1302)', () => {
+  // The server still writes `mesa`; a later build will write `naru`, which the
+  // generated type does not name yet — hence the one widening cast.
+  const naru = (id: number, patch: Partial<LiveTurn> = {}) =>
+    turn(id, { role: 'naru' as LiveTurn['role'], ...patch })
+
+  it('is Naru’s side, as mesa is, and the user is not', () => {
+    expect(isNaruRole('mesa')).toBe(true)
+    expect(isNaruRole('naru')).toBe(true)
+    expect(isNaruRole('user')).toBe(false)
+  })
+
+  it('is spoken and queued like a mesa turn', () => {
+    expect(spokenText(naru(1))).toBe('the board is open')
+    expect(pendingTurns([naru(1), turn(2, { role: 'user' })], new Set()).map((t) => t.id)).toEqual(
+      [1],
+    )
+    expect(nextUnplayed([naru(3)], new Set())?.id).toBe(3)
+  })
+
+  it('runs together with a mesa turn beside it', () => {
+    const groups = turnGroups([turn(1), naru(2), turn(3, { role: 'user' })])
+    expect(groups.map((g) => g.turns.map((t) => t.id))).toEqual([[1, 2], [3]])
+    expect(turnLabel(naru(2).role)).toBe('Naru')
   })
 })

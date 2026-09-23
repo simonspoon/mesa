@@ -9921,7 +9921,8 @@ button:focus-visible,
 }
 
 .live-group.live-user,
-.live-group.live-mesa {
+.live-group.live-mesa,
+.live-group.live-naru {
   max-width: 86%;
 }
 

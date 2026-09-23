@@ -177,15 +177,15 @@ is still running."
     };
 }
 
-/// The loop text itself, unchanged: the body of the `mesa-live` agent
+/// The loop text itself, unchanged: the body of the `naru-live` agent
 /// definition minus its frontmatter, and what every test that pins a rule of
 /// the conversation asserts against.
 pub const AGENT_PROMPT: &str = agent_loop!();
 
-/// The `mesa-live` agent definition (mesa task 1068) — YAML frontmatter plus
-/// [`AGENT_PROMPT`]. This is what the `mesa-live` library built-in holds and
+/// The `naru-live` agent definition (mesa task 1068) — YAML frontmatter plus
+/// [`AGENT_PROMPT`]. This is what the `naru-live` library built-in holds and
 /// what [`ensure_agent_definition`] seeds to
-/// `$HOME/.claude/agents/mesa-live.md`, so `claude --agent mesa-live` (the
+/// `$HOME/.claude/agents/naru-live.md`, so `claude --agent naru-live` (the
 /// `live-agent` template's default) finds a real agent. `Read` is in the tool
 /// list because `mesa live look` prints the path to a PNG the agent has to
 /// open; `Agent` because rule 12 (mesa task 1156) delegates long jobs off
@@ -196,7 +196,7 @@ pub const AGENT_PROMPT: &str = agent_loop!();
 /// 1273) — the reasoning effort the person tuned for the voice.
 pub const AGENT_DEFINITION: &str = concat!(
     "---\n",
-    "name: mesa-live\n",
+    "name: naru-live\n",
     "description: The voice of mesa in a live conversation — drives one live \
 session through the listen/say loop\n",
     "model: fable\n",
@@ -452,7 +452,7 @@ pub const LIVE_HANDOFF_TURNS: usize = 10;
 /// is an agent definition rather than a prompt — the agent *name* the
 /// `live-agent` template spawns with and the file stem it is seeded under.
 /// One const, so the three can never drift apart.
-pub const LIVE_AGENT_BUILTIN: &str = "mesa-live";
+pub const LIVE_AGENT_BUILTIN: &str = "naru-live";
 
 /// Resolves a prompt block from its library fork, falling back to the
 /// built-in — used by [`summary_prompt`], and by [`ensure_agent_definition`]
@@ -476,9 +476,9 @@ fn resolve_prompt_block(store: &crate::core::Store, name: &str, builtin: &str) -
 /// hand the agent the same text.
 ///
 /// As of mesa task 1068 the instructions are **not** in here: they are the
-/// `mesa-live` agent definition ([`AGENT_DEFINITION`], the library built-in
+/// `naru-live` agent definition ([`AGENT_DEFINITION`], the library built-in
 /// [`ensure_agent_definition`] seeds to disk) that the `live-agent` template
-/// spawns with `--agent mesa-live`. What mesa injects is only what the
+/// spawns with `--agent naru-live`. What mesa injects is only what the
 /// definition cannot know: which session this is, and what came before it.
 pub fn agent_prompt(store: &crate::core::Store, session_id: i64) -> String {
     // A store error here falls back to no recall at all rather than failing
@@ -499,7 +499,7 @@ pub fn agent_prompt(store: &crate::core::Store, session_id: i64) -> String {
 /// followed by the outgoing agent's note and the session's last
 /// [`LIVE_HANDOFF_TURNS`] turns — read straight off the end of the
 /// transcript by `Store::last_live_turns`, since a long transcript is the
-/// very case a handoff exists for. Same template, same `--agent mesa-live`,
+/// very case a handoff exists for. Same template, same `--agent naru-live`,
 /// and everything that is per-session sits *after* the shared prefix, so the
 /// successor's cached prefix is its predecessor's. The store fallbacks are
 /// [`agent_prompt`]'s: a hiccup costs recall, never the spawn.
@@ -519,10 +519,10 @@ pub fn handoff_prompt(
     handoff_prompt_with(session_id, lease, &notebook, &summaries, note, &turns)
 }
 
-/// Writes the `mesa-live` agent definition to `$HOME/.claude/agents/mesa-live.md`
+/// Writes the `naru-live` agent definition to `$HOME/.claude/agents/naru-live.md`
 /// if it is not there already, and answers where it went (mesa task 1068).
 /// Called by **both** spawn sites before `agents::spawn_bg`, because
-/// `claude --agent mesa-live` errors on an agent Claude Code has never seen and
+/// `claude --agent naru-live` errors on an agent Claude Code has never seen and
 /// nothing else puts the file there — the library sync is a thing the user
 /// runs, not something a conversation may depend on.
 ///
@@ -693,7 +693,7 @@ mod tests {
 
     /// The prompt is one argument mesa passes through `spawn_bg`, and since
     /// mesa task 1068 the session id is the whole of it: the instructions are
-    /// the `mesa-live` agent definition, not something mesa injects.
+    /// the `naru-live` agent definition, not something mesa injects.
     #[test]
     fn agent_prompt_carries_the_session_id_and_nothing_else() {
         let prompt = prompt_with(7, 1, &[], &[]);
@@ -833,7 +833,7 @@ mod tests {
             "{AGENT_DEFINITION}"
         );
         assert!(
-            AGENT_DEFINITION.starts_with("---\nname: mesa-live\n"),
+            AGENT_DEFINITION.starts_with("---\nname: naru-live\n"),
             "{AGENT_DEFINITION}"
         );
     }
@@ -963,9 +963,9 @@ mod tests {
         assert!(msg.contains("30%"), "{msg}");
     }
 
-    /// mesa task 1068: the first spawn seeds the `mesa-live` agent
-    /// definition to `$HOME/.claude/agents/mesa-live.md`, because
-    /// `claude --agent mesa-live` errors on an agent Claude Code has never
+    /// mesa task 1068: the first spawn seeds the `naru-live` agent
+    /// definition to `$HOME/.claude/agents/naru-live.md`, because
+    /// `claude --agent naru-live` errors on an agent Claude Code has never
     /// seen and nothing else puts the file there.
     #[test]
     fn ensure_agent_definition_seeds_the_builtin_when_the_file_is_absent() {
@@ -980,16 +980,16 @@ mod tests {
                 path,
                 home.canonicalize()
                     .unwrap()
-                    .join(".claude/agents/mesa-live.md")
+                    .join(".claude/agents/naru-live.md")
             );
             let body = std::fs::read_to_string(&path).unwrap();
             assert_eq!(body, AGENT_DEFINITION);
-            assert!(body.starts_with("---\nname: mesa-live\n"), "{body}");
+            assert!(body.starts_with("---\nname: naru-live\n"), "{body}");
             assert!(body.contains("mesa live listen"), "{body}");
         });
     }
 
-    /// A forked `mesa-live` row is what gets seeded — the same fork
+    /// A forked `naru-live` row is what gets seeded — the same fork
     /// resolution every other library-backed spawn does, so an edited
     /// definition is the one that reaches disk.
     #[test]
@@ -1003,14 +1003,14 @@ mod tests {
                     crate::core::LibraryScope::User,
                     None,
                     LIVE_AGENT_BUILTIN,
-                    "---\nname: mesa-live\n---\n\nTalk like a pirate.",
+                    "---\nname: naru-live\n---\n\nTalk like a pirate.",
                     Some(LIVE_AGENT_BUILTIN),
                     false,
                 )
                 .unwrap();
 
             ensure_agent_definition(&store).unwrap();
-            let body = std::fs::read_to_string(home.join(".claude/agents/mesa-live.md")).unwrap();
+            let body = std::fs::read_to_string(home.join(".claude/agents/naru-live.md")).unwrap();
             assert!(body.ends_with("Talk like a pirate."), "{body}");
             assert!(!body.contains("mesa live listen"), "{body}");
         });
@@ -1023,7 +1023,7 @@ mod tests {
         crate::core::library::test_home::with_home_dir(|home| {
             let dir = tempfile::tempdir().unwrap();
             let store = crate::core::Store::open(&dir.path().join("test.db")).unwrap();
-            let path = home.join(".claude/agents/mesa-live.md");
+            let path = home.join(".claude/agents/naru-live.md");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "hand-edited, do not touch").unwrap();
 
@@ -1227,7 +1227,7 @@ question is a task, not a note",
     fn handoff_prompt_with_carries_the_note_and_lease_after_the_session_line() {
         let turns = [
             sample_turn(1, crate::core::LiveRole::User, "open the board"),
-            sample_turn(2, crate::core::LiveRole::Mesa, "Opening it now."),
+            sample_turn(2, crate::core::LiveRole::Naru, "Opening it now."),
         ];
         let prompt = handoff_prompt_with(4, 2, &[], &[], "we were on the roadmap", &turns);
         assert!(
@@ -1278,10 +1278,10 @@ question is a task, not a note",
             "{prompt}"
         );
 
-        let mut nav = sample_turn(3, crate::core::LiveRole::Mesa, "");
+        let mut nav = sample_turn(3, crate::core::LiveRole::Naru, "");
         nav.action = Some(crate::core::LiveAction::Navigate);
         nav.target = Some("#/inbox".into());
-        let mut fold = sample_turn(4, crate::core::LiveRole::Mesa, "Making room.");
+        let mut fold = sample_turn(4, crate::core::LiveRole::Naru, "Making room.");
         fold.action = Some(crate::core::LiveAction::CollapseSidebars);
         let multi = sample_turn(5, crate::core::LiveRole::User, "two\nlines");
         let prompt = handoff_prompt_with(4, 2, &[], &[], "n", &[nav, fold, multi]);

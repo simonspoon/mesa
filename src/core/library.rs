@@ -42,11 +42,11 @@ pub struct Builtin {
     pub body: &'static str,
 }
 
-/// The starter set — deliberately tiny. `mesa-live` is the agent definition
+/// The starter set — deliberately tiny. `naru-live` is the agent definition
 /// the live conversation runs as (mesa task 1068, replacing the old
 /// `live-agent-prompt` *prompt*): its body is `core::live::AGENT_DEFINITION`,
 /// frontmatter plus the loop `core::live::AGENT_PROMPT` states, and because it
-/// is an [`LibraryKind::Agent`] it has a real path — `.claude/agents/mesa-live.md`
+/// is an [`LibraryKind::Agent`] it has a real path — `.claude/agents/naru-live.md`
 /// — so the sync flow carries it like any other agent definition, and
 /// `core::live::ensure_agent_definition` seeds it there on the first spawn.
 /// `supervisor` is the same shape one step up (mesa task 1075): the agent
@@ -59,9 +59,9 @@ pub struct Builtin {
 /// `core::inbox_triage::INBOX_TRIAGE_DEFINITION`, at
 /// `.claude/agents/inbox-triage.md`, seeded by
 /// `core::inbox_triage::ensure_agent_definition` before the `inbox-watcher`
-/// spawn. `mesa-retro` is the fourth (mesa task 1158): the agent definition a
+/// spawn. `naru-retro` is the fourth (mesa task 1158): the agent definition a
 /// `serve --watch-retro` pass reviews finished sessions as, body
-/// `core::retro::RETRO_DEFINITION`, at `.claude/agents/mesa-retro.md`, seeded
+/// `core::retro::RETRO_DEFINITION`, at `.claude/agents/naru-retro.md`, seeded
 /// by `core::retro::ensure_agent_definition` before the `retro` spawn.
 /// `live-summary-prompt` is still a `prompt` (mesa task 921): the instructions
 /// for the short-lived agent that writes a live conversation's memory once it
@@ -143,8 +143,49 @@ echo \"Claude Code stopped in $(pwd)\"
     },
 ];
 
-/// Looks up one built-in by id.
+/// Built-in ids renamed by mesa task 1302, old to new. A stored fork was
+/// moved by the migration at index 71; everything that still names a
+/// built-in by its old id — a bundle exported before the rename, a caller
+/// forking `mesa-live` by name — is read through [`canonical_builtin_id`].
+pub const RENAMED_BUILTINS: &[(&str, &str)] =
+    &[("mesa-live", "naru-live"), ("mesa-retro", "naru-retro")];
+
+/// A built-in id with a pre-rename spelling mapped to its current one; any
+/// other id comes back unchanged.
+pub fn canonical_builtin_id(id: &str) -> &str {
+    RENAMED_BUILTINS
+        .iter()
+        .find(|(old, _)| *old == id)
+        .map_or(id, |(_, new)| new)
+}
+
+/// The agent-definition frontmatter line `name: <old>` rewritten to
+/// `name: <new>`, or `None` when the body carries no such line inside its
+/// frontmatter. The Rust twin of migration index 71's `body` rewrite, used on
+/// a pre-rename bundle so an imported fork of `naru-live` names the agent
+/// `claude --agent naru-live` looks for: the first `\nname: <old>\n` of a body
+/// that opens with `---\n`, and only before the frontmatter's closing `\n---`.
+/// A CRLF body (`---\r\n`, `\nname: <old>\r\n`) is matched too, and keeps its
+/// `\r\n`; like the migration, the LF form is tried first.
+pub fn rename_frontmatter_name(body: &str, old: &str, new: &str) -> Option<String> {
+    if !(body.starts_with("---\n") || body.starts_with("---\r\n")) {
+        return None;
+    }
+    let close = 3 + body[3..].find("\n---")?;
+    ["\n", "\r\n"].into_iter().find_map(|eol| {
+        let line = format!("\nname: {old}{eol}");
+        let at = body.find(&line).filter(|at| *at < close)?;
+        Some(format!(
+            "{}\nname: {new}{eol}{}",
+            &body[..at],
+            &body[at + line.len()..]
+        ))
+    })
+}
+
+/// Looks up one built-in by id, a pre-rename id included.
 pub fn builtin(id: &str) -> Option<&'static Builtin> {
+    let id = canonical_builtin_id(id);
     BUILTINS.iter().find(|b| b.id == id)
 }
 
@@ -286,7 +327,7 @@ fn canonical_prefix(path: &Path) -> Result<PathBuf, String> {
 
 /// Writes a built-in **agent definition** to its user-scope path if it is not
 /// there already, and answers where it went. Both named-agent features seed
-/// their definition this way before spawning — `mesa-live`
+/// their definition this way before spawning — `naru-live`
 /// ([`crate::core::live::ensure_agent_definition`]) and `supervisor`
 /// ([`crate::core::supervisor::ensure_agent_definition`]) — because
 /// `claude --agent <name>` errors on an agent Claude Code has never seen and
@@ -904,7 +945,8 @@ fn marker(text: String) -> LibraryDiffLine {
 }
 
 /// Applies the caller's per-path choices from a `sync_status` scan.
-/// `choice` is `"mesa" | "disk" | "skip"`. Per-row isolation: a failing row
+/// `choice` is `"naru" | "mesa" | "disk" | "skip"` (`naru` and `mesa` are
+/// one choice). Per-row isolation: a failing row
 /// is reported in its own result and the rest still apply — never an
 /// all-or-nothing batch.
 pub fn sync_apply(
@@ -952,7 +994,9 @@ pub fn sync_apply(
                 applied: false,
                 error: None,
             }),
-            "mesa" => match apply_mesa(store, project, row) {
+            // `naru` is the same choice as `mesa` under the new name (mesa
+            // task 1302); the result echoes whichever spelling was given.
+            "naru" | "mesa" => match apply_naru(store, project, row) {
                 Ok(()) => results.push(LibrarySyncResult {
                     path: path.clone(),
                     choice: choice.clone(),
@@ -991,10 +1035,10 @@ pub fn sync_apply(
     Ok(results)
 }
 
-/// `mesa` wins: write the mesa body to disk, creating parent directories, and
-/// stamp the baseline. A built-in (no db row) is re-derivable, so it is
-/// written to disk with no baseline stamp.
-fn apply_mesa(store: &mut Store, project: Option<i64>, row: &LibrarySyncRow) -> StoreResult<()> {
+/// `naru` (or `mesa`) wins: write the naru body to disk, creating parent
+/// directories, and stamp the baseline. A built-in (no db row) is
+/// re-derivable, so it is written to disk with no baseline stamp.
+fn apply_naru(store: &mut Store, project: Option<i64>, row: &LibrarySyncRow) -> StoreResult<()> {
     let body = row
         .mesa_body
         .as_ref()
@@ -2909,7 +2953,7 @@ pub(crate) mod test_home {
     use std::path::Path;
 
     /// Serializes every test that needs a controlled `user`-scope base — the
-    /// `claude-md` and `mesa-live` built-ins only exist at `user` scope, so
+    /// `claude-md` and `naru-live` built-ins only exist at `user` scope, so
     /// exercising them means overriding the real, process-global `$HOME` for
     /// the duration of the closure. Guarded by a mutex (not just "no other
     /// test reads MESA_DB"-style luck) because several tests need it, and
@@ -3162,8 +3206,8 @@ mod tests {
         // definition now, so unlike the prompt they used to be they have a
         // path and the sync flow carries them.
         assert_eq!(
-            relative_path(LibraryKind::Agent, LibraryScope::User, "mesa-live", false),
-            Some(PathBuf::from(".claude/agents/mesa-live.md"))
+            relative_path(LibraryKind::Agent, LibraryScope::User, "naru-live", false),
+            Some(PathBuf::from(".claude/agents/naru-live.md"))
         );
     }
 
@@ -3256,7 +3300,7 @@ mod tests {
         // Both outcomes are safe here — an `Err` (refusing it outright) is
         // exactly as acceptable as an `Ok` that stays contained, so there is
         // nothing to assert on the error path itself. This differs from the
-        // real sync path (`apply_mesa`/`apply_disk`), which never discards a
+        // real sync path (`apply_naru`/`apply_disk`), which never discards a
         // `resolve()` error — it is always propagated as the row's
         // `LibrarySyncResult.error`, never swallowed.
         if let Ok(resolved) = resolve(&base, rel) {
@@ -3517,7 +3561,7 @@ mod tests {
 
     #[test]
     fn builtin_lookup() {
-        assert!(builtin("mesa-live").is_some());
+        assert!(builtin("naru-live").is_some());
         assert!(builtin("supervisor").is_some());
         assert!(builtin("live-summary-prompt").is_some());
         assert!(builtin("starter-claude-md").is_some());
@@ -3551,12 +3595,12 @@ mod tests {
         let items = effective_items(&store, None).unwrap();
         let found = items
             .iter()
-            .find(|i| i.builtin_id.as_deref() == Some("mesa-live"))
+            .find(|i| i.builtin_id.as_deref() == Some("naru-live"))
             .expect("unshadowed built-in must be reported");
         assert!(found.builtin);
         assert_eq!(found.id, None);
         assert_eq!(found.body, crate::core::live::AGENT_DEFINITION);
-        assert_eq!(found.path.as_deref(), Some(".claude/agents/mesa-live.md"));
+        assert_eq!(found.path.as_deref(), Some(".claude/agents/naru-live.md"));
 
         let (mut store, _dir) = temp_store();
         store
@@ -3564,14 +3608,14 @@ mod tests {
                 LibraryKind::Agent,
                 LibraryScope::User,
                 None,
-                "mesa-live",
+                "naru-live",
                 "a custom definition",
-                Some("mesa-live"),
+                Some("naru-live"),
                 false,
             )
             .unwrap();
         let items = effective_items(&store, None).unwrap();
-        let matches: Vec<_> = items.iter().filter(|i| i.name == "mesa-live").collect();
+        let matches: Vec<_> = items.iter().filter(|i| i.name == "naru-live").collect();
         assert_eq!(matches.len(), 1, "a fork must shadow, not duplicate");
         assert!(!matches[0].builtin);
         assert_eq!(matches[0].body, "a custom definition");
@@ -4151,6 +4195,38 @@ mod tests {
         assert_eq!(refreshed.synced_body.as_deref(), Some("reviewer body"));
     }
 
+    /// `naru` is `mesa`'s new spelling (mesa task 1302): it writes the same
+    /// file, and the result echoes the choice exactly as it was given.
+    #[test]
+    fn sync_apply_naru_is_the_mesa_choice_echoed_as_given() {
+        let (mut store, dir) = temp_store();
+        let base = dir.path().to_path_buf();
+        let pid = project_at(&mut store, &base);
+        store
+            .create_library_item(
+                LibraryKind::Agent,
+                LibraryScope::Project,
+                Some(pid),
+                "reviewer",
+                "reviewer body",
+                None,
+                false,
+            )
+            .unwrap();
+
+        let results = sync_apply(
+            &mut store,
+            Some(pid),
+            &[(".claude/agents/reviewer.md".to_string(), "naru".to_string())],
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].applied, "{:?}", results[0].error);
+        assert_eq!(results[0].choice, "naru");
+        let written = fs::read_to_string(base.join(".claude/agents/reviewer.md")).unwrap();
+        assert_eq!(written, "reviewer body");
+    }
+
     #[test]
     fn sync_apply_disk_pulls_the_body_and_appends_a_version() {
         let (mut store, dir) = temp_store();
@@ -4596,6 +4672,81 @@ mod tests {
         assert_eq!(matches[0].name, "AGENTS");
     }
 
+    /// mesa task 1302: the pre-rename ids still name their built-ins, and
+    /// the frontmatter rewrite touches only the `name:` line inside the
+    /// frontmatter.
+    #[test]
+    fn a_renamed_builtin_answers_to_its_old_id() {
+        assert_eq!(builtin("mesa-live").unwrap().id, "naru-live");
+        assert_eq!(builtin("mesa-retro").unwrap().id, "naru-retro");
+        assert_eq!(canonical_builtin_id("mesa-live"), "naru-live");
+        assert_eq!(canonical_builtin_id("supervisor"), "supervisor");
+        assert_eq!(
+            rename_frontmatter_name(
+                "---\nname: mesa-live\nx: y\n---\nbody",
+                "mesa-live",
+                "naru-live"
+            )
+            .as_deref(),
+            Some("---\nname: naru-live\nx: y\n---\nbody")
+        );
+        // Outside the frontmatter, or with no frontmatter at all: untouched.
+        assert_eq!(
+            rename_frontmatter_name(
+                "---\nx: y\n---\nname: mesa-live\n",
+                "mesa-live",
+                "naru-live"
+            ),
+            None
+        );
+        assert_eq!(
+            rename_frontmatter_name("name: mesa-live\n", "mesa-live", "naru-live"),
+            None
+        );
+        // A CRLF body is matched too and keeps its line endings.
+        assert_eq!(
+            rename_frontmatter_name(
+                "---\r\nname: mesa-retro\r\nx: y\r\n---\r\nbody\r\n",
+                "mesa-retro",
+                "naru-retro"
+            )
+            .as_deref(),
+            Some("---\r\nname: naru-retro\r\nx: y\r\n---\r\nbody\r\n")
+        );
+    }
+
+    /// A bundle exported before the rename carries `builtin_id: "mesa-live"`:
+    /// it imports as the fork of `naru-live`, under the new name and with the
+    /// frontmatter naming the agent `claude --agent naru-live` looks for.
+    #[test]
+    fn a_pre_rename_bundle_imports_as_the_fork_of_the_new_builtin() {
+        let (mut store, _dir) = temp_store();
+        let bundle: LibraryBundle = serde_json::from_value(serde_json::json!({
+            "version": BUNDLE_VERSION,
+            "exported_at": "2026-09-01 00:00:00",
+            "items": [{
+                "name": "mesa-live",
+                "kind": "agent",
+                "scope": "user",
+                "project": null,
+                "body": "---\nname: mesa-live\n---\n\nTuned.",
+                "builtin_id": "mesa-live"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(bundle.items[0].name, "naru-live");
+        let results = import(&mut store, &bundle, "skip", &[]).unwrap();
+        assert_eq!(results[0].status, "created", "{results:?}");
+        let fork = store.find_library_fork("naru-live").unwrap().unwrap();
+        assert_eq!(fork.name, "naru-live");
+        assert_eq!(fork.builtin_id.as_deref(), Some("naru-live"));
+        assert_eq!(fork.body, "---\nname: naru-live\n---\n\nTuned.");
+
+        // Imported again, it meets that fork rather than a second one.
+        let again = import(&mut store, &bundle, "skip", &[]).unwrap();
+        assert_ne!(again[0].status, "created", "{again:?}");
+    }
+
     // ---- export / import (mesa task 963) ----
 
     #[test]
@@ -4606,9 +4757,9 @@ mod tests {
                 LibraryKind::Agent,
                 LibraryScope::User,
                 None,
-                "mesa-live",
+                "naru-live",
                 "a custom definition",
-                Some("mesa-live"),
+                Some("naru-live"),
                 false,
             )
             .unwrap();
@@ -4619,9 +4770,9 @@ mod tests {
         let forked = bundle
             .items
             .iter()
-            .find(|i| i.name == "mesa-live")
+            .find(|i| i.name == "naru-live")
             .expect("a forked built-in must be exported");
-        assert_eq!(forked.builtin_id.as_deref(), Some("mesa-live"));
+        assert_eq!(forked.builtin_id.as_deref(), Some("naru-live"));
         assert_eq!(forked.body, "a custom definition");
 
         // live-summary-prompt was never forked, so it must not appear at all.

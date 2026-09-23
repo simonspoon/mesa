@@ -1,4 +1,4 @@
-//! The `mesa-retro` agent definition (mesa task 1158) — the contract a
+//! The `naru-retro` agent definition (mesa task 1158) — the contract a
 //! `serve --watch-retro` pass (or `mesa retro run`) reviews the finished task
 //! sessions under, as a named Claude Code agent, exactly as mesa task 1168
 //! made triage the `inbox-triage` agent and mesa task 1075 made a dispatch
@@ -8,7 +8,7 @@
 //! definition, a const holding the built-in's id (which is also the agent
 //! *name* the `retro` template spawns with and the file stem it is seeded
 //! under), and [`ensure_agent_definition`], which puts the file on disk
-//! before the first spawn so `claude --agent mesa-retro` finds a real agent.
+//! before the first spawn so `claude --agent naru-retro` finds a real agent.
 //!
 //! What the agent is: a reviewer that **proposes and never edits**. It reads
 //! session telemetry (`mesa cc`), finds friction — denials, retry loops, a
@@ -23,18 +23,18 @@
 /// built-in is an agent definition rather than a prompt — the agent *name*
 /// the `retro` template spawns with and the file stem it is seeded under.
 /// One const, so the three can never drift apart.
-pub const RETRO_AGENT_BUILTIN: &str = "mesa-retro";
+pub const RETRO_AGENT_BUILTIN: &str = "naru-retro";
 
-/// The `mesa-retro` agent definition — YAML frontmatter plus the procedure.
-/// This is what the `mesa-retro` library built-in holds and what
-/// [`ensure_agent_definition`] seeds to `$HOME/.claude/agents/mesa-retro.md`,
-/// so `claude --agent mesa-retro` (the `retro` template's default) finds a
+/// The `naru-retro` agent definition — YAML frontmatter plus the procedure.
+/// This is what the `naru-retro` library built-in holds and what
+/// [`ensure_agent_definition`] seeds to `$HOME/.claude/agents/naru-retro.md`,
+/// so `claude --agent naru-retro` (the `retro` template's default) finds a
 /// real agent. The tool list deliberately carries no `Edit`, `Write` or
 /// `NotebookEdit`: a retrospective reports; it never changes an agent, a
 /// skill, a config file or project code, and an agent that cannot edit cannot
 /// quietly start to. `Agent` is there for the model-per-step rule below.
 pub const RETRO_DEFINITION: &str = r#"---
-name: mesa-retro
+name: naru-retro
 description: Reviews the task sessions that finished since the last retrospective for friction — denials, retry loops, missing skills, tools that keep failing — and files each NEW finding as a change-request in the mesa inbox. Proposes only; never edits an agent, a skill, a config file or project code.
 model: sonnet
 tools: Bash, Read, Grep, Glob, Agent
@@ -94,7 +94,7 @@ else.
    finding's fingerprint with new/known, and the inbox ids you filed.
 "#;
 
-/// Seeds `$HOME/.claude/agents/mesa-retro.md` from the effective library
+/// Seeds `$HOME/.claude/agents/naru-retro.md` from the effective library
 /// row — the user's fork if they made one, else the built-in — **without
 /// overwriting an existing file**, and answers its path. Both spawn sites
 /// (`retro_watcher_tick`, `mesa retro run`) call this before
@@ -110,7 +110,7 @@ pub fn ensure_agent_definition(store: &crate::core::Store) -> Result<std::path::
 /// Agents sidebar. Both spawn sites use it, so a watcher pass and a manual
 /// one are told apart by their run row, not their name.
 pub fn session_name(run_id: i64) -> String {
-    format!("mesa retro {run_id}")
+    format!("naru retro {run_id}")
 }
 
 #[cfg(test)]
@@ -193,7 +193,7 @@ mod tests {
                 path,
                 home.canonicalize()
                     .unwrap()
-                    .join(".claude/agents/mesa-retro.md")
+                    .join(".claude/agents/naru-retro.md")
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), RETRO_DEFINITION);
             std::fs::write(&path, "hand-edited").unwrap();
@@ -204,6 +204,6 @@ mod tests {
 
     #[test]
     fn session_name_carries_the_run_id() {
-        assert_eq!(session_name(7), "mesa retro 7");
+        assert_eq!(session_name(7), "naru retro 7");
     }
 }

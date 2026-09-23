@@ -231,6 +231,17 @@ struct AppState {
     /// receipt records nothing, since there is no id to stop with (the
     /// limitation the attach pane already has).
     todo_dispatched: Arc<Mutex<HashMap<String, DispatchedSession>>>,
+    /// Task id → the todo-watcher's last failed spawn for it (mesa task 1338):
+    /// the task's `updated_at` as the watcher's own revert left it, and the
+    /// error texts already filed as inbox alerts. The watcher skips a task
+    /// while its `updated_at` still reads that value ([`spawn_backed_off`]),
+    /// so a spawn that fails every time is tried once rather than claimed and
+    /// reverted on every tick; any later write to the task makes it eligible
+    /// again, and a successful spawn drops the entry. In memory, like
+    /// `inbox_dispatched`, and deliberately not persisted: a restart retries
+    /// every such task once, which is the recoverable direction. Not pruned —
+    /// it holds one small entry per task whose spawn has failed.
+    todo_spawn_failed: Arc<Mutex<HashMap<i64, SpawnFailure>>>,
     /// Every **detached** script run this server owns (mesa task 1224) — the
     /// runs the Scripts page starts and can then close the tab on. In memory
     /// beside the watcher bookkeeping above and for the same reason: the run
@@ -815,10 +826,14 @@ const COST_GUARD_AUTHOR: &str = "cost-guard";
 /// Bounded, so a malformed `parent_id` cycle can only cost a few queries
 /// rather than spinning the tick forever; real task trees are a few levels
 /// deep at most.
-fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
+///
+/// Tasks in `exclude` (the ones backed off after a failed spawn) are never
+/// walked into, so the walk can end on a task whose only actionable
+/// descendants are excluded — still a batch, which the caller checks for.
+fn deepest_actionable(store: &Store, mut task: Task, exclude: &[i64]) -> Result<Task, Error> {
     const MAX_DEPTH: usize = 16;
     for _ in 0..MAX_DEPTH {
-        match store.next_subtask(&[task.id])? {
+        match store.next_subtask_excluding(&[task.id], exclude)? {
             Some(child) => task = child,
             None => break,
         }
@@ -833,7 +848,10 @@ fn deepest_actionable(store: &Store, mut task: Task) -> Result<Task, Error> {
 /// the agent's own `/execute-mesa-task` pickup step, so a second tick can't
 /// double-dispatch the same task while the agent is still starting up. A
 /// spawn failure reverts the task back to `todo` so the project isn't
-/// wedged; a dispatched agent that later crashes without finishing is not
+/// wedged, files one inbox alert per (task, error text) and backs the task
+/// off until something else writes to it ([`spawn_backed_off`], mesa task
+/// 1338) — the picks exclude it, so the project's other tasks still move; a
+/// dispatched agent that later crashes without finishing is not
 /// detected here (task-status, not live-session, is the "in process" signal)
 /// — the reaper is what notices it (mesa task 1191): [`todo_reaper_tick`]
 /// files an inbox alert for a dispatched session that ended, or sat idle an
@@ -951,6 +969,18 @@ fn todo_watcher_tick(state: &AppState) {
         // in_progress task occupies one of the project's dispatch slots.
         let parents: std::collections::HashSet<i64> =
             tasks.iter().filter_map(|t| t.parent_id).collect();
+        // Tasks whose last spawn failed and that nobody has touched since
+        // (mesa task 1338): never picked, so the pick moves past them.
+        let mut backed_off: HashMap<i64, Vec<i64>> = HashMap::new();
+        {
+            let failed = match state.todo_spawn_failed.lock() {
+                Ok(f) => f,
+                Err(e) => e.into_inner(),
+            };
+            for t in tasks.iter().filter(|t| spawn_backed_off(&failed, t)) {
+                backed_off.entry(t.project_id).or_default().push(t.id);
+            }
+        }
         let mut busy_counts: HashMap<i64, usize> = HashMap::new();
         let mut umbrellas: std::collections::HashMap<i64, Vec<i64>> =
             std::collections::HashMap::new();
@@ -995,9 +1025,14 @@ fn todo_watcher_tick(state: &AppState) {
             // project is idle and the whole backlog is fair game. Decided
             // once: a leaf claimed below is nobody's parent.
             let parent_ids = umbrellas.get(&project.id);
-            for _ in 0..slots {
+            // The backed-off tasks, plus any batch found below whose only
+            // actionable descendants are backed off. Each skip adds a task
+            // the picks can no longer return, so the loop terminates.
+            let mut skip = backed_off.remove(&project.id).unwrap_or_default();
+            let mut filled = 0;
+            while filled < slots {
                 let picked = match parent_ids {
-                    Some(parent_ids) => match store.next_subtask(parent_ids) {
+                    Some(parent_ids) => match store.next_subtask_excluding(parent_ids, &skip) {
                         Ok(Some(task)) => task,
                         Ok(None) => break,
                         Err(e) => {
@@ -1008,7 +1043,7 @@ fn todo_watcher_tick(state: &AppState) {
                             break;
                         }
                     },
-                    None => match store.next_task(Some(project.id)) {
+                    None => match store.next_task_excluding(Some(project.id), &skip) {
                         Ok(NextResult::Task(task)) => *task,
                         Ok(NextResult::None { .. }) => break,
                         Err(e) => {
@@ -1020,7 +1055,7 @@ fn todo_watcher_tick(state: &AppState) {
                         }
                     },
                 };
-                let task = match deepest_actionable(&store, picked) {
+                let task = match deepest_actionable(&store, picked, &skip) {
                     Ok(task) => task,
                     Err(e) => {
                         eprintln!(
@@ -1030,6 +1065,26 @@ fn todo_watcher_tick(state: &AppState) {
                         break;
                     }
                 };
+                // The walk skipped the backed-off tasks, so it can stop on a
+                // task that still has actionable subtasks — all of them
+                // backed off. That task is a batch and must not be claimed;
+                // skip it for this tick and pick again.
+                if !skip.is_empty() {
+                    match store.next_subtask(&[task.id]) {
+                        Ok(Some(_)) => {
+                            skip.push(task.id);
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "todo-watcher: next_subtask failed for project {}: {e}",
+                                project.id
+                            );
+                            break;
+                        }
+                    }
+                }
                 let in_progress = TaskPatch {
                     status: Some(Status::InProgress),
                     ..Default::default()
@@ -1040,6 +1095,7 @@ fn todo_watcher_tick(state: &AppState) {
                 }
                 let session_name = format!("{}: {}", project.name, task.name);
                 claimed.push((task.id, local_path.to_string(), session_name));
+                filled += 1;
             }
         }
         claimed
@@ -1049,38 +1105,49 @@ fn todo_watcher_tick(state: &AppState) {
         // has to be on disk before the spawn — `claude --agent` errors on an
         // agent it has never seen (mesa task 1075). The store lock taken to
         // claim the tasks above is long gone by here, so re-lock for this one
-        // read. A failure skips *this* task the way a failed spawn does; the
-        // tick goes on.
-        {
+        // read. A failure is a failed spawn for *this* task — reverted,
+        // backed off and alerted below exactly like a spawn error, rather than
+        // left `in_progress` with no agent — and the tick goes on.
+        let seeded = {
             let store = state.store.lock().unwrap();
-            if let Err(e) = supervisor::ensure_agent_definition(&store) {
-                eprintln!("todo-watcher: cannot seed the supervisor agent definition: {e}");
-                continue;
-            }
-        }
+            supervisor::ensure_agent_definition(&store)
+                .map(|_| ())
+                .map_err(|e| format!("cannot seed the supervisor agent definition: {e}"))
+        };
         // The command — including which slash command executes a task — comes
         // from `~/.mesa/config.json`'s `todo-watcher` entry, defaulting to
         // `claude --bg --agent supervisor … -- /execute-mesa-task <id>`.
         // The library's prompts, for any `{prompt:<name>}` the template names
         // (mesa task 1138) — re-read per task for the same reason the
         // definition seed above is, and for the same cost.
-        let prompts = {
-            let store = state.store.lock().unwrap();
-            library::prompts(&store).unwrap_or_default()
-        };
-        match agents::spawn_bg(
-            config::TODO_WATCHER,
-            &local_path,
-            Some(task_id),
-            Some(&session_name),
-            None,
-            &prompts,
-        ) {
+        let spawned = seeded.and_then(|()| {
+            let prompts = {
+                let store = state.store.lock().unwrap();
+                library::prompts(&store).unwrap_or_default()
+            };
+            agents::spawn_bg(
+                config::TODO_WATCHER,
+                &local_path,
+                Some(task_id),
+                Some(&session_name),
+                None,
+                &prompts,
+            )
+        });
+        match spawned {
             // The receipt's short job id is what `claude stop` takes, so
             // remembering it here is the whole of what the reaper needs
             // (mesa task 1057). A command that printed no receipt leaves
             // nothing to stop, exactly as it leaves nothing to attach to.
             Ok(job_id) => {
+                // A spawn that works ends any backoff from an earlier failure.
+                {
+                    let mut failed = match state.todo_spawn_failed.lock() {
+                        Ok(f) => f,
+                        Err(e) => e.into_inner(),
+                    };
+                    failed.remove(&task_id);
+                }
                 if let Some(job_id) = job_id {
                     // Starting a *second* agent on this task says the first is
                     // finished with it, whatever the task's status reads right
@@ -1115,6 +1182,10 @@ fn todo_watcher_tick(state: &AppState) {
             }
             Err(e) => {
                 eprintln!("todo-watcher: spawn failed for task {task_id}: {e}");
+                // The alert body and the dedup key: escapes stripped (the real
+                // `claude` colours its output) and the length bounded, since
+                // the body may be spoken.
+                let e = spawn_error_text(&e);
                 let mut store = match state.store.lock() {
                     Ok(s) => s,
                     Err(e) => e.into_inner(),
@@ -1123,10 +1194,96 @@ fn todo_watcher_tick(state: &AppState) {
                     status: Some(Status::Todo),
                     ..Default::default()
                 };
-                let _ = store.update_task(task_id, &revert);
+                // The revert's own `updated_at` is what the backoff compares
+                // against, so only a write *after* it makes the task eligible.
+                // A revert that failed (the task was deleted mid-spawn) leaves
+                // nothing to back off or report.
+                let Ok(reverted) = store.update_task(task_id, &revert) else {
+                    continue;
+                };
+                let mut failed = match state.todo_spawn_failed.lock() {
+                    Ok(f) => f,
+                    Err(e) => e.into_inner(),
+                };
+                let failure = failed.entry(task_id).or_default();
+                failure.updated_at = reverted.updated_at;
+                // One alert per (task, error text): a repeat of the same
+                // failure after a touch files nothing new. Remembered only
+                // once filed, so a failed filing is tried again next failure.
+                if !failure.alerted.contains(&e) {
+                    let body = spawn_failed_body(task_id, &local_path, &e);
+                    match store.create_inbox_item(
+                        Some(TODO_WATCHER_AUTHOR),
+                        &body,
+                        InboxKind::TaskSummary,
+                        task_id,
+                    ) {
+                        Ok(_) => {
+                            failure.alerted.insert(e);
+                        }
+                        Err(err) => eprintln!(
+                            "todo-watcher: could not file the spawn-failure alert for task \
+                             {task_id}: {err}"
+                        ),
+                    }
+                }
             }
         }
     }
+}
+
+/// Author the todo-watcher's spawn-failure alerts are filed under, the
+/// dispatch side's twin of [`TODO_REAPER_AUTHOR`].
+const TODO_WATCHER_AUTHOR: &str = "todo-watcher";
+
+/// One task's failed todo-watcher spawn (mesa task 1338), kept in
+/// `AppState::todo_spawn_failed`.
+#[derive(Debug, Default)]
+struct SpawnFailure {
+    /// The task's `updated_at` as the watcher's revert to `todo` left it.
+    updated_at: String,
+    /// Spawn error texts already filed as an inbox alert for this task.
+    alerted: std::collections::HashSet<String>,
+}
+
+/// Whether the todo-watcher should pass `task` over: its last spawn failed
+/// and nothing has written to it since — its `updated_at` is still the one
+/// the watcher's own revert stamped. Any other write moves `updated_at` and
+/// makes the task eligible again. (`updated_at` has one-second resolution, so
+/// a write in the same second as the revert goes unnoticed.)
+fn spawn_backed_off(failed: &HashMap<i64, SpawnFailure>, task: &Task) -> bool {
+    failed
+        .get(&task.id)
+        .is_some_and(|f| f.updated_at == task.updated_at)
+}
+
+/// Longest spawn error text an alert carries, in bytes.
+const SPAWN_ERROR_MAX: usize = 2048;
+
+/// A spawn error as the alert names it and dedups on: ANSI escapes stripped
+/// and cut to [`SPAWN_ERROR_MAX`] bytes on a character boundary (`…` marks
+/// the cut).
+fn spawn_error_text(error: &str) -> String {
+    let clean = agents::strip_ansi(error);
+    if clean.len() <= SPAWN_ERROR_MAX {
+        return clean;
+    }
+    let mut end = SPAWN_ERROR_MAX;
+    while !clean.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &clean[..end])
+}
+
+/// The alert for a task the todo-watcher could not start an agent on.
+fn spawn_failed_body(task_id: i64, local_path: &str, error: &str) -> String {
+    format!(
+        "The todo watcher could not start an agent for task {task_id} in {local_path}. \
+         The spawn failed with: {error}. The task is back in todo, and the watcher will \
+         not try it again until the task changes. Once the cause is fixed, touch the task \
+         — for example `mesa task update {task_id} --status todo` — and the next tick \
+         dispatches it."
+    )
 }
 
 /// What a dispatched session was started for: the todo-watcher's task, or
@@ -1707,6 +1864,7 @@ pub fn serve(
         cost_alerted: Arc::new(Mutex::new(std::collections::HashSet::new())),
         cost_stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
         todo_dispatched: Arc::new(Mutex::new(HashMap::new())),
+        todo_spawn_failed: Arc::new(Mutex::new(HashMap::new())),
         script_runs: Arc::new(script_runs::Registry::new()),
     };
     // A detached run is pumped by a thread of *this* process and tracked in
@@ -9397,6 +9555,7 @@ mod tests {
             cost_alerted: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cost_stopped: Arc::new(Mutex::new(std::collections::HashSet::new())),
             todo_dispatched: Arc::new(Mutex::new(HashMap::new())),
+            todo_spawn_failed: Arc::new(Mutex::new(HashMap::new())),
             script_runs: Arc::new(script_runs::Registry::new()),
         };
         (dir, state)
@@ -11735,6 +11894,250 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 "a released child must dispatch normally: {log:?}"
             );
             assert_eq!(get(child), Status::InProgress);
+
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
+    }
+
+    #[test]
+    fn spawn_backed_off_holds_only_while_updated_at_is_unchanged() {
+        let (_dir, state) = test_state();
+        let project = new_project(&state, None);
+        let base = {
+            let id = new_task(&state, project);
+            state.store.lock().unwrap().get_task(id).unwrap()
+        };
+        let task = |id: i64, updated_at: &str| Task {
+            id,
+            updated_at: updated_at.to_string(),
+            ..base.clone()
+        };
+        let mut failed = HashMap::new();
+        assert!(
+            !spawn_backed_off(&failed, &task(1, "2026-01-01 00:00:00")),
+            "a task that never failed is not backed off"
+        );
+        failed.insert(
+            1,
+            SpawnFailure {
+                updated_at: "2026-01-01 00:00:00".into(),
+                ..Default::default()
+            },
+        );
+        assert!(spawn_backed_off(&failed, &task(1, "2026-01-01 00:00:00")));
+        assert!(
+            !spawn_backed_off(&failed, &task(1, "2026-01-01 00:00:05")),
+            "any later write makes it eligible again"
+        );
+        assert!(
+            !spawn_backed_off(&failed, &task(2, "2026-01-01 00:00:00")),
+            "the entry is per task"
+        );
+    }
+
+    #[test]
+    fn todo_watcher_tick_alerts_once_and_backs_off_a_failed_spawn() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+            let fail = stub_dir.path().join("fail");
+            std::fs::write(&fail, "").unwrap();
+
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let proj_path = proj_dir.path().to_str().unwrap().to_string();
+            let project = new_project(&state, Some(&proj_path));
+            let first = new_task(&state, project);
+            let second = new_task(&state, project);
+            let events = |id| {
+                state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .list_events(Some(id))
+                    .unwrap()
+                    .len()
+            };
+            let inbox = || state.store.lock().unwrap().list_inbox_items(None).unwrap();
+            let status = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+
+            // First tick: `first` is claimed, fails, reverted, reported once.
+            todo_watcher_tick(&state);
+            assert_eq!(status(first), Status::Todo);
+            let items = inbox();
+            assert_eq!(items.len(), 1, "one alert for the failed spawn: {items:?}");
+            let item = &items[0];
+            assert_eq!(item.author.as_deref(), Some("todo-watcher"));
+            assert_eq!(item.kind, InboxKind::TaskSummary);
+            assert_eq!(item.task_id, Some(first));
+            assert!(
+                item.body.contains(&format!("task {first}")),
+                "{}",
+                item.body
+            );
+            assert!(item.body.contains(&proj_path), "{}", item.body);
+            assert!(item.body.contains("stub claude is down"), "{}", item.body);
+            let first_events = events(first);
+
+            // Second tick: `first` is backed off, so the pick moves on to
+            // `second` rather than stopping the project at `first`.
+            todo_watcher_tick(&state);
+            assert_eq!(
+                events(first),
+                first_events,
+                "a backed-off task is not re-claimed"
+            );
+            assert_eq!(
+                inbox().len(),
+                2,
+                "the second task's failure is its own alert"
+            );
+            let second_events = events(second);
+
+            // Both backed off: further ticks claim nothing and file nothing.
+            todo_watcher_tick(&state);
+            todo_watcher_tick(&state);
+            assert_eq!(events(first), first_events);
+            assert_eq!(events(second), second_events);
+            assert_eq!(inbox().len(), 2);
+
+            // Touching the task makes it eligible; the same failure again
+            // files no second alert. `updated_at` has one-second resolution.
+            std::thread::sleep(Duration::from_millis(1100));
+            set_status(&state, first, Status::Todo);
+            let touched_events = events(first);
+            todo_watcher_tick(&state);
+            assert!(
+                events(first) > touched_events,
+                "a touched task is tried again"
+            );
+            assert_eq!(inbox().len(), 2, "the same error text is not filed twice");
+
+            // Fixed and touched: the next tick dispatches it, and the backoff
+            // entry is gone.
+            std::fs::remove_file(&fail).unwrap();
+            std::thread::sleep(Duration::from_millis(1100));
+            set_status(&state, first, Status::Todo);
+            todo_watcher_tick(&state);
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(
+                log.contains(&format!("/execute-mesa-task {first}")),
+                "a touched task dispatches once the spawn works: {log:?}"
+            );
+            assert_eq!(status(first), Status::InProgress);
+            assert!(!state.todo_spawn_failed.lock().unwrap().contains_key(&first));
+
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+        });
+    }
+
+    #[test]
+    fn spawn_error_text_strips_escapes_and_caps_the_length() {
+        assert_eq!(
+            spawn_error_text("\x1b[31mWorkspace not trusted\x1b[0m"),
+            "Workspace not trusted"
+        );
+        let long = "é".repeat(SPAWN_ERROR_MAX);
+        let cut = spawn_error_text(&long);
+        assert!(cut.ends_with('…'));
+        assert!(cut.len() <= SPAWN_ERROR_MAX + '…'.len_utf8());
+    }
+
+    #[test]
+    fn todo_watcher_tick_treats_a_failed_definition_seed_as_a_failed_spawn() {
+        // A definition that cannot be seeded used to `continue` past the
+        // task, leaving it `in_progress` with no agent and the project's slot
+        // wedged. It is now a failed spawn: reverted, backed off, alerted.
+        //
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::core::library::test_home::with_home_dir(|home| {
+            // `~/.claude` as a file: the agents dir can never be created.
+            std::fs::write(home.join(".claude"), "").unwrap();
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let task = new_task(&state, project);
+
+            todo_watcher_tick(&state);
+            todo_watcher_tick(&state);
+            unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
+
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(log.is_empty(), "nothing is spawned: {log:?}");
+            let store = state.store.lock().unwrap();
+            assert_eq!(store.get_task(task).unwrap().status, Status::Todo);
+            // Created, claimed, reverted — and not claimed again by tick two.
+            assert_eq!(store.list_events(Some(task)).unwrap().len(), 3);
+            let items = store.list_inbox_items(None).unwrap();
+            assert_eq!(items.len(), 1, "{items:?}");
+            assert!(
+                items[0]
+                    .body
+                    .contains("cannot seed the supervisor agent definition"),
+                "{}",
+                items[0].body
+            );
+        });
+    }
+
+    #[test]
+    fn todo_watcher_tick_never_claims_a_batch_whose_subtasks_are_backed_off() {
+        // A backed-off leaf must not make its parent look like a leaf: the
+        // parent still has an actionable subtask, so claiming it would break
+        // the umbrella rule `deepest_actionable` exists for.
+        //
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::core::library::test_home::with_home_dir(|_| {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let log_path = stub_dir.path().join("bg.log");
+            let bin = stub_claude_bg(stub_dir.path(), &log_path);
+            unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+            std::fs::write(stub_dir.path().join("fail"), "").unwrap();
+
+            let (_dir, state) = test_state();
+            let proj_dir = tempfile::tempdir().unwrap();
+            let project = new_project(&state, Some(proj_dir.path().to_str().unwrap()));
+            let epic = new_task(&state, project);
+            let child = new_subtask(&state, project, epic, "child");
+            let status = |id| state.store.lock().unwrap().get_task(id).unwrap().status;
+
+            todo_watcher_tick(&state);
+            assert!(state.todo_spawn_failed.lock().unwrap().contains_key(&child));
+            let epic_events = state.store.lock().unwrap().list_events(Some(epic)).unwrap();
+
+            todo_watcher_tick(&state);
+            assert_eq!(status(epic), Status::Todo);
+            assert_eq!(
+                state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .list_events(Some(epic))
+                    .unwrap()
+                    .len(),
+                epic_events.len(),
+                "a batch whose only actionable subtask is backed off is never claimed"
+            );
 
             unsafe { std::env::remove_var("MESA_CLAUDE_BIN") };
         });

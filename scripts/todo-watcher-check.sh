@@ -849,4 +849,168 @@ ok "a session that exits with its task still in_progress is reported once, and t
 
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
 
+# ---- a failed spawn is reported once and backed off (mesa task 1338) ----
+# A spawn that fails every time (seen live: "Workspace not trusted") used to be
+# claimed and reverted on every tick, forever, with the error only on stderr.
+# Now: one todo-watcher inbox alert per (task, error text), the task skipped
+# while its updated_at is what the watcher's own revert left, the pick moving
+# on to the next task, and a touch after the fix dispatching it. Own db, stub
+# and server, like the sections above.
+
+export MESA_DB="$TMP/spawnfail.db"
+SF_LOG="$TMP/spawnfail-bg.log"
+SF_FAIL_LOG="$TMP/spawnfail-fail.log"
+touch "$SF_LOG" "$SF_FAIL_LOG"
+SF_STUB="$STUB_DIR/claude-spawnfail"
+cat > "$SF_STUB" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "--bg" ]; then
+  shift
+  AGENT=""
+  if [ "\$1" = "--agent" ]; then shift; AGENT="\$1"; shift; fi
+  NAME=""
+  if [ "\$1" = "--name" ]; then shift; NAME="\$1"; shift; fi
+  PROMPT=""
+  if [ "\$1" = "--" ]; then shift; PROMPT="\$1"; fi
+  [ -e "$STUB_DIR/spawnfail" ] && {
+    echo "\$PROMPT" >> "$SF_FAIL_LOG"
+    MSG=\$(cat "$STUB_DIR/spawnfail")
+    [ -n "\$MSG" ] || MSG="Workspace not trusted. Run claude in \$(pwd) once and accept the trust prompt"
+    echo "\$MSG" >&2
+    exit 1
+  }
+  echo "\$(pwd)|\$NAME|\$PROMPT" >> "$SF_LOG"
+  echo "backgrounded · deadbeef (idle — send a prompt to start)"
+  exit 0
+fi
+if [ "\$1" = "agents" ]; then echo '[]'; exit 0; fi
+exit 2
+EOF
+chmod +x "$SF_STUB"
+
+mkdir -p "$TMP/sfDir"
+SF_DIR=$(cd "$TMP/sfDir" && pwd -P)
+run 0 "$MESA" project create "SF" --no-git
+SF_P=$(jqs .id)
+run 0 "$MESA" project update "$SF_P" --path "$SF_DIR"
+run 0 "$MESA" task create "$SF_P" "task sf one"
+SF_T1=$(jqs .id)
+run 0 "$MESA" task create "$SF_P" "task sf two"
+SF_T2=$(jqs .id)
+
+touch "$STUB_DIR/spawnfail"
+SF_PORT=17792
+MESA_CLAUDE_BIN="$SF_STUB" MESA_WATCH_TODO_TICK_MS=150 \
+  "$MESA" serve --port "$SF_PORT" --watch-todo >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_server "$SF_PORT"
+
+wait_sf_lines() { # wait_sf_lines <file> <n> -> blocks until <file> has >= n lines, or fails
+  local file=$1 n=$2
+  for _ in $(seq 1 50); do
+    [ "$(wc -l < "$file")" -ge "$n" ] && return 0
+    sleep 0.1
+  done
+  fail "timed out waiting for $n line(s) in $file: $(cat "$file")"
+}
+
+wait_sf_lines "$SF_FAIL_LOG" 2
+# ~10 more ticks: a watcher still retrying would add attempts and alerts here.
+sleep 1.5
+[ "$(wc -l < "$SF_FAIL_LOG")" -eq 2 ] ||
+  fail "each failed task must be tried once, not every tick: $(cat "$SF_FAIL_LOG")"
+[ "$(sort "$SF_FAIL_LOG" | tr '\n' ' ')" = "$(printf '/execute-mesa-task %s\n' "$SF_T1" "$SF_T2" | sort | tr '\n' ' ')" ] ||
+  fail "a backed-off task must not wedge the project, the pick moves on: $(cat "$SF_FAIL_LOG")"
+[ "$("$MESA" task show "$SF_T1" | jq -r .status)" = "todo" ] || fail "a failed spawn leaves the task todo"
+[ "$("$MESA" task show "$SF_T2" | jq -r .status)" = "todo" ] || fail "a failed spawn leaves the task todo"
+ok "a failed spawn is tried once per task, then backed off; the pick moves past it"
+
+run 0 "$MESA" inbox list
+[ "$(jqs 'length')" -eq 2 ] || fail "expected one alert per failed task, got $(jqs 'length'): $STDOUT"
+[ "$(jqs '[.[] | select(.author == "todo-watcher" and .kind == "task-summary")] | length')" -eq 2 ] ||
+  fail "the alerts are todo-watcher task summaries: $STDOUT"
+SF_BODY=$(jq -r --argjson t "$SF_T1" '.[] | select(.task_id == $t) | .body' <<<"$STDOUT")
+grep -q "task $SF_T1 " <<<"$SF_BODY" || fail "the alert must name task $SF_T1: $SF_BODY"
+grep -qF "$SF_DIR" <<<"$SF_BODY" || fail "the alert must name the project folder $SF_DIR: $SF_BODY"
+grep -q "Workspace not trusted" <<<"$SF_BODY" || fail "the alert must carry the spawn error: $SF_BODY"
+ok "each failed spawn files exactly one todo-watcher alert naming the task, the folder and the error"
+
+# Touched while still failing: tried again, but the same error files nothing
+# new. updated_at has one-second resolution, so each touch waits out the
+# revert's second.
+sleep 1.1
+run 0 "$MESA" task update "$SF_T1" --status todo
+wait_sf_lines "$SF_FAIL_LOG" 3
+sleep 0.5
+[ "$(wc -l < "$SF_FAIL_LOG")" -eq 3 ] || fail "a touched task must be tried again once: $(cat "$SF_FAIL_LOG")"
+[ "$("$MESA" inbox list | jq 'length')" -eq 2 ] || fail "the same error text must not be filed twice"
+ok "a touched task is retried once, and the same failure files no second alert"
+
+# Touched again, now failing with a different error: that one is its own alert.
+echo "Rate limited, try again later" > "$STUB_DIR/spawnfail"
+sleep 1.1
+run 0 "$MESA" task update "$SF_T1" --status todo
+wait_sf_lines "$SF_FAIL_LOG" 4
+for _ in $(seq 1 50); do
+  [ "$("$MESA" inbox list | jq 'length')" -ge 3 ] && break
+  sleep 0.1
+done
+sleep 0.5
+[ "$(wc -l < "$SF_FAIL_LOG")" -eq 4 ] || fail "a touched task must be tried again once: $(cat "$SF_FAIL_LOG")"
+run 0 "$MESA" inbox list
+[ "$(jqs 'length')" -eq 3 ] || fail "a different error text is a second alert for the task: $STDOUT"
+[ "$(jq --argjson t "$SF_T1" '[.[] | select(.task_id == $t)] | length' <<<"$STDOUT")" -eq 2 ] ||
+  fail "both alerts name task $SF_T1: $STDOUT"
+grep -q "Rate limited" <<<"$(jqs '.[0].body')" || fail "the new alert carries the new error: $STDOUT"
+ok "the same task failing with a different error files a second alert"
+
+# Fixed and touched: dispatched on the next tick.
+rm "$STUB_DIR/spawnfail"
+sleep 1.1
+run 0 "$MESA" task update "$SF_T1" --status todo
+wait_sf_lines "$SF_LOG" 1
+[ "$(head -1 "$SF_LOG")" = "$SF_DIR|SF: task sf one|/execute-mesa-task $SF_T1" ] ||
+  fail "a touched task must dispatch once the spawn works; log: $(cat "$SF_LOG")"
+[ "$("$MESA" task show "$SF_T1" | jq -r .status)" = "in_progress" ] || fail "the dispatched task is claimed"
+[ "$("$MESA" inbox list | jq 'length')" -eq 3 ] || fail "a successful spawn files nothing"
+ok "once fixed, touching the task dispatches it on the next tick"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+
+# A supervisor definition that cannot be seeded is a failed spawn too: the
+# task is reverted and alerted once, never left in_progress with no agent.
+# Seeding fails under a throwaway HOME whose ~/.claude is a file. The backed-
+# off task two is cancelled first, since a restart would retry it.
+run 0 "$MESA" task update "$SF_T2" --status cancelled
+mkdir -p "$TMP/sfSeedDir" "$TMP/badhome"
+: > "$TMP/badhome/.claude"
+SF_SEED_DIR=$(cd "$TMP/sfSeedDir" && pwd -P)
+run 0 "$MESA" project create "SFSeed" --no-git
+SF_SEED_P=$(jqs .id)
+run 0 "$MESA" project update "$SF_SEED_P" --path "$SF_SEED_DIR"
+run 0 "$MESA" task create "$SF_SEED_P" "task sf seed"
+SF_SEED_T=$(jqs .id)
+HOME="$TMP/badhome" MESA_CLAUDE_BIN="$SF_STUB" MESA_WATCH_TODO_TICK_MS=150 \
+  "$MESA" serve --port "$SF_PORT" --watch-todo >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_server "$SF_PORT"
+for _ in $(seq 1 50); do
+  [ "$("$MESA" inbox list | jq 'length')" -ge 4 ] && break
+  sleep 0.1
+done
+sleep 1.5
+run 0 "$MESA" inbox list
+[ "$(jqs 'length')" -eq 4 ] || fail "a failed definition seed files exactly one alert: $STDOUT"
+grep -q "cannot seed the supervisor agent definition" <<<"$(jqs '.[0].body')" ||
+  fail "the alert names the seed failure: $STDOUT"
+[ "$(jqs '.[0].task_id')" = "$SF_SEED_T" ] || fail "the alert names task $SF_SEED_T: $STDOUT"
+[ "$("$MESA" task show "$SF_SEED_T" | jq -r .status)" = "todo" ] ||
+  fail "a failed seed must revert the task, not leave it in_progress"
+[ "$("$MESA" task events "$SF_SEED_T" | jq 'length')" -eq 3 ] ||
+  fail "a failed seed is claimed once, not every tick: $("$MESA" task events "$SF_SEED_T")"
+grep -q "sfSeedDir" "$SF_LOG" && fail "nothing may be spawned without the definition: $(cat "$SF_LOG")"
+ok "a failed supervisor-definition seed reverts the task and is alerted once, like a failed spawn"
+
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+
 echo "ALL OK ($CHECKS checks)"

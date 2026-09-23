@@ -3923,6 +3923,15 @@ impl Store {
     /// how many of those `in_progress` tasks are held by a claim nobody has
     /// renewed for [`STALE_CLAIM_MINUTES`] minutes.
     pub fn next_task(&self, project: Option<i64>) -> Result<NextResult> {
+        self.next_task_excluding(project, &[])
+    }
+
+    /// [`Store::next_task`] with the tasks in `exclude` never picked — the
+    /// todo-watcher's pick, which passes the tasks it has backed off after a
+    /// failed spawn (mesa task 1338) so one of them cannot stand in front of
+    /// the rest of the project's backlog. Only the pick is filtered: the
+    /// no-actionable-task counts are the same as `next_task`'s.
+    pub fn next_task_excluding(&self, project: Option<i64>, exclude: &[i64]) -> Result<NextResult> {
         let blocked_expr = BLOCKED_EXPR;
         let priority_rank = PRIORITY_RANK;
         let task = {
@@ -3932,10 +3941,12 @@ impl Store {
                  WHERE t.status = 'todo' AND NOT {blocked_expr} \
                  AND (?1 IS NULL OR t.project_id = ?1) \
                  AND (?1 IS NOT NULL OR {NOT_HIDDEN_PROJECT}) \
+                 AND t.id NOT IN (SELECT value FROM json_each(?2)) \
                  ORDER BY {priority_rank}, t.id LIMIT 1"
             );
+            let exclude = serde_json::to_string(exclude).expect("an id list always serializes");
             self.conn
-                .query_row(&sql, [project], row_to_task)
+                .query_row(&sql, rusqlite::params![project, exclude], row_to_task)
                 .map(Some)
                 .or_else(|e| match e {
                     rusqlite::Error::QueryReturnedNoRows => Ok(None),
@@ -3981,10 +3992,17 @@ impl Store {
     /// subtask shares its parent's project, so the caller has already chosen
     /// the project by choosing the parents (mesa task 570).
     pub fn next_subtask(&self, parents: &[i64]) -> Result<Option<Task>> {
+        self.next_subtask_excluding(parents, &[])
+    }
+
+    /// [`Store::next_subtask`] with the tasks in `exclude` never picked, for
+    /// the reason [`Store::next_task_excluding`] gives.
+    pub fn next_subtask_excluding(&self, parents: &[i64], exclude: &[i64]) -> Result<Option<Task>> {
         if parents.is_empty() {
             return Ok(None);
         }
         let placeholders = parents.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let exclude_param = parents.len() + 1;
         // `UNION` (not `UNION ALL`) so a malformed parent cycle terminates
         // instead of recursing forever.
         let sql = format!(
@@ -3995,10 +4013,17 @@ impl Store {
              ) \
              SELECT {TASK_COLUMNS} FROM tasks t WHERE t.id IN (SELECT id FROM sub) \
              AND t.status = 'todo' AND NOT {BLOCKED_EXPR} \
+             AND t.id NOT IN (SELECT value FROM json_each(?{exclude_param})) \
              ORDER BY {PRIORITY_RANK}, t.id LIMIT 1"
         );
+        let exclude = serde_json::to_string(exclude).expect("an id list always serializes");
+        let params: Vec<rusqlite::types::Value> = parents
+            .iter()
+            .map(|&id| rusqlite::types::Value::Integer(id))
+            .chain(std::iter::once(rusqlite::types::Value::Text(exclude)))
+            .collect();
         self.conn
-            .query_row(&sql, rusqlite::params_from_iter(parents), row_to_task)
+            .query_row(&sql, rusqlite::params_from_iter(params), row_to_task)
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),

@@ -741,8 +741,9 @@ fn parse_spawn(stdout: &str) -> Option<String> {
 }
 
 /// Strips ANSI CSI escape sequences (`ESC '[' <params> <final byte>`, e.g.
-/// SGR color codes like `\x1b[36m`). No crate dependency for one narrow use.
-fn strip_ansi(s: &str) -> String {
+/// SGR color codes like `\x1b[36m`). No crate dependency for two narrow uses
+/// (the spawn receipt, and the todo-watcher's spawn-failure alert).
+pub fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

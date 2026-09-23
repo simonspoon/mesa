@@ -116,6 +116,47 @@ because someone ran `mesa serve`.
   task is reverted back to `todo` so the project isn't wedged — an
   unrecoverable spawn must not silently stop that project from ever being
   picked up again.
+- **A failed spawn is reported once and backed off** (mesa task 1338). Seen
+  live: every spawn for a task failed with "Workspace not trusted", and the
+  watcher claimed and reverted it on every tick, forever, with the error only
+  on the server's stderr.
+  - The failure files an inbox alert (kind `task-summary`, so the
+    inbox-watcher never triages it; author `todo-watcher`; against the task,
+    through the same `Store::create_inbox_item` the reaper uses) naming the
+    task id, the project folder the spawn ran in and the error text —
+    ANSI escapes stripped and cut to 2 KiB, the same text serving as the
+    dedup key. **One per `(task, error text)`**: the same task failing again
+    with the same error files nothing new, a different error files one. A
+    filing that fails is tried again on the task's next failure.
+  - A `supervisor` definition that cannot be seeded before the spawn is a
+    failed spawn in every respect (reverted, backed off, alerted) — it used
+    to skip the task and leave it `in_progress` with no agent, wedging the
+    project's slot.
+  - **Backoff rule:** `AppState::todo_spawn_failed` records the task id with
+    its `updated_at` as it stands *after* the watcher's own revert, and the
+    tick passes the task over while its `updated_at` still reads that value
+    (`spawn_backed_off`, a pure function). Any later write by anyone — a
+    person or agent touching the task, e.g. `mesa task update <id> --status
+    todo` once the folder is trusted — moves `updated_at` and makes it
+    eligible on the next tick; a successful spawn drops the entry. The
+    comparison is on the text timestamp, which has one-second resolution, so
+    a write in the same second as the revert goes unnoticed.
+  - **A backed-off task never wedges its project.** Both picks take an
+    exclusion list (`Store::next_task_excluding` / `next_subtask_excluding`;
+    the plain `next_task`/`next_subtask` are the same queries with an empty
+    one), so the tick moves on to the next actionable task. The deepest-leaf
+    walk skips backed-off tasks too, and a task whose only actionable
+    subtasks are backed off is still a batch — it is skipped for that tick
+    rather than claimed, so the umbrella rule above holds.
+  - In memory, like `inbox_dispatched`, and not persisted: a `serve` restart
+    retries every such task once (and may alert once more). Not pruned — one
+    small entry per task whose spawn has failed.
+  - Regressions: `api::tests::spawn_backed_off_holds_only_while_updated_at_is_unchanged`,
+    `api::tests::todo_watcher_tick_alerts_once_and_backs_off_a_failed_spawn`,
+    `api::tests::todo_watcher_tick_never_claims_a_batch_whose_subtasks_are_backed_off`,
+    `api::tests::todo_watcher_tick_treats_a_failed_definition_seed_as_a_failed_spawn`,
+    `api::tests::spawn_error_text_strips_escapes_and_caps_the_length`,
+    and the spawn-failure block at the end of `scripts/todo-watcher-check.sh`.
 - **A project's occupied slots are `max(in_progress leaves, live-work
   sessions)`** (mesa task 802). The second signal is the number of `claude`
   sessions whose `cwd` is under this project's `local_path` (the same
@@ -252,7 +293,9 @@ because someone ran `mesa serve`.
   with `--watch-todo` appended when it was set, so restarting the server
   never silently turns the watcher off.
 - Gate: `scripts/todo-watcher-check.sh` (flag on/off, dispatch + claim,
-  at-the-limit skip, path-less/stale-path skip, spawn-failure revert,
+  at-the-limit skip, path-less/stale-path skip, spawn-failure revert, a
+  failing spawn tried once per task and alerted once while the pick moves on
+  and a touch after the fix dispatching it,
   archived-project skip + unarchive-resumes-dispatch, umbrella
   subtask-dispatch lifecycle, a configured `todo-concurrency` filling to the
   limit in one tick and picking up the next task once one finishes, a real

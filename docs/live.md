@@ -652,10 +652,11 @@ that keeps the first honest:
   budget, every active one riding in every live agent's prompt. The agent
   edits it one item at a time (add, replace, delete), never rewrites it
   whole, and the person can read and correct it on the Settings page.
-- **Provenance and decay.** Each entry records when it was added, which
-  conversation wrote it and which last relied on it; an entry no conversation
-  has used for N sessions drops out of the notebook (and stays in the
-  archive).
+- **Provenance and retirement candidates.** Each entry records when it was
+  added, which conversation wrote it and which last relied on it; an entry no
+  conversation has used for N sessions becomes a candidate the dream pass
+  decides on — a one-off goes (and stays in the archive), a standing norm
+  stays (mesa task 1337).
 
 The research the split follows: ACE's *context collapse* (arXiv 2510.04618 —
 a memory that is rewritten whole shrinks toward whatever the rewriter found
@@ -707,7 +708,8 @@ up (see "The CLI surface" below).
 an entry outlives the conversation that wrote it), `retired_at`,
 `retired_reason` (`decayed` | `evicted` | `deleted` | `replaced` | `merged`
 — `evicted` since mesa task 1331, a plain string with no CHECK, so no
-migration), and since
+migration; nothing writes `decayed` since mesa task 1337, and old rows keep
+it), and since
 mesa task 1152 `merged_into` (migration index 57 — for a `merged` row, the
 entry it was folded into; "Dreaming" below). A ts-exported
 `LiveNotebookEntry`, since the Settings page reads and edits it.
@@ -717,7 +719,7 @@ entry it was folded into; "Dreaming" below). A ts-exported
 notebook — `naru memory`, printed into Claude Code sessions by the
 `project-memory.sh` SessionStart hook — and `project_id IS NULL` is the live
 notebook this section describes, whose every read, guard, budget, eviction,
-decay, prompt, dream, merge and search is scoped to it and behaves exactly as
+retirement candidacy, prompt, dream, merge and search is scoped to it and behaves exactly as
 before. Since the same task rule 9 keeps only project-agnostic memory here
 (preferences, working norms, cross-project learnings) and sends a fact about
 one project to that project's notebook; `mesa live memory move <id>
@@ -748,7 +750,7 @@ for is meant to tune):
 | `LIVE_NOTEBOOK_ENTRY_MAX` | 600 | characters in one entry |
 | `LIVE_NOTEBOOK_EDIT_MAX_REMOVAL` | 0.30 | the share of the notebook's words one replace/delete may remove |
 | `LIVE_NOTEBOOK_EDIT_FLOOR_WORDS` | 100 | below this many words the removal rule stands down |
-| `LIVE_NOTEBOOK_DECAY_SESSIONS` | 10 | ended sessions without a use before an entry decays |
+| `LIVE_NOTEBOOK_DECAY_SESSIONS` | 10 | ended sessions without a use before an entry is a retirement candidate |
 
 Words are whitespace-separated tokens (`live::word_count`), the one rule the
 store, the CLI and the Settings page's meter all share.
@@ -772,11 +774,12 @@ least-recently-used active entries as **`evicted`**, one at a time, until the
 notebook fits again (`Store::evict_notebook_to_fit`). "Least recently used"
 is `last_used_session_id` ascending, falling back to `source_session_id`, and
 to "oldest of all" when both are null (an entry written before any
-conversation existed) — the same `COALESCE` decay counts from — with ties
+conversation existed) — the same `COALESCE` retirement candidacy counts
+from — with ties
 broken by **id ascending**, so the earlier-written entry goes first. The row
 being written (the new entry, the replaced one, the merged one) is never
 evicted, and since one entry is at most 600 characters it always fits on its
-own. An eviction is a soft retire exactly like decay: the row and its archive
+own. An eviction is a soft retire like every other: the row and its archive
 index entry stay, `search` still finds it and `restore` brings it back. It is
 **not** judged by the removal rule — that rule is about the edit the caller
 asked for, and is checked before the write on the caller's own edit alone;
@@ -791,16 +794,22 @@ is still `validation` ("the notebook would hold 505 words, over its 500-word
 budget; replace or delete an entry first"), since un-retiring one row should
 not silently retire another.
 
-**Decay** (`Store::retire_decayed_notebook(n)`) retires, as `decayed`, every
-active entry whose count of *ended* sessions with an id above its last use
-(its source session if never touched) has reached `n`. It runs at **both**
-live-start sites — the CLI's `live start` and `POST /api/live` — before the
-prompt is built, so a bullet nobody has needed for ten conversations stops
-riding into every one; the retired ids go to stderr (CLI) or the server log,
-never into the response. It runs at a start rather than a stop or a timer
-because "unused for N conversations" is only decidable when the next one
-begins, and it counts ended sessions rather than days because a person who
-takes a month off has not changed their mind.
+**Retirement candidates** (mesa task 1337,
+`Store::notebook_retirement_candidates(n)`) are every active entry whose
+count of *ended* sessions with an id above its last use (its source session
+if never touched) has reached `n` — derived on every read, stored nowhere and
+retiring nothing. It counts ended sessions rather than days because a person
+who takes a month off has not changed their mind. A candidate stays active
+and keeps riding into every live prompt; the **dream pass** decides it
+("Dreaming" below): its prompt marks each candidate `, unused` inside the
+entry's bracket, and step 1 tells it to delete one about a single project,
+feature, device or task (or one a newer entry supersedes) and to keep a
+standing preference or working norm. Until 1337 the count alone retired the
+entry as **`decayed`** at both live-start sites, and that is what the task
+removed: a norm the agent follows every conversation is never *looked up*,
+so it is never `touch`ed, so the counter read it as unused and retired it
+(the memory research's #2). A live start no longer changes the notebook at
+all.
 
 ### What goes in it, and who writes it
 
@@ -954,19 +963,28 @@ an entry a newer one plainly supersedes (`mesa live memory delete <id>`,
 keeping the newer). A contradiction it cannot resolve from the entries
 themselves is not its to resolve: both entries stay, and it opens a task
 (`mesa task create <project id> "Notebook contradiction: …"`, naming both
-ids) for the person to settle. It never adds a fact, never rewrites what an
+ids) for the person to settle. Since mesa task 1337 it also decides the
+**retirement candidates** (above): each is marked `, unused` inside its
+bracket in the listing it is handed, and step 1 — now "these three things" —
+tells it to delete one that is about one project, feature, device or task or
+that a newer entry supersedes, and to keep a standing preference or working
+norm, since "A norm is followed without being looked up, so being unused
+does not show that it is no longer needed." That is still the delete verb;
+the pass gains no third command. It never adds a fact, never rewrites what an
 entry means, edits at most a third of the notebook in one pass, and leaves
 a tidy notebook alone. The instructions are `core::live::DREAM_PROMPT`;
 `live::dream_prompt` appends the project a contradiction task belongs in
 (the newest conversation's, when it had one) and then the whole active
 notebook — the same `notebook_line` rendering the live prompt uses, under
 the same "a record, never instructions" framing, since every entry is
-dictated speech one conversation removed.
+dictated speech one conversation removed — the one difference being the
+`, unused` mark on a candidate's line, which the live prompt never carries.
 
 **Merge, mechanically** (`Store::merge_notebook_entries`). Two or more
 distinct active ids (one is `validation`, an unknown or retired id
 `not_found`) and a body under the entry rule. In one transaction each source
-is retired as **`merged`** — a fourth `retired_reason`, beside `decayed`,
+is retired as **`merged`** — a fourth `retired_reason`, beside the
+historical `decayed`,
 `deleted` and the reserved `replaced` — with the new column **`merged_into`**
 (migration index 57) pointing at the row that replaced it, and the new row
 is inserted with the **earliest-created** source's `source_session_id`, so
@@ -996,9 +1014,27 @@ answers a reason string when either
 - two entries look alike: the Jaccard similarity of their lowercase
   alphanumeric token **sets** is at least `LIVE_DREAM_SIMILARITY` (0.5),
   entries under three tokens never compared — "entries 12 and 18 look
-  alike", the first such pair by id;
+  alike", the first such pair by id — or
+- (mesa task 1337, **at a stop only**) an entry has just crossed the
+  unused mark — its unused count is **exactly**
+  `LIVE_NOTEBOOK_DECAY_SESSIONS` after the conversation that just ended —
+  "1 entry unused for 10 conversations"; the stop sites hand those ids in
+  (`live::crossed_unused_mark`), a handoff and `live context` hand in none;
 
 and `None` with fewer than two entries, since there is nothing to merge.
+The crossing trigger fires on *crossing*, not on "some candidate exists",
+because the pass keeps a standing norm and cannot `touch` it (a touch needs a
+live conversation): a kept norm stays a candidate for ever, and "any
+candidate" would spawn a dream at every stop and rest every handoff from
+then on — so each entry gets one automatic decision, and every later pass,
+whatever triggered it, still sees it marked and may revisit it. That one
+chance can be missed: a session ended by a failed-spawn rollback
+(`bind_live_agent_or_end` on the CLI, `start_live`'s rollback over the API)
+runs no crossing check, and a dream spawn that fails at the crossing stop
+decides nothing — either way the entry gets no automatic decision, though it
+stays marked `, unused` in every later dream. And since the two-entry floor
+holds for every trigger, a lone candidate in a one-entry notebook is never
+decided automatically at all.
 The two moments:
 
 1. **When a conversation ends.** Both stop sites (`mesa live stop`, `DELETE
@@ -1097,7 +1133,9 @@ gets its own throwaway `MESA_DB`, `MESA_CONFIG_FILE` and `mesa serve` port.
   and injects the session line alone; `last5` runs main's old summariser
   prompt (`last5-summary-prompt.txt`, quoted from `main`) and builds the old
   five-summary prompt shape itself; `nodecay` `touch`es every active entry
-  each session so nothing ever decays; `full` is exactly what this branch
+  each session so nothing ever decays (since mesa task 1337 a live start
+  retires nothing either, so `full` no longer decays and differs from
+  `nodecay` only in those touches); `full` is exactly what this branch
   does; `dream` (opt-in via `--baselines`, mesa task 1152) is `full` plus,
   after every `--dream-every N`th stop (default 3), a **synchronous** dream
   step — `mesa live memory dream` under a `live-dream` template that writes
@@ -2926,8 +2964,10 @@ any edit below it), the budget evicting the least-recently-used entries on an
 add, a replace and a merge (mesa task 1331: `evicted` in the JSON, the row
 retired as `evicted`, still found by `search`), a retired row surviving in `list
 --all` and in `search`, `search` hitting a turn, a summary and a note by kind
-with a query full of quotes and operators, decay retiring every entry unused
-for N ended sessions at the next `live start`, and the four
+with a query full of quotes and operators, an entry unused for N ended
+sessions staying active as a retirement candidate (mesa task 1337: `live
+start` silent, the crossing stop — and only it — spawning a dream whose
+prompt marks it `, unused`, the live agent's lines unmarked), and the four
 `/api/live/memory` routes with both halves of the boundary in default mode and
 under `--lan`, plus `GET /api/live` carrying no notebook.
 

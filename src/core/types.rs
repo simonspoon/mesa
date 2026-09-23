@@ -4166,11 +4166,12 @@ pub struct LiveSummary {
 ///
 /// Retiring is a **soft delete**: the row stays (and stays searchable in the
 /// archive, `Store::search_live_memory`) with `retired_at`/`retired_reason`
-/// stamped, and drops out of the prompt and the default list. `decayed` is the
-/// automatic kind — an entry no conversation has used for
-/// `live::LIVE_NOTEBOOK_DECAY_SESSIONS` ended sessions — `evicted` the other
-/// automatic one (mesa task 1331: the least-recently-used entry an add,
-/// replace or merge pushed past the word budget), `deleted` an explicit
+/// stamped, and drops out of the prompt and the default list. `evicted` is the
+/// automatic kind (mesa task 1331: the least-recently-used entry an add,
+/// replace or merge pushed past the word budget); `decayed` is historical —
+/// an entry no conversation had used for `live::LIVE_NOTEBOOK_DECAY_SESSIONS`
+/// ended sessions, retired at a live start until mesa task 1337 made such an
+/// entry a candidate for the dream pass instead — `deleted` an explicit
 /// one, `merged` a source folded into another row by a dream pass (mesa task
 /// 1152, `merged_into` naming the row that replaced it), and `replaced` is
 /// reserved for a future rewrite-as-new-row path (a replace today updates the
@@ -4196,12 +4197,12 @@ pub struct LiveNotebookEntry {
     #[ts(type = "number | null")]
     pub source_session_id: Option<i64>,
     /// The conversation that last relied on it (`mesa live memory touch`, or a
-    /// replace), which is what decay is measured from.
+    /// replace), which is what retirement candidacy is measured from.
     #[ts(type = "number | null")]
     pub last_used_session_id: Option<i64>,
     pub retired_at: Option<String>,
-    /// `decayed` | `evicted` | `deleted` | `replaced` | `merged`, null while
-    /// the entry is active.
+    /// `decayed` (old rows only) | `evicted` | `deleted` | `replaced` |
+    /// `merged`, null while the entry is active.
     pub retired_reason: Option<String>,
     /// For a `merged` retirement, the entry this one was folded into
     /// (`Store::merge_notebook_entries`); null otherwise. Bounded, so it

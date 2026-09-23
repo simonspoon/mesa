@@ -41,7 +41,7 @@ live-notebook methods are the `None` scope):
 | Removal guard | 30% once it holds 100 words | same, on its own words |
 | Provenance | `source_session_id`, `last_used_session_id` | none (both `NULL`) |
 | `touch` | needs a live session | stamps `last_used_at`, no session needed |
-| Decay | after 10 unused ended conversations | **never** — it shrinks only by eviction, a dream, or a delete |
+| Unused entries | a retirement candidate after 10 unused ended conversations, decided by the dream pass (mesa task 1337; never retired by the count alone) | **never** a candidate — it shrinks only by eviction, a dream, or a delete |
 | Retire / merge / restore | soft, `merged_into`, undo | same |
 | Search | turns, summaries, live notes | this project's notes only (retired ones included) |
 

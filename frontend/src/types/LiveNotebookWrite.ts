@@ -24,12 +24,12 @@ body: string, created_at: string, updated_at: string,
 source_session_id: number | null, 
 /**
  * The conversation that last relied on it (`mesa live memory touch`, or a
- * replace), which is what decay is measured from.
+ * replace), which is what retirement candidacy is measured from.
  */
 last_used_session_id: number | null, retired_at: string | null, 
 /**
- * `decayed` | `evicted` | `deleted` | `replaced` | `merged`, null while
- * the entry is active.
+ * `decayed` (old rows only) | `evicted` | `deleted` | `replaced` |
+ * `merged`, null while the entry is active.
  */
 retired_reason: string | null, 
 /**

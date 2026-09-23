@@ -2392,7 +2392,7 @@ EXAMPLES
   mesa live memory list
   mesa live memory list --all")]
     List {
-        /// Include retired entries (decayed, deleted) — the archive's view
+        /// Include retired entries (deleted, evicted, merged) — the archive's view
         #[arg(long)]
         all: bool,
     },
@@ -2458,10 +2458,11 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Mark one entry as used by the live conversation, so it does not decay
+    /// Mark one entry as used by the live conversation, so it is not marked unused
     ///
-    /// An entry no conversation has touched for 10 ended sessions is retired
-    /// as `decayed` at the next live start. `not_found` with no live session.
+    /// An entry no conversation has touched for 10 ended sessions becomes a
+    /// retirement candidate: the next dream pass sees it marked unused and
+    /// decides whether to delete it. `not_found` with no live session.
     Touch {
         #[arg(value_name = "ID")]
         id: i64,
@@ -2515,7 +2516,7 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Un-retire one entry — the undo for a delete, a decay or a merge; prints the record
+    /// Un-retire one entry — the undo for a delete, an eviction or a merge (or an old `decayed` row); prints the record
     ///
     /// `validation` when the entry is active, or when restoring it would take
     /// the notebook over its budget. Restoring a merge's source leaves the
@@ -5233,32 +5234,6 @@ fn spawn_live_summary(store: &mut Store, session: &LiveSession) {
     }
 }
 
-/// Retires notebook entries no conversation has used for
-/// `live::LIVE_NOTEBOOK_DECAY_SESSIONS` ended sessions, reporting the ids on
-/// stderr only — the API's start route does the same into its log. The
-/// notebook is a prompt input, so this runs at the start site rather than on a
-/// timer: "unused for N conversations" is only decidable when one begins.
-fn retire_decayed_notebook(store: &mut Store) {
-    match store.retire_decayed_notebook(live::LIVE_NOTEBOOK_DECAY_SESSIONS) {
-        Ok(retired) if !retired.is_empty() => eprintln!(
-            "notebook: retired {} unused for {} conversations: {}",
-            if retired.len() == 1 {
-                "entry"
-            } else {
-                "entries"
-            },
-            live::LIVE_NOTEBOOK_DECAY_SESSIONS,
-            retired
-                .iter()
-                .map(|e| format!("#{}", e.id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Ok(_) => {}
-        Err(e) => eprintln!("notebook: could not run decay: {e}"),
-    }
-}
-
 fn run_live(cmd: LiveCmd) -> Result<()> {
     let mut store = Store::open_default()?;
     match cmd {
@@ -5274,10 +5249,6 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             // project — and every failure AFTER it goes through
             // `bind_live_agent_or_end`, which ends the session again.
             let session = store.start_live_session(project_id)?;
-            // Decay first (mesa task 1147), so the prompt built below carries
-            // only entries some conversation has used lately. Best-effort:
-            // a failure here is a warning, never a failed start.
-            retire_decayed_notebook(&mut store);
             let session = if no_agent {
                 session
             } else {
@@ -5472,7 +5443,7 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             // read, no model call — and the pass itself is spawned only
             // once the successor exists, so a failed successor spawn still
             // changes nothing at all.
-            let dream_wanted = live::dream_wanted(&store.list_notebook(false)?);
+            let dream_wanted = live::dream_wanted(&store.list_notebook(false)?, &[]);
             let spawned = live::ensure_agent_definition(&store).and_then(|_| {
                 let prompts = library::prompts(&store).map_err(|e| e.to_string())?;
                 agents::spawn_bg(
@@ -5558,7 +5529,8 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             let pulse = cc::session_pulse(&uuid);
             // Why the next handoff would rest the conversation to dream (mesa
             // task 1155), so the agent can announce it — or hand off now.
-            let dream = live::dream_wanted(&store.list_notebook(false)?);
+            // No `crossed` ids, exactly like the handoff it forecasts.
+            let dream = live::dream_wanted(&store.list_notebook(false)?, &[]);
             print_json(&serde_json::json!({
                 "session_id": session.id,
                 "agent_id": agent_id,
@@ -6133,8 +6105,17 @@ fn spawn_dream_pass(
 /// safe because every notebook write goes through the guarded `Store` paths
 /// (`docs/live.md`, "Dreaming").
 fn spawn_live_dream_after(store: &mut Store, session: &LiveSession) {
-    let reason = match store.list_notebook(false) {
-        Ok(entries) => live::dream_wanted(&entries),
+    // Only a stop passes the entries that just crossed the unused mark (mesa
+    // task 1337): each crosses once, at the end of a conversation, so each
+    // gets one automatic decision — a kept norm stays a candidate and would
+    // otherwise re-trigger at every stop and handoff.
+    let reason = match store.list_notebook(false).and_then(|entries| {
+        Ok(live::dream_wanted(
+            &entries,
+            &live::crossed_unused_mark(store)?,
+        ))
+    }) {
+        Ok(reason) => reason,
         Err(e) => {
             eprintln!(
                 "live session {}: could not read the notebook for a dream pass: {e}",

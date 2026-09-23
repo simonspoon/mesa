@@ -878,7 +878,8 @@ const MIGRATIONS: &[&str] = &[
     // ones; the whole active notebook rides in every live agent's prompt, so
     // it is bounded by `live::LIVE_NOTEBOOK_BUDGET_WORDS` (in `Store`, not the
     // schema) and edited one row at a time. Retiring is a SOFT delete —
-    // `retired_at` + `retired_reason` (`decayed` | `deleted` | `replaced`) —
+    // `retired_at` + `retired_reason` (`decayed` | `deleted` | `replaced`;
+    // nothing writes `decayed` since mesa task 1337, old rows keep it) —
     // so a retired entry stays in the archive below. Both session FKs are
     // `SET NULL`: an entry outlives the conversation that wrote it.
     //
@@ -6335,11 +6336,12 @@ impl Store {
     /// the row the calling write just wrote. Answers the evicted ids, oldest
     /// used first. In the live notebook "least recently used" is
     /// `last_used_session_id` ascending, falling back to `source_session_id`
-    /// and then to 0 when both are null (the `retire_decayed_notebook` rule,
-    /// so an entry never attributed to any conversation is the oldest of
-    /// all); in a project notebook (mesa task 1333) it is `last_used_at`,
-    /// falling back to `created_at`. Ties are broken by id ascending — the
-    /// earlier-written entry goes first. A soft retire exactly like decay:
+    /// and then to 0 when both are null (the
+    /// `notebook_retirement_candidates` rule, so an entry never attributed to
+    /// any conversation is the oldest of all); in a project notebook (mesa
+    /// task 1333) it is `last_used_at`, falling back to `created_at`. Ties
+    /// are broken by id ascending — the earlier-written entry goes first. A
+    /// soft retire like every other:
     /// the row and its archive index entry both stay, so `search` still finds
     /// it and `restore` undoes it. It always fits: one entry is at most
     /// [`live::LIVE_NOTEBOOK_ENTRY_MAX`] characters, far under the budget in
@@ -6573,8 +6575,8 @@ impl Store {
         self.restore_notebook_entry_in(None, id)
     }
 
-    /// Un-retires one row, whatever retired it — the undo for a delete, a
-    /// decay or a merge (mesa task 1152): `retired_at`, `retired_reason` and
+    /// Un-retires one row, whatever retired it — the undo for a delete, an
+    /// eviction or a merge (or an old `decayed` row) (mesa task 1152): `retired_at`, `retired_reason` and
     /// `merged_into` are cleared and nothing else on the row moves, so its
     /// provenance reads exactly as before. An active id is `validation`
     /// (there is nothing to restore), and a restore that would take the
@@ -6607,7 +6609,8 @@ impl Store {
     }
 
     /// Marks one active live-notebook entry as used by the **live**
-    /// conversation, which is what keeps it from decaying. `NotFound` with no
+    /// conversation, which is what keeps it from becoming a retirement
+    /// candidate (`notebook_retirement_candidates`). `NotFound` with no
     /// live session, like every other `mesa live` verb — an agent can only
     /// vouch for an entry from inside a conversation.
     pub fn touch_notebook_entry(&mut self, id: i64) -> Result<LiveNotebookEntry> {
@@ -6755,34 +6758,30 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Retires, as `decayed`, every active **live-notebook** entry that no
-    /// conversation has used for `n` **ended** sessions: counted as the ended
-    /// sessions with an id above the entry's last use (its source session
-    /// when it was never touched). Run at both live-start sites before the
-    /// prompt is built, so a bullet nobody has needed in `n` conversations
-    /// stops riding into every one. A project notebook never decays (mesa
-    /// task 1333): it has no conversations to count. Answers the rows it
-    /// retired.
-    pub fn retire_decayed_notebook(&mut self, n: i64) -> Result<Vec<LiveNotebookEntry>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {LIVE_NOTEBOOK_COLUMNS} FROM live_notebook \
-             WHERE retired_at IS NULL AND project_id IS NULL AND (
-                SELECT COUNT(*) FROM live_sessions \
-                 WHERE id > COALESCE(last_used_session_id, source_session_id, 0) \
-                   AND ended_at IS NOT NULL) >= ?1 \
-             ORDER BY id"
-        ))?;
-        let decayed = stmt
-            .query_map([n], row_to_notebook_entry)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-        for entry in &decayed {
-            self.retire_notebook_entry(entry.id, "decayed")?;
-        }
-        decayed
-            .iter()
-            .map(|e| self.get_notebook_entry(e.id))
-            .collect()
+    /// The **retirement candidates** of the live notebook (mesa task 1337):
+    /// every active **live-notebook** entry that no conversation has used for
+    /// at least `n` **ended** sessions, counted as the ended sessions with an
+    /// id above the entry's last use (its source session when it was never
+    /// touched), answered as `(id, unused)` pairs in id order, `unused` being
+    /// that count. Derived on every read and read-only: nothing is stored and
+    /// nothing is retired — the dream pass is told which entries are
+    /// candidates and decides, deleting a one-off and keeping a standing norm,
+    /// since a norm is followed without being looked up. (Until 1337 this
+    /// predicate retired the rows as `decayed` at every live start.) A project
+    /// notebook has no candidates (mesa task 1333): it has no conversations to
+    /// count.
+    pub fn notebook_retirement_candidates(&self, n: i64) -> Result<Vec<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, unused FROM (
+                SELECT id, (SELECT COUNT(*) FROM live_sessions \
+                     WHERE id > COALESCE(last_used_session_id, source_session_id, 0) \
+                       AND ended_at IS NOT NULL) AS unused \
+                  FROM live_notebook \
+                 WHERE retired_at IS NULL AND project_id IS NULL) \
+             WHERE unused >= ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([n], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// The live archive's search — [`Self::search_memory_in`] at the live
@@ -15399,7 +15398,7 @@ mod tests {
     }
 
     /// A project's entries never reach the live notebook's list, budget,
-    /// prompt, decay or search — and carry no session provenance even while a
+    /// prompt, retirement candidates or search — and carry no session provenance even while a
     /// conversation is live.
     #[test]
     fn project_notebooks_are_isolated_from_the_live_notebook() {
@@ -15458,10 +15457,13 @@ mod tests {
                 .is_empty()
         );
 
-        // Decay counts conversations, which a project notebook has none of.
+        // Candidacy counts conversations, which a project notebook has none
+        // of.
         store.end_live_session(live_session.id).unwrap();
-        let decayed = store.retire_decayed_notebook(0).unwrap();
-        assert_eq!(ids(decayed), vec![live.id]);
+        assert_eq!(
+            store.notebook_retirement_candidates(0).unwrap(),
+            vec![(live.id, 0)]
+        );
         assert!(
             store
                 .get_notebook_entry(note.id)
@@ -15894,10 +15896,11 @@ mod tests {
         assert_eq!(store.get_notebook_entry(a.id).unwrap().id, a.id);
     }
 
-    /// Decay counts ended sessions past an entry's last use; touching resets
-    /// the clock, and a retired row stays searchable.
+    /// Retirement candidacy (mesa task 1337) counts ended sessions past an
+    /// entry's last use; touching resets the clock, and reading the
+    /// candidates retires nothing — the dream pass decides.
     #[test]
-    fn notebook_entries_decay_after_n_ended_sessions_unless_touched() {
+    fn notebook_entries_become_candidates_after_n_ended_sessions_unless_touched() {
         let (mut store, _dir) = temp_store();
         let first = ended_session(&mut store);
         let stale = store
@@ -15909,7 +15912,7 @@ mod tests {
             ended_session(&mut store);
         }
         assert!(
-            store.retire_decayed_notebook(3).unwrap().is_empty(),
+            store.notebook_retirement_candidates(3).unwrap().is_empty(),
             "2 < 3"
         );
         let live = store.start_live_session(None).unwrap();
@@ -15920,29 +15923,36 @@ mod tests {
         store.touch_notebook_entry(stale.id).unwrap();
         store.end_live_session(live.id).unwrap();
         // 3 ended sessions after `first`, but the touch moved the clock.
-        assert!(store.retire_decayed_notebook(3).unwrap().is_empty());
+        assert!(store.notebook_retirement_candidates(3).unwrap().is_empty());
         for _ in 0..3 {
             ended_session(&mut store);
         }
-        let decayed = store.retire_decayed_notebook(3).unwrap();
+        // Both last used in `live`: three ended sessions since, exactly the
+        // mark.
         assert_eq!(
-            decayed.iter().map(|e| e.id).collect::<Vec<_>>(),
+            store.notebook_retirement_candidates(3).unwrap(),
+            vec![(stale.id, 3), (fresh.id, 3)]
+        );
+        ended_session(&mut store);
+        assert_eq!(
+            store.notebook_retirement_candidates(3).unwrap(),
+            vec![(stale.id, 4), (fresh.id, 4)],
+            "past the mark is still a candidate, and the count keeps rising"
+        );
+        // Nothing was retired: a candidate stays active and in the prompt's
+        // notebook until the dream deletes it.
+        let active = store.list_notebook(false).unwrap();
+        assert_eq!(
+            active.iter().map(|e| e.id).collect::<Vec<_>>(),
             vec![stale.id, fresh.id]
         );
-        assert!(
-            decayed
-                .iter()
-                .all(|e| e.retired_reason.as_deref() == Some("decayed"))
+        assert!(active.iter().all(|e| e.retired_at.is_none()));
+        // A retired row is not a candidate.
+        store.delete_notebook_entry(fresh.id).unwrap();
+        assert_eq!(
+            store.notebook_retirement_candidates(3).unwrap(),
+            vec![(stale.id, 4)]
         );
-        assert!(store.list_notebook(false).unwrap().is_empty());
-        assert!(
-            store.retire_decayed_notebook(3).unwrap().is_empty(),
-            "idempotent"
-        );
-        let hits = store.search_live_memory("pelican", 10).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].kind, "note");
-        assert_eq!(hits[0].ref_id, stale.id);
     }
 
     /// A merge (mesa task 1152) retires its sources as `merged` pointing at

@@ -3834,32 +3834,6 @@ async fn start_live(
         .unwrap()
         .start_live_session(body.project_id)?
         .id;
-    // Decay first (mesa task 1147), so the prompt built by the spawn carries
-    // only entries some conversation has used lately. Best-effort, like the
-    // CLI's start: a failure is a log line, never a failed start.
-    match state
-        .store
-        .lock()
-        .unwrap()
-        .retire_decayed_notebook(live::LIVE_NOTEBOOK_DECAY_SESSIONS)
-    {
-        Ok(retired) if !retired.is_empty() => eprintln!(
-            "notebook: retired {} unused for {} conversations: {}",
-            if retired.len() == 1 {
-                "entry"
-            } else {
-                "entries"
-            },
-            live::LIVE_NOTEBOOK_DECAY_SESSIONS,
-            retired
-                .iter()
-                .map(|e| format!("#{}", e.id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Ok(_) => {}
-        Err(e) => eprintln!("notebook: could not run decay: {e}"),
-    }
     let job = match spawn_live_agent(&state, session_id, body.project_id).await {
         Ok(job) => job,
         Err(err) => {
@@ -4083,8 +4057,16 @@ async fn spawn_live_summary(state: &AppState, session_id: i64, project_id: Optio
 async fn spawn_live_dream_after(state: &AppState, session_id: i64, project_id: Option<i64>) {
     let (reason, dir, prompt, prompts) = {
         let store = state.store.lock().unwrap();
-        let reason = match store.list_notebook(false) {
-            Ok(entries) => live::dream_wanted(&entries),
+        // Only a stop passes the entries that just crossed the unused mark
+        // (mesa task 1337), as the CLI's does: a kept norm stays a candidate
+        // and would otherwise re-trigger at every stop and handoff.
+        let reason = match store.list_notebook(false).and_then(|entries| {
+            Ok(live::dream_wanted(
+                &entries,
+                &live::crossed_unused_mark(&store)?,
+            ))
+        }) {
+            Ok(reason) => reason,
             Err(e) => {
                 eprintln!(
                     "live session {session_id}: could not read the notebook for a dream pass: {e}"

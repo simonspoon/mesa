@@ -126,9 +126,11 @@
 #      retired row surviving in `list --all` and in the archive, `search`
 #      hitting a turn, a summary and a note with their `kind`s, `ref_id`s
 #      and bracketed snippets, a query carrying `"` and `AND` searched as
-#      words rather than erroring, decay retiring every entry unused for N
-#      ended sessions at the next `live start` (named on stderr, active list
-#      empty, `--all` showing `decayed`), the four `/api/live/memory` routes
+#      words rather than erroring, an entry unused for N ended sessions
+#      staying active as a retirement candidate (mesa task 1337: `live start`
+#      retires nothing and says nothing, the dream prompt marks it
+#      `, unused`, the stop at which it crosses the mark spawns a dream pass
+#      and the next stop does not), the four `/api/live/memory` routes
 #      with both halves of the security boundary in default mode AND under
 #      `--lan` (the Settings posture: `require_agent_access`, reads
 #      included), and `GET /api/live` carrying no notebook (the 2s poll stays
@@ -2561,17 +2563,24 @@ NB_ENTRY_MAX=$(grep -Eo 'pub const LIVE_NOTEBOOK_ENTRY_MAX: usize = [0-9]+' src/
 
 words() { printf 'w%.0s ' $(seq 1 "$1") | sed 's/ $//'; } # N single-letter words
 
-# ---- list: section 11's entry has DECAYED by now — sections 11-13 ended
-#      well over N conversations after it was written and section 13's
-#      `live start` ran the decay — so it is out of the active list and in
-#      --all as `decayed`; --quiet refused on the two arrays ----
+# ---- list: section 11's entry is STILL ACTIVE — sections 11-13 ended well
+#      over N conversations after it was written, which since mesa task 1337
+#      makes it a retirement candidate for the dream pass, never retires it
+#      on its own. Deleted here by hand (what a dream deciding it is a
+#      one-off would do), with anything else still active, so the sections
+#      below start from an empty notebook; --quiet refused on the two
+#      arrays ----
 run 0 "$MESA" live memory list
 [ "$(jqs type)" = "array" ] || fail "live memory list: bare array"
-[ "$(jqs 'map(.id) | index('"$NOTE_ID"')')" = "null" ] ||
-  fail "live memory list: section 11's entry #$NOTE_ID must have decayed by now (unused for $NB_DECAY+ conversations)"
-run 0 "$MESA" live memory list --all
-[ "$(jqs 'map(select(.id == '"$NOTE_ID"'))[0].retired_reason')" = "decayed" ] ||
-  fail "list --all must show section 11's entry as decayed (got $(jqs 'map(select(.id == '"$NOTE_ID"'))'))"
+[ "$(jqs 'map(.id) | index('"$NOTE_ID"')')" != "null" ] ||
+  fail "live memory list: section 11's entry #$NOTE_ID must still be active, unused for $NB_DECAY+ conversations or not (got $STDOUT)"
+[ "$(jqs 'map(select(.id == '"$NOTE_ID"'))[0].retired_at')" = "null" ] ||
+  fail "section 11's entry #$NOTE_ID must not be retired"
+for id in $(jqs '.[].id'); do
+  run 0 "$MESA" live memory delete --quiet "$id"
+done
+run 0 "$MESA" live memory show "$NOTE_ID"
+[ "$(jqs .retired_reason)" = "deleted" ] || fail "section 11's entry is retired by the explicit delete"
 run 2 "$MESA" live memory list --quiet
 [ -z "$STDOUT" ] || fail "live memory list --quiet: stdout must be empty on a usage error"
 [ "$(jqe .error.code)" = "usage" ] || fail "live memory list --quiet: error.code"
@@ -2608,7 +2617,7 @@ run 1 "$MESA" live memory delete "$D1"
 run 1 "$MESA" live memory replace "$D1" anything
 [ "$(jqe .error.code)" = "not_found" ] || fail "replacing a retired row: not_found"
 run 1 "$MESA" live memory delete "$NOTE_ID"
-[ "$(jqe .error.code)" = "not_found" ] || fail "deleting a decayed row: not_found"
+[ "$(jqe .error.code)" = "not_found" ] || fail "deleting section 11's retired row again: not_found"
 ok "live memory delete: allowed below the 100-word floor; a soft delete — echoed, out of \`list\`, in \`list --all\` and \`show\`, and not_found for every later write"
 
 # ---- add / show / --quiet / touch ----
@@ -2789,38 +2798,74 @@ run 0 "$MESA" live memory list
 [ "$(jqs 'map(.id) | join(",")')" = "$E2,$E4,$E6,$E7" ] || fail "the active notebook after the evictions (got $(jqs 'map(.id)'))"
 ok "live memory: past the $NB_BUDGET-word budget an add or replace evicts the least-recently-used entries (id breaking a tie), never the one written, listed in \`evicted\` and still searchable; landing exactly on the budget evicts nothing"
 
-# ---- decay: N ended sessions with no use retires an entry at the next start ----
+# ---- retirement candidates (mesa task 1337): N ended sessions with no use
+#      make an entry a candidate the dream pass decides, never retire it ----
 #
-# Every active entry was last used at (or before) the session ended above,
-# so after N more ended conversations the next `live start` retires them all
-# — named on stderr, gone from the active list, `decayed` in --all.
-for _ in $(seq 1 "$NB_DECAY"); do
+# First empty the notebook, in steps the removal guard allows (<= 30% each
+# while it holds 100+ words): 500 -> 409 -> 310 -> 220 -> 160 -> 115 -> 85,
+# then below the floor anything goes.
+run 0 "$MESA" live memory delete "$E7"
+run 0 "$MESA" live memory delete "$E2"
+run 0 "$MESA" live memory replace "$E4" "$(words 70)"
+run 0 "$MESA" live memory replace "$E6" "$(words 90)"
+run 0 "$MESA" live memory replace "$E6" "$(words 45)"
+run 0 "$MESA" live memory replace "$E4" "$(words 40)"
+run 0 "$MESA" live memory delete "$E4"
+run 0 "$MESA" live memory delete "$E6"
+run 0 "$MESA" live memory list
+[ "$(jqs length)" = "0" ] || fail "the notebook must be empty before the candidate check (got $STDOUT)"
+# Two small, unlike entries: under every older dream trigger, so a dream at
+# a stop below can only be the crossing trigger.
+run 0 "$MESA" live memory add "CAND-A: the old sandbox device is on the desk."
+C1=$(jqs .id)
+run 0 "$MESA" live memory add "CAND-B: prefers answers read out before the board."
+C2=$(jqs .id)
+rm -f "$STUB_DIR/last-argc"
+for _ in $(seq 1 $((NB_DECAY - 1))); do
   run 0 "$MESA" live start --no-agent
+  [ -z "$STDERR" ] || fail "live start must say nothing about the notebook (got: $STDERR)"
   run 0 "$MESA" live stop >/dev/null
 done
-run 0 "$MESA" live memory list
-[ "$(jqs length)" = "4" ] || fail "decay runs at a start, not a stop: all 4 entries still active"
+[ ! -e "$STUB_DIR/last-argc" ] ||
+  fail "no stop before the ${NB_DECAY}th may spawn a dream pass for two small entries (got: $(cat "$STUB_DIR/last-prompt"))"
+# The Nth ended session is the one both entries cross the mark at: that stop
+# spawns the dream, and its prompt marks both unused.
 run 0 "$MESA" live start --no-agent
-grep -q "retired" <<<"$STDERR" || fail "live start must report the decayed entries on stderr (got: $STDERR)"
-for id in "$E2" "$E4" "$E6" "$E7"; do
-  grep -q "#$id\b" <<<"$STDERR" || fail "live start's decay report must name #$id (got: $STDERR)"
-done
-run 0 "$MESA" live memory list
-[ "$(jqs length)" = "0" ] || fail "after decay the active notebook is empty"
-run 0 "$MESA" live memory list --all
-for id in "$E2" "$E4" "$E6" "$E7"; do
-  [ "$(jqs 'map(select(.id == '"$id"'))[0].retired_reason')" = "decayed" ] ||
-    fail "list --all must show #$id as decayed"
-done
-run 0 "$MESA" live memory show "$E2"
-[ "$(jqs .retired_reason)" = "decayed" ] || fail "a decayed row reads as decayed"
-run 0 "$MESA" live memory show "$E1"
-[ "$(jqs .retired_reason)" = "evicted" ] || fail "decay touches only active rows: an evicted one stays evicted"
 run 0 "$MESA" live stop >/dev/null
+[ -e "$STUB_DIR/last-argc" ] || fail "the stop at which entries cross the $NB_DECAY-session mark must spawn a dream pass"
+grep -q "You are tidying mesa's notebook between conversations" "$STUB_DIR/last-prompt" ||
+  fail "the crossing stop must spawn the live-dream prompt (got: $(cat "$STUB_DIR/last-prompt"))"
+grep -q "Some entries are marked unused" "$STUB_DIR/last-prompt" ||
+  fail "the dream prompt must tell the dreamer what unused means"
+for id in "$C1" "$C2"; do
+  grep -q -- "- \[#$id, added [0-9-]*, from session [0-9-]*, last used session [0-9-]*, unused\] CAND-" \
+    "$STUB_DIR/last-prompt" || fail "the dream prompt must mark #$id unused (got: $(cat "$STUB_DIR/last-prompt"))"
+done
+# Crossing happens once: the next stop, both entries still candidates, spawns
+# nothing — a kept norm must not re-trigger a dream at every stop.
+rm -f "$STUB_DIR/last-argc"
 run 0 "$MESA" live start --no-agent
-[ -z "$STDERR" ] || fail "a second start with nothing left to decay must be silent (got: $STDERR)"
+[ -z "$STDERR" ] || fail "live start past the mark must retire nothing and say nothing (got: $STDERR)"
 run 0 "$MESA" live stop >/dev/null
-ok "live memory decay: an entry unused for $NB_DECAY ended sessions is retired at the next live start — named on stderr, out of the active list, \`decayed\` in --all"
+[ ! -e "$STUB_DIR/last-argc" ] || fail "a stop past the mark must not spawn the dream again"
+run 0 "$MESA" live memory list
+[ "$(jqs 'map(.id) | join(",")')" = "$C1,$C2" ] ||
+  fail "candidates stay active: both entries must still be listed (got $STDOUT)"
+[ "$(jqs 'map(.retired_at) | unique | join(",")')" = "" ] || fail "no candidate may be retired"
+# The manual dream marks them too, and a live agent's prompt never does.
+run 0 "$MESA" live memory dream
+[ "$(jqs .spawned)" = "true" ] || fail "live memory dream over two candidates must spawn (got $STDOUT)"
+[ "$(grep -c ', unused\] CAND-' "$STUB_DIR/last-prompt")" = "2" ] ||
+  fail "the manual dream prompt must mark both candidates unused"
+run 0 "$MESA" live start
+! grep -q 'unused\]' "$STUB_DIR/last-prompt" || fail "the live agent's notebook lines carry no unused mark"
+grep -q -- "- \[#$C1, added .*\] CAND-A" "$STUB_DIR/last-prompt" ||
+  fail "a candidate still rides in the live agent's prompt"
+run 0 "$MESA" live stop >/dev/null
+# Empty again for the API section below.
+run 0 "$MESA" live memory delete "$C1"
+run 0 "$MESA" live memory delete "$C2"
+ok "live memory candidates: an entry unused for $NB_DECAY ended sessions stays active — live start retires nothing and says nothing, the stop it crosses the mark at spawns a dream whose prompt marks it \`, unused\`, the next stop does not, and the live agent's lines carry no mark"
 
 # ---- the API: four routes on require_agent_access, default mode ----
 PORT=17781
@@ -2834,7 +2879,7 @@ done
 curl -sf "$BASE/api/live" >/dev/null || fail "server did not start (log: $(cat "$TMP/serve14.log"))"
 
 api 200 GET "/api/live/memory"
-[ "$BODY" = "[]" ] || fail "GET /api/live/memory: the active notebook is empty after decay (got $BODY)"
+[ "$BODY" = "[]" ] || fail "GET /api/live/memory: the active notebook is empty here (got $BODY)"
 api 201 POST "/api/live/memory" '{"body":"  Prefers the board sorted by priority.  "}'
 M1=$(jqb .id)
 [ "$(jqb .body)" = "Prefers the board sorted by priority." ] || fail "POST /api/live/memory: trimmed body"
@@ -2958,8 +3003,8 @@ LAN_PID=
 
 # ---- the dream pass (mesa task 1152): merge, restore, dream ----
 #
-# The active notebook is empty here (everything above was deleted or has
-# decayed) and no session is live. `$D1` is a row section 14 deleted, so it
+# The active notebook is empty here (everything above was deleted or
+# evicted) and no session is live. `$D1` is a row section 14 deleted, so it
 # is the retired id a merge must refuse.
 
 # `dream` takes no --quiet (like `search`), and with fewer than two active

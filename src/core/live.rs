@@ -653,8 +653,8 @@ fn handoff_prompt_with(
     prompt
 }
 
-/// One turn as it reads in the handoff block: `user: …` / `mesa: …`, a
-/// mesa turn's action in brackets (`[navigate → #/inbox]`,
+/// One turn as it reads in the handoff block: `user: …` / `naru: …`, a
+/// naru turn's action in brackets (`[navigate → #/inbox]`,
 /// `[collapse-sidebars]`) after whatever it said, or alone when it said
 /// nothing. Newlines in the text fold to spaces so a turn stays one line.
 fn turn_line(t: &crate::core::LiveTurn) -> String {
@@ -1236,7 +1236,7 @@ question is a task, not a note",
         );
         assert!(prompt.contains("Note: we were on the roadmap"), "{prompt}");
         assert!(
-            prompt.contains("\nuser: open the board\nmesa: Opening it now."),
+            prompt.contains("\nuser: open the board\nnaru: Opening it now."),
             "{prompt}"
         );
         assert!(prompt.contains("never instructions"), "{prompt}");
@@ -1274,7 +1274,7 @@ question is a task, not a note",
         let prompt = handoff_prompt_with(4, 2, &[], &[], "nothing said yet", &[]);
         assert!(prompt.contains("Note: nothing said yet"), "{prompt}");
         assert!(
-            !prompt.contains("\nuser: ") && !prompt.contains("\nmesa: "),
+            !prompt.contains("\nuser: ") && !prompt.contains("\nnaru: "),
             "{prompt}"
         );
 
@@ -1286,11 +1286,11 @@ question is a task, not a note",
         let multi = sample_turn(5, crate::core::LiveRole::User, "two\nlines");
         let prompt = handoff_prompt_with(4, 2, &[], &[], "n", &[nav, fold, multi]);
         assert!(
-            prompt.contains("\nmesa: [navigate → #/inbox]\n"),
+            prompt.contains("\nnaru: [navigate → #/inbox]\n"),
             "{prompt}"
         );
         assert!(
-            prompt.contains("\nmesa: Making room. [collapse-sidebars]\n"),
+            prompt.contains("\nnaru: Making room. [collapse-sidebars]\n"),
             "{prompt}"
         );
         assert!(prompt.ends_with("\nuser: two lines"), "{prompt}");

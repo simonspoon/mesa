@@ -11,7 +11,7 @@ import type { LiveRole } from "./LiveRole";
  */
 export type LiveTurn = { id: number, session_id: number, role: LiveRole, 
 /**
- * What was said. Spoken aloud when the role is `mesa`, so it is prose —
+ * What was said. Spoken aloud when the role is `naru`, so it is prose —
  * and bounded, since a runaway body would wedge the synthesiser. Empty
  * only on a pure action turn, which changes the page and says nothing.
  */

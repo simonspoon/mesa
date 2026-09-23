@@ -11,7 +11,7 @@ function turn(id: number, patch: Partial<LiveTurn> = {}): LiveTurn {
   return {
     id,
     session_id: 1,
-    role: 'mesa',
+    role: 'naru',
     text: 'one moment',
     action: null,
     target: null,

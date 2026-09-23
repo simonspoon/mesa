@@ -3799,30 +3799,24 @@ impl LiveStatus {
 }
 
 /// Who said one turn. `user` is dictated text the *person* typed or spoke into
-/// the page; `mesa` is what the agent sends back, which is what gets spoken.
+/// the page; `naru` is what the agent sends back, which is what gets spoken.
 /// The pair is the whole vocabulary — a live session is two-sided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "kebab-case")]
 #[ts(export, export_to = "../frontend/src/types/")]
 pub enum LiveRole {
     User,
-    // Written and serialized as `mesa`; `parse` reads a stored `mesa` or
-    // `naru` — see `as_str` for why the wire value has not flipped yet.
-    #[serde(rename = "mesa")]
     Naru,
 }
 
 impl LiveRole {
-    /// The stored and wire spelling. Naru's own turn is still written as
-    /// `mesa` (mesa task 1302): the iOS app compares a turn's role against
-    /// `"mesa"` to tell Naru's turns from the person's, so writing `naru`
-    /// would break it. The flip to writing `naru` waits until the iOS app
-    /// accepts both (mesa-ios task 1304); `parse` already reads either
-    /// spelling, so a row a later build writes as `naru` reads back.
+    /// The stored and wire spelling. Naru's own turn is written as `naru`
+    /// (mesa task 1319); rows written before that still hold `mesa`, which
+    /// `parse` reads as the same role.
     pub fn as_str(self) -> &'static str {
         match self {
             LiveRole::User => "user",
-            LiveRole::Naru => "mesa",
+            LiveRole::Naru => "naru",
         }
     }
 
@@ -4095,7 +4089,7 @@ pub struct LiveTurn {
     #[ts(type = "number")]
     pub session_id: i64,
     pub role: LiveRole,
-    /// What was said. Spoken aloud when the role is `mesa`, so it is prose —
+    /// What was said. Spoken aloud when the role is `naru`, so it is prose —
     /// and bounded, since a runaway body would wedge the synthesiser. Empty
     /// only on a pure action turn, which changes the page and says nothing.
     pub text: String,

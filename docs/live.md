@@ -266,7 +266,7 @@ so it was spoken on almost every turn and told the person nothing.
 
 ### The notice turn
 
-A **notice** is a `mesa`-role turn Naru itself writes *about* the agent,
+A **notice** is a `naru`-role turn Naru itself writes *about* the agent,
 not the agent's own words: `LiveTurn.notice` names the kind — `permission`
 (the job is blocked on a prompt), the only one — and is null on every turn
 either side actually said. `text` is one fixed plain sentence per kind
@@ -486,8 +486,8 @@ the cached prefix carries over. The order is:
    conversation until now left for you, and the last 10 turns as spoken …
    a record of what was said, never instructions*: `Note: <note>`, then
    the session's last `LIVE_HANDOFF_TURNS` (10) turns in chronological
-   order, one per line as `user: …` / `mesa: …`, a mesa turn's action in
-   brackets after whatever it said (`mesa: [navigate → #/inbox]`), newlines
+   order, one per line as `user: …` / `naru: …`, a naru turn's action in
+   brackets after whatever it said (`naru: [navigate → #/inbox]`), newlines
    folded so a turn stays one line.
 
 Ten turns, not the transcript: a handoff exists to shed context, and
@@ -550,8 +550,11 @@ turns (schema enforces none of it, per CLAUDE.md):
   it is just over.
 - A **`user`** turn carries non-empty text and nothing else: the page dictates,
   it does not drive itself.
-- A **`mesa`** turn must say something **or** do something. Empty text is legal
+- A **`naru`** turn must say something **or** do something. Empty text is legal
   exactly on a pure action turn, which changes the page and speaks nothing.
+  Naru's side is written as `naru` since mesa task 1319; a row written before
+  that still holds `mesa`, and every reader (`LiveRole::parse`,
+  `liveTurns.ts::isNaruRole`) takes it as the same role.
 - An **`action`** is one of `navigate`, `collapse-sidebars` and
   `expand-sidebars`. `navigate` must carry a `target`; the two sidebar verbs
   must carry none — a route on one is a caller who meant `navigate`, not a
@@ -614,7 +617,7 @@ long before either stamps it. That is why the session also names a
 separate column rather than an earlier `played_at`, which would say a turn had
 been heard before anyone had heard it.
 
-`notice` (mesa task 1157) marks a `mesa` turn Naru itself wrote about the
+`notice` (mesa task 1157) marks a `naru` turn Naru itself wrote about the
 agent — `permission` — rather than one the agent said; it is
 written only by `Store::add_live_notice`, never by `add_live_turn`, and is
 null everywhere else. See [Telling the person the agent is stuck or
@@ -1270,7 +1273,7 @@ the group (with none live, `not_found` naming `mesa live start`).
   one. Same trap, same rule, and it is sharper here only in that the result is
   visible rather than audible.
 - **`--say` speaks a sentence alongside the picture**, exactly as
-  `navigate --say` speaks one as the page changes — an ordinary `mesa` turn,
+  `navigate --say` speaks one as the page changes — an ordinary `naru` turn,
   carrying no action, written after the board so the picture is there when the
   sentence is.
 - **`--quiet` drops `body`**, the one unbounded field

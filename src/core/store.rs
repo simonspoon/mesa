@@ -13161,18 +13161,18 @@ mod tests {
         assert_eq!(taken.speaker.as_deref(), Some("the-tab-left"));
     }
 
-    /// Naru's turns are still written as `mesa` for the iOS app (mesa task
-    /// 1302), but a row a later build writes as `naru` must read back as the
-    /// same role rather than panicking in `row_to_live_turn`.
+    /// Naru's turns are written as `naru` (mesa task 1319), but a row an
+    /// earlier build wrote as `mesa` must read back as the same role rather
+    /// than panicking in `row_to_live_turn`.
     #[test]
-    fn a_turn_stored_as_naru_reads_back_as_naru() {
+    fn a_turn_stored_as_mesa_reads_back_as_naru() {
         let (mut store, _dir) = temp_store();
         let session = store.start_live_session(None).unwrap();
         store
             .conn
             .execute(
                 "INSERT INTO live_turns (session_id, role, text, created_at) \
-                 VALUES (?1, 'naru', 'from a later build', datetime('now'))",
+                 VALUES (?1, 'mesa', 'from an earlier build', datetime('now'))",
                 [session.id],
             )
             .unwrap();
@@ -13182,7 +13182,7 @@ mod tests {
         let turns = store.list_live_turns(session.id, None, 10).unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, LiveRole::Naru);
-        assert_eq!(turns[0].text, "from a later build");
+        assert_eq!(turns[0].text, "from an earlier build");
         let stored: String = store
             .conn
             .query_row(
@@ -13191,8 +13191,8 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(stored, "mesa");
-        assert_eq!(serde_json::to_value(LiveRole::Naru).unwrap(), "mesa");
+        assert_eq!(stored, "naru");
+        assert_eq!(serde_json::to_value(LiveRole::Naru).unwrap(), "naru");
     }
 
     #[test]

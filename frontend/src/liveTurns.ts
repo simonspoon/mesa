@@ -19,10 +19,10 @@ import type { LiveTurn } from './types/LiveTurn'
  */
 
 /**
- * Whether a turn's role is Naru's side of the conversation. The server still
- * writes `mesa` (the iOS app compares against it), but a later build will
- * write `naru` (mesa task 1302), so every "is this Naru's turn" check reads
- * both — the generated `LiveRole` type names only the first, hence `string`.
+ * Whether a turn's role is Naru's side of the conversation. The server writes
+ * `naru` (mesa task 1319), but a row written before that still reads `mesa`,
+ * so every "is this Naru's turn" check reads both — the generated `LiveRole`
+ * type names only the first, hence `string`.
  */
 export function isNaruRole(role: string): boolean {
   return role === 'mesa' || role === 'naru'

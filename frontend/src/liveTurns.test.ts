@@ -20,7 +20,7 @@ function turn(id: number, patch: Partial<LiveTurn> = {}): LiveTurn {
   return {
     id,
     session_id: 1,
-    role: 'mesa',
+    role: 'naru',
     text: 'the board is open',
     action: null,
     target: null,
@@ -243,7 +243,7 @@ describe('turnGroups', () => {
     ])
     expect(groups.map((g) => [g.role, g.turns.map((t) => t.id)])).toEqual([
       ['user', [1]],
-      ['mesa', [2, 3]],
+      ['naru', [2, 3]],
       ['user', [4]],
     ])
     expect(groups.every((g) => !g.notice)).toBe(true)
@@ -275,12 +275,12 @@ describe('turnGroups', () => {
 describe('turnLabel', () => {
   it('names each side the way the agent chat does', () => {
     expect(turnLabel('user')).toBe('you')
-    expect(turnLabel('mesa')).toBe('Naru')
+    expect(turnLabel('naru')).toBe('Naru')
   })
 
   it('names a notice as one, not as mesa', () => {
-    expect(turnLabel('mesa', true)).toBe('notice')
-    expect(turnLabel('mesa', false)).toBe('Naru')
+    expect(turnLabel('naru', true)).toBe('notice')
+    expect(turnLabel('naru', false)).toBe('Naru')
   })
 })
 
@@ -326,29 +326,29 @@ describe('actsOn', () => {
   })
 })
 
-describe('a turn written as naru (mesa task 1302)', () => {
-  // The server still writes `mesa`; a later build will write `naru`, which the
-  // generated type does not name yet — hence the one widening cast.
-  const naru = (id: number, patch: Partial<LiveTurn> = {}) =>
-    turn(id, { role: 'naru' as LiveTurn['role'], ...patch })
+describe('a turn stored as mesa before mesa task 1319', () => {
+  // The server writes `naru`; a row written before that still reads `mesa`,
+  // which the generated type no longer names — hence the one widening cast.
+  const legacy = (id: number, patch: Partial<LiveTurn> = {}) =>
+    turn(id, { role: 'mesa' as LiveTurn['role'], ...patch })
 
-  it('is Naru’s side, as mesa is, and the user is not', () => {
+  it('is Naru’s side, as naru is, and the user is not', () => {
     expect(isNaruRole('mesa')).toBe(true)
     expect(isNaruRole('naru')).toBe(true)
     expect(isNaruRole('user')).toBe(false)
   })
 
-  it('is spoken and queued like a mesa turn', () => {
-    expect(spokenText(naru(1))).toBe('the board is open')
-    expect(pendingTurns([naru(1), turn(2, { role: 'user' })], new Set()).map((t) => t.id)).toEqual(
-      [1],
-    )
-    expect(nextUnplayed([naru(3)], new Set())?.id).toBe(3)
+  it('is spoken and queued like a naru turn', () => {
+    expect(spokenText(legacy(1))).toBe('the board is open')
+    expect(
+      pendingTurns([legacy(1), turn(2, { role: 'user' })], new Set()).map((t) => t.id),
+    ).toEqual([1])
+    expect(nextUnplayed([legacy(3)], new Set())?.id).toBe(3)
   })
 
-  it('runs together with a mesa turn beside it', () => {
-    const groups = turnGroups([turn(1), naru(2), turn(3, { role: 'user' })])
+  it('runs together with a naru turn beside it', () => {
+    const groups = turnGroups([turn(1), legacy(2), turn(3, { role: 'user' })])
     expect(groups.map((g) => g.turns.map((t) => t.id))).toEqual([[1, 2], [3]])
-    expect(turnLabel(naru(2).role)).toBe('Naru')
+    expect(turnLabel(legacy(2).role)).toBe('Naru')
   })
 })

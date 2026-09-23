@@ -2,7 +2,7 @@
 
 /**
  * Who said one turn. `user` is dictated text the *person* typed or spoke into
- * the page; `mesa` is what the agent sends back, which is what gets spoken.
+ * the page; `naru` is what the agent sends back, which is what gets spoken.
  * The pair is the whole vocabulary — a live session is two-sided.
  */
-export type LiveRole = "user" | "mesa";
+export type LiveRole = "user" | "naru";

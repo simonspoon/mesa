@@ -460,7 +460,7 @@ ok "live status during a conversation: the live session"
 run 0 "$MESA" live say Three tasks are in progress right now.
 SAY_ID=$(jqs .id)
 [ "$(jqs .session_id)" = "$S1" ] || fail "live say: session_id"
-[ "$(jqs .role)" = "mesa" ] || fail "live say: role must be mesa"
+[ "$(jqs .role)" = "naru" ] || fail "live say: role must be naru"
 [ "$(jqs .text)" = "Three tasks are in progress right now." ] ||
   fail "live say: the trailing words are joined into the spoken text"
 [ "$(jqs .action)" = "null" ] || fail "live say: a plain reply carries no action"
@@ -502,7 +502,7 @@ run 0 "$MESA" live sidebars collapse --say "Making some room."
 [ "$(jqs .action)" = "collapse-sidebars" ] || fail "live sidebars collapse: action"
 [ "$(jqs .target)" = "null" ] || fail "live sidebars collapse: a sidebar turn carries no target"
 [ "$(jqs .text)" = "Making some room." ] || fail "live sidebars --say: spoken text"
-[ "$(jqs .role)" = "mesa" ] || fail "live sidebars: role must be mesa"
+[ "$(jqs .role)" = "naru" ] || fail "live sidebars: role must be naru"
 run 0 "$MESA" live sidebars expand
 [ "$(jqs .action)" = "expand-sidebars" ] || fail "live sidebars expand: action"
 [ "$(jqs .text)" = "" ] || fail "live sidebars with no --say: a pure action turn says nothing"
@@ -1031,7 +1031,7 @@ api 200 GET "/api/live"
 [ "$(jqb '.turns | map(.id) | length')" = "3" ] ||
   fail "GET /api/live: every turn so far (the utterance and both replies)"
 LAST=$(jqb '.turns | last | .id')
-SPEAK_TURN=$(jqb '.turns | map(select(.role == "mesa" and .text != "")) | first | .id')
+SPEAK_TURN=$(jqb '.turns | map(select(.role == "naru" and .text != "")) | first | .id')
 api 200 GET "/api/live?after=$U1"
 [ "$(jqb '.turns | map(select(.id <= '"$U1"')) | length')" = "0" ] ||
   fail "GET /api/live?after=: the cursor is exclusive"
@@ -2678,7 +2678,7 @@ run 0 "$MESA" live memory search pelican
 [ "$(jqs 'map(.kind) | sort | join(",")')" = "note,summary,turn" ] ||
   fail "search must hit the turn, the summary and the note (got $(jqs 'map(.kind)'))"
 [ "$(jqs 'map(select(.kind == "turn"))[0].ref_id')" = "$PELICAN_TURN" ] || fail "search: the turn's ref_id"
-[ "$(jqs 'map(select(.kind == "turn"))[0].role')" = "mesa" ] || fail "search: a turn carries its role"
+[ "$(jqs 'map(select(.kind == "turn"))[0].role')" = "naru" ] || fail "search: a turn carries its role"
 [ "$(jqs 'map(select(.kind == "turn"))[0].session_id')" = "$SEARCH_SESSION" ] || fail "search: session_id"
 [ "$(jqs 'map(select(.kind == "summary"))[0].ref_id')" = "$SEARCH_SESSION" ] ||
   fail "search: a summary's ref_id is its session"
@@ -3248,15 +3248,15 @@ grep -q "HANDOFF-MARKER: we were on the roadmap" "$STUB_DIR/last-prompt" ||
 for i in $(seq 2 6); do
   grep -q "^user: handoff utterance $i$" "$STUB_DIR/last-prompt" ||
     fail "the successor's prompt must carry utterance $i"
-  grep -q "^mesa: handoff reply $i$" "$STUB_DIR/last-prompt" ||
+  grep -q "^naru: handoff reply $i$" "$STUB_DIR/last-prompt" ||
     fail "the successor's prompt must carry reply $i"
 done
 ! grep -q "handoff utterance 1$" "$STUB_DIR/last-prompt" || fail "the first utterance is not among the last 10 turns"
 ! grep -q "handoff reply 1$" "$STUB_DIR/last-prompt" || fail "the first reply is not among the last 10 turns"
-[ "$(grep -c -E '^(user|mesa): ' "$STUB_DIR/last-prompt")" = "10" ] ||
-  fail "exactly the last 10 turns ride in the successor's prompt (got $(grep -c -E '^(user|mesa): ' "$STUB_DIR/last-prompt"))"
+[ "$(grep -c -E '^(user|naru): ' "$STUB_DIR/last-prompt")" = "10" ] ||
+  fail "exactly the last 10 turns ride in the successor's prompt (got $(grep -c -E '^(user|naru): ' "$STUB_DIR/last-prompt"))"
 [ "$(grep -n '^user: handoff utterance 2$' "$STUB_DIR/last-prompt" | cut -d: -f1)" -lt \
-  "$(grep -n '^mesa: handoff reply 6$' "$STUB_DIR/last-prompt" | cut -d: -f1)" ] ||
+  "$(grep -n '^naru: handoff reply 6$' "$STUB_DIR/last-prompt" | cut -d: -f1)" ] ||
   fail "the turns must stay in chronological order"
 # Block order: notebook, then the summary, then the handoff block — every
 # per-session block is appended AFTER the shared prefix, never before.
@@ -3310,7 +3310,7 @@ run 0 "$MESA" live listen --lease 2 --wait 0
 [ "$STDOUT" = "null" ] || fail "nothing else queued"
 [ ! -e "$STUB_DIR/last-stop" ] || fail "the predecessor is stopped exactly once, never re-stopped"
 run 0 "$MESA" live say --lease 2 "Picking up where we left off."
-[ "$(jqs .role)" = "mesa" ] || fail "say --lease 2 writes the turn"
+[ "$(jqs .role)" = "naru" ] || fail "say --lease 2 writes the turn"
 ok "the successor's first listen --lease 2 takes the queued utterance and stops the predecessor exactly once"
 
 # ---- (e) a lease-less person still drives ----
@@ -3435,7 +3435,7 @@ BLOCKED_NULL_AT=$(date +%s)
 run 0 "$MESA" live notice permission
 NP=$(jqs .id)
 [ "$(jqs .session_id)" = "$NS" ] || fail "notice: session_id"
-[ "$(jqs .role)" = "mesa" ] || fail "notice: role must be mesa"
+[ "$(jqs .role)" = "naru" ] || fail "notice: role must be naru"
 [ "$(jqs .notice)" = "permission" ] || fail "notice: kind (got $(jqs .notice))"
 [ "$(jqs .text)" = "The agent is blocked on a permission prompt. Check the terminal." ] ||
   fail "notice: the fixed permission text (got $(jqs .text))"
@@ -3487,7 +3487,7 @@ ok "live notice: a bad or missing kind is a usage error (exit 2, the sidebars ru
 api 200 POST "/api/live/notice" '{"kind":"permission"}'
 [ "$(jqb .id)" = "$NP2" ] || fail "one store: the API sees the CLI's notice as the existing one"
 [ "$(jqb .notice)" = "permission" ] || fail "POST /api/live/notice: notice"
-[ "$(jqb .role)" = "mesa" ] || fail "POST /api/live/notice: role"
+[ "$(jqb .role)" = "naru" ] || fail "POST /api/live/notice: role"
 [ "$(jqb .text)" = "The agent is blocked on a permission prompt. Check the terminal." ] ||
   fail "POST /api/live/notice: the fixed text"
 api 200 POST "/api/live/notice" '{"kind":"permission"}'

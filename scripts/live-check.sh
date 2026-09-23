@@ -237,7 +237,7 @@ case "\$1" in
     pwd > "$STUB_DIR/last-cwd"
     # A DISTINCT id per spawn (mesa task 1150): a handoff binds a successor to
     # the same session, and the assertions must be able to tell the two
-    # apart. The first spawn is still `deadbeef`; the rest are `deadbeef-<n>`.
+    # apart. The first spawn is still \`deadbeef\`; the rest are \`deadbeef-<n>\`.
     N=\$(( \$(cat "$STUB_DIR/spawns" 2>/dev/null || echo 0) + 1 ))
     printf '%s\n' "\$N" > "$STUB_DIR/spawns"
     if [ "\$N" -eq 1 ]; then ID=deadbeef; else ID="deadbeef-\$N"; fi
@@ -271,10 +271,10 @@ case "\$1" in
   stop)
     # The other end of the receipt: ending a conversation stops the agent it
     # was started with. Records the argv so the assertions can read back WHICH
-    # job was stopped; a `stop-fail` marker makes it the failure that must
+    # job was stopped; a \`stop-fail\` marker makes it the failure that must
     # still leave a cleanly ended session behind.
     printf '%s\n' "\$*" > "$STUB_DIR/last-stop"
-    # An `if`, not `[ … ] &&`: as the case's last command the bare test
+    # An \`if\`, not \`[ … ] &&\`: as the case's last command the bare test
     # would make every ordinary stop exit 1 (mesa task 1155 caught it).
     if [ -e "$STUB_DIR/stop-fail" ]; then echo "No job matching" >&2; exit 1; fi
     ;;
@@ -348,8 +348,8 @@ export MESA_LOKI_BIN="$STUB_DIR/loki"
 # stderr and writing nothing to stdout.
 cat > "$STUB_DIR/auris" <<EOF
 #!/usr/bin/env bash
-# The model probe (`auris --no-download --list-models`) is how mesa answers
-# GET /api/live/transcribe's `{"available": bool}`. It records nothing: a
+# The model probe (\`auris --no-download --list-models\`) is how mesa answers
+# GET /api/live/transcribe's \`{"available": bool}\`. It records nothing: a
 # probe must not clobber the argv or the stdin the transcribe assertions
 # read back.
 if [ "\$1" = "--no-download" ] && [ "\$2" = "--list-models" ]; then

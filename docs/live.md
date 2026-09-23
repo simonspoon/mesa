@@ -69,7 +69,7 @@ handed — and "Speech, reused rather than rebuilt" (below) for audio-out's:
   a separate external binary this hands a recording to and retains nothing
   of, in either direction, and a browser's own recognizer is the browser's,
   not Naru's.
-- **Naru → person is speech.** A mesa turn is synthesised by `kokoro-rs` and
+- **Naru → person is speech.** A Naru turn is synthesised by `kokoro-rs` and
   streamed back to the browser, through the same `speech::start` and the same
   browser-side player the Inbox's play button uses (`docs/inbox.md`). This
   half is unchanged since before `auris`: server to browser, synthesised on
@@ -279,7 +279,7 @@ on a kind `LiveNotice` no longer parses. It is a turn rather
 than a flag on the session for one reason: a turn is **spoken and shown
 exactly once** — `played_at`, the same run, the same stamp — which is exactly
 what a status report read aloud needs. The transcript labels it `notice`
-rather than `mesa` (`liveTurns.ts::turnLabel`, and `turnGroups` keeps it out
+rather than `Naru` (`liveTurns.ts::turnLabel`, and `turnGroups` keeps it out
 of the agent's own run on either side), and it is deliberately **not indexed
 into `live_memory_fts`**: it is not conversation content, so `mesa live
 memory search` never finds one.
@@ -1832,7 +1832,7 @@ control — **Go live**, or **Listen** when the conversation is already
 running — is the gesture that unlocks audio. The `AudioContext` is created and
 `resume()`d inside that one handler, on every press, whether or not this press
 turns out to need it: a gesture is what a phone weighs, and the element failure
-that says decoding is needed arrives long after the gesture is gone. Every mesa turn after that
+that says decoding is needed arrives long after the gesture is gone. Every Naru turn after that
 reuses the element and the clock that press unlocked, spoken **oldest first,
 one at a time**, each stamped `played` when it finishes. `played_at` only comes
 back on the *next* poll, so the page also holds the turns it has taken in
@@ -2450,7 +2450,7 @@ conversation") working with no backend change.
   turn silenced mid-sentence was in the hub's `handled` set and nowhere else —
   before 1161 Resume skipped it and the half-heard sentence was lost, still
   there to read but never finished. Removing it is the whole repair: it is the
-  oldest unplayed mesa turn by id, so it plays first and everything that landed
+  oldest unplayed Naru turn by id, so it plays first and everything that landed
   while paused follows in transcript order, navigates included, nothing skipped
   and nothing twice (`End` releases nothing, since its transcript resets
   anyway). Resume needs no new gesture, since `unlocked` was never given up. A conversation ending clears the pause,

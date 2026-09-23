@@ -302,7 +302,7 @@ notebook needed nothing.";
 pub const LIVE_SUMMARY_RECALL: usize = 1;
 
 /// What a `permission` notice says (mesa task 1157): one plain spoken
-/// sentence, since it goes through the synthesiser like any mesa turn.
+/// sentence, since it goes through the synthesiser like any Naru turn.
 pub const NOTICE_PERMISSION_TEXT: &str =
     "The agent is blocked on a permission prompt. Check the terminal.";
 
@@ -1269,7 +1269,7 @@ question is a task, not a note",
 
     /// A conversation handed off before anyone spoke is still a valid
     /// prompt: the note alone, no turn lines, nothing panicking on an empty
-    /// tail. A mesa turn with an action and no text renders as its action.
+    /// tail. A Naru turn with an action and no text renders as its action.
     #[test]
     fn handoff_prompt_with_survives_zero_turns_and_renders_actions() {
         let prompt = handoff_prompt_with(4, 2, &[], &[], "nothing said yet", &[]);

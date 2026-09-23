@@ -4095,14 +4095,14 @@ pub struct LiveTurn {
     /// only on a pure action turn, which changes the page and says nothing.
     pub text: String,
     /// What the page should *do* with this turn beside speak it. Null on every
-    /// user turn, and on a mesa turn that only speaks.
+    /// user turn, and on a Naru turn that only speaks.
     pub action: Option<LiveAction>,
     /// The `#/…` route `action: navigate` moves the browser to. Present iff
     /// the action is `navigate` — the sidebar actions take no target.
     pub target: Option<String>,
     /// Set when this turn is mesa's own report about the agent — blocked on a
     /// permission prompt, or silent too long (mesa task 1157) — rather than
-    /// something the agent said. Spoken and shown like any mesa turn, labelled
+    /// something the agent said. Spoken and shown like any Naru turn, labelled
     /// as a notice in the transcript, and never indexed into the archive.
     pub notice: Option<LiveNotice>,
     /// The Claude Code session that produced this turn, stamped from the live
@@ -4117,9 +4117,9 @@ pub struct LiveTurn {
     pub created_at: String,
     /// When the agent **consumed** this user turn (`mesa live listen`). Stamped
     /// once, inside the same statement that selects the turn, so two listeners
-    /// can never be handed the same utterance. Null on a mesa turn.
+    /// can never be handed the same utterance. Null on a Naru turn.
     pub delivered_at: Option<String>,
-    /// When the browser finished speaking this mesa turn. Stamped once and
+    /// When the browser finished speaking this Naru turn. Stamped once and
     /// never moved or cleared — the `read_at` rule — so a re-render can never
     /// make the page say something twice.
     pub played_at: Option<String>,

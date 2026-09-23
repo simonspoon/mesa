@@ -1446,7 +1446,7 @@ const LIVE_CONTEXT_FIELD_MAX: usize = 200;
 /// a garbled report is refused rather than stored, not to judge a monitor.
 const LIVE_WINDOW_EXTENT_MAX: i32 = 20000;
 
-/// Longest turn text. Bounded because a mesa turn is **spoken**: a runaway
+/// Longest turn text. Bounded because a Naru turn is **spoken**: a runaway
 /// body would wedge the synthesiser rather than say anything.
 pub const LIVE_TEXT_MAX: usize = 8192;
 
@@ -5584,7 +5584,7 @@ impl Store {
             LiveRole::Naru => {
                 if text.is_empty() && action.is_none() {
                     return Err(Error::Validation(
-                        "a mesa turn must have text or an action".into(),
+                        "a Naru turn must have text or an action".into(),
                     ));
                 }
             }
@@ -13260,7 +13260,7 @@ mod tests {
                 Some("#/inbox"),
             ),
             (
-                "a mesa turn that neither speaks nor acts",
+                "a Naru turn that neither speaks nor acts",
                 LiveRole::Naru,
                 "",
                 None,
@@ -13484,7 +13484,7 @@ mod tests {
         let second = store
             .add_live_turn(session.id, LiveRole::User, "two", None, None)
             .unwrap();
-        // A mesa turn is not something to listen for.
+        // A Naru turn is not something to listen for.
         store
             .add_live_turn(session.id, LiveRole::Naru, "hello there", None, None)
             .unwrap();
@@ -14427,7 +14427,7 @@ mod tests {
         assert_eq!(turns[1].notice, Some(LiveNotice::Permission));
     }
 
-    /// A notice is a mesa turn mesa writes about the agent (mesa task 1157):
+    /// A notice is a Naru turn mesa writes about the agent (mesa task 1157):
     /// fixed text, no action, the kind on the row, and at most one per kind
     /// per working span — a fresh `next_user_turn` span allows the next one.
     #[test]

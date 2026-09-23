@@ -18,7 +18,7 @@ export type LiveTurn = { id: number, session_id: number, role: LiveRole,
 text: string, 
 /**
  * What the page should *do* with this turn beside speak it. Null on every
- * user turn, and on a mesa turn that only speaks.
+ * user turn, and on a Naru turn that only speaks.
  */
 action: LiveAction | null, 
 /**
@@ -29,7 +29,7 @@ target: string | null,
 /**
  * Set when this turn is mesa's own report about the agent — blocked on a
  * permission prompt, or silent too long (mesa task 1157) — rather than
- * something the agent said. Spoken and shown like any mesa turn, labelled
+ * something the agent said. Spoken and shown like any Naru turn, labelled
  * as a notice in the transcript, and never indexed into the archive.
  */
 notice: LiveNotice | null, 
@@ -50,11 +50,11 @@ created_at: string,
 /**
  * When the agent **consumed** this user turn (`mesa live listen`). Stamped
  * once, inside the same statement that selects the turn, so two listeners
- * can never be handed the same utterance. Null on a mesa turn.
+ * can never be handed the same utterance. Null on a Naru turn.
  */
 delivered_at: string | null, 
 /**
- * When the browser finished speaking this mesa turn. Stamped once and
+ * When the browser finished speaking this Naru turn. Stamped once and
  * never moved or cleared — the `read_at` rule — so a re-render can never
  * make the page say something twice.
  */

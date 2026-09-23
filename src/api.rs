@@ -4332,7 +4332,7 @@ async fn claim_live_speaker(
     Ok(Json(store.claim_live_speaker(session.id, &body.client)?).into_response())
 }
 
-/// Stamps one mesa turn as spoken, answering with the turn either way. The
+/// Stamps one Naru turn as spoken, answering with the turn either way. The
 /// inbox's `read` route in every respect: idempotent, stamped only the first
 /// time and never cleared, which is what lets the page fire it as each turn
 /// finishes without tracking whether it already has.
@@ -4357,7 +4357,7 @@ async fn live_turn_played(
 /// `require_same_site_fetch` because the `<audio src>` this exists to feed
 /// carries no `Origin` for the first gate's Origin checks to judge.
 ///
-/// A turn with empty `text` is a **pure navigate** — a mesa turn is allowed to
+/// A turn with empty `text` is a **pure navigate** — a Naru turn is allowed to
 /// carry an action instead of words — and asking to speak one is `validation`,
 /// not a zero-length WAV. Silence coming back down an audio element is
 /// indistinguishable from a broken synthesiser, and the page should never have
@@ -15315,7 +15315,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         });
     }
 
-    /// A mesa turn may carry a navigate action instead of words. Asking to
+    /// A Naru turn may carry a navigate action instead of words. Asking to
     /// speak one is the page's bug, and it gets told so — silence down an
     /// audio element is indistinguishable from a dead synthesiser.
     #[tokio::test]

@@ -1822,7 +1822,7 @@ run 0 "$MESA" live stop
 # prompt — compare the flags alone, which is what this assertion is about.
 EXPECTED_SUMMARY_FLAGS="--bg
 --name
-mesa live $SUM4 summary
+naru live $SUM4 summary
 --"
 [ "$(head -4 "$STUB_DIR/last-flags")" = "$EXPECTED_SUMMARY_FLAGS" ] ||
   fail "live-summary spawn argv: expected

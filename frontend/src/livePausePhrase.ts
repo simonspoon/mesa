@@ -15,9 +15,10 @@
  *   run the checks". A trigger word inside a longer sentence is ordinary
  *   speech about pausing, waiting or holding something.
  * - **A short, fixed grammar**, not a keyword search: an optional lead-in
- *   ("mesa", "hey mesa", "okay", "ok"), exactly one trigger, an optional
- *   "please". Seven words at most after normalisation ("hey mesa hold on a
- *   second please" is the longest legal form) — a real pause phrase is never
+ *   ("mesa", "hey mesa", "naru", "hey naru", "okay", "ok"), exactly one
+ *   trigger, an optional "please". Seven words at most after normalisation
+ *   ("hey mesa hold on a second please" and "okay naru hold on a second
+ *   please" are the longest legal forms) — a real pause phrase is never
  *   longer, and the budget is what keeps a mis-lexed long sentence from ever
  *   reaching the grammar.
  * - **Punctuation and case are ignored**, since `auris` punctuates ("Hold on,
@@ -46,7 +47,18 @@ export const PAUSE_TRIGGERS: readonly string[] = [
 ]
 
 /** What may come before the trigger, and be nothing more than an address. */
-export const PAUSE_LEAD_INS: readonly string[] = ['mesa', 'hey mesa', 'okay', 'ok', 'okay mesa', 'ok mesa']
+export const PAUSE_LEAD_INS: readonly string[] = [
+  'mesa',
+  'hey mesa',
+  'okay',
+  'ok',
+  'okay mesa',
+  'ok mesa',
+  'naru',
+  'hey naru',
+  'okay naru',
+  'ok naru',
+]
 
 /** What may trail it. */
 export const PAUSE_TAILS: readonly string[] = ['please']

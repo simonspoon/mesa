@@ -59,6 +59,16 @@ describe('isPausePhrase', () => {
     expect(isPausePhrase('Okay, mesa. Hold up.')).toBe(true)
   })
 
+  it('accepts the naru lead-ins beside the mesa ones', () => {
+    expect(isPausePhrase('hey naru, hold up')).toBe(true)
+    expect(isPausePhrase('okay naru wait a second please')).toBe(true)
+    expect(isPausePhrase('Naru, pause.')).toBe(true)
+    expect(isPausePhrase('OK Naru, hold on.')).toBe(true)
+    expect(isPausePhrase('naru can you wait for the build')).toBe(false)
+    expect(isPausePhrase('naru')).toBe(false)
+    expect(isPausePhrase('hey naru')).toBe(false)
+  })
+
   it('is false for empty or punctuation-only text', () => {
     expect(isPausePhrase('')).toBe(false)
     expect(isPausePhrase('   ')).toBe(false)
@@ -105,5 +115,7 @@ describe('isPausePhrase', () => {
     expect(longest).toBeLessThanOrEqual(PAUSE_WORD_BUDGET)
     expect(isPausePhrase('hey mesa hold on a second please')).toBe(true)
     expect(isPausePhrase('hey mesa hold on a second please now')).toBe(false)
+    expect(isPausePhrase('okay naru hold on a second please')).toBe(true)
+    expect(isPausePhrase('okay naru hold on a second please now')).toBe(false)
   })
 })

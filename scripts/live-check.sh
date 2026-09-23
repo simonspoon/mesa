@@ -2845,7 +2845,8 @@ for id in "$C1" "$C2"; do
     "$STUB_DIR/last-prompt" || fail "the dream prompt must mark #$id unused (got: $(cat "$STUB_DIR/last-prompt"))"
 done
 # Crossing happens once: the next stop, both entries still candidates, spawns
-# nothing — a kept norm must not re-trigger a dream at every stop.
+# nothing — a norm the dream left in place without a `keep` must not
+# re-trigger a dream at every stop.
 rm -f "$STUB_DIR/last-argc"
 run 0 "$MESA" live start --no-agent
 [ -z "$STDERR" ] || fail "live start past the mark must retire nothing and say nothing (got: $STDERR)"
@@ -2864,9 +2865,13 @@ run 0 "$MESA" live memory keep "$C2"
 [ "$(jqs 'has("body")')" = "true" ] || fail "live memory keep prints the full record"
 KEPT_AT=$(jqs .kept_at)
 [ -n "$KEPT_AT" ] && [ "$KEPT_AT" != "null" ] || fail "live memory keep must stamp kept_at (got $STDOUT)"
+# Backdate the stamp so a second keep that re-stamped it could not pass
+# within the same second (`datetime('now')` has one-second resolution).
+command -v sqlite3 >/dev/null || fail "sqlite3 is required for the idempotent-keep case"
+sqlite3 "$MESA_DB" "UPDATE live_notebook SET kept_at='2026-01-01 00:00:00' WHERE id=$C2"
 run 0 "$MESA" live memory keep "$C2" --quiet
 [ "$(jqs 'has("body")')" = "false" ] || fail "live memory keep --quiet drops body"
-[ "$(jqs .kept_at)" = "$KEPT_AT" ] || fail "keeping a kept entry keeps the first kept_at (got $STDOUT)"
+[ "$(jqs .kept_at)" = "2026-01-01 00:00:00" ] || fail "keeping a kept entry keeps the first kept_at (got $STDOUT)"
 run 1 "$MESA" live memory keep 999999
 [ "$(jqe .error.code)" = "not_found" ] || fail "live memory keep on an unknown id: not_found"
 run 0 "$MESA" live memory show "$C1"

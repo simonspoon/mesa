@@ -6711,8 +6711,8 @@ impl Store {
         let tx = self.conn.transaction()?;
         tx.execute(
             &format!(
-                "UPDATE live_notebook SET project_id = ?2, last_used_at = {NOTEBOOK_USED_NOW} \
-                 WHERE id = ?1"
+                "UPDATE live_notebook SET project_id = ?2, last_used_at = {NOTEBOOK_USED_NOW}, \
+                 kept_at = NULL WHERE id = ?1"
             ),
             (id, project_id),
         )?;
@@ -15697,8 +15697,13 @@ mod tests {
             .add_notebook_entry(&format!("heron {}", words_of(99, "m")))
             .unwrap()
             .entry;
+        store.keep_notebook_entry(entry.id).unwrap();
         let moved = store.move_notebook_entry(entry.id, a).unwrap();
         assert_eq!(moved.entry.id, entry.id);
+        assert_eq!(
+            moved.entry.kept_at, None,
+            "a kept live entry arrives in a project notebook unkept"
+        );
         assert_eq!(moved.entry.project_id, Some(a));
         assert!(moved.entry.last_used_at.is_some());
         assert_eq!(

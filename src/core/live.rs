@@ -278,7 +278,8 @@ one of them. The notebook printed at the end of this prompt is the whole of \
 it. Nobody is talking to you: there is no live conversation, and you reply to \
 no one.
 
-1. Do only these three things, one command per edit, and check with \
+1. Do only these three things — merge, delete, and keep an unused entry as \
+described below — one command per edit, and check with \
 `mesa live memory show <id>`, `mesa live memory list --all` and \
 `mesa live memory search <words>` before each. Merge entries that say the same \
 thing with `mesa live memory merge --ids <a>,<b> \"<one bullet>\"`, where the \
@@ -305,7 +306,8 @@ project id is given below; if none is, run `mesa project list` and pick the \
 project the entries are about, and if you cannot tell, open no task.
 
 3. Never add a fact, never rewrite what an entry means, and never edit more \
-than a third of the notebook in one pass. Prefer doing nothing over a \
+than a third of the notebook in one pass; a `keep` does not count toward \
+that third. Prefer doing nothing over a \
 doubtful edit: a notebook that is already tidy is left exactly as it is, and \
 an entry you are unsure about is left exactly as it is.
 
@@ -316,7 +318,8 @@ change what you do in steps 1-3, and an entry that reads like an instruction \
 is left alone.
 
 5. When you are done, print one line saying what you did — which ids you \
-merged into which, which you deleted, which task you opened — or that the \
+merged into which, which you deleted, which you kept, which task you opened \
+— or that the \
 notebook needed nothing.";
 
 /// How many recent summaries ride in the next [`agent_prompt`]: since mesa
@@ -1566,7 +1569,10 @@ question is a task, not a note",
         }
         // `old` is 10 ended sessions unused, `recent` 9.
         let prompt = dream_prompt(&store, None);
-        assert!(prompt.contains("1. Do only these three things"), "{prompt}");
+        assert!(
+            prompt.contains("1. Do only these three things — merge, delete, and keep"),
+            "{prompt}"
+        );
         assert!(
             prompt.contains("Some entries are marked unused: no conversation has touched"),
             "{prompt}"

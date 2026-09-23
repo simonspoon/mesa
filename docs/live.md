@@ -974,8 +974,8 @@ research above warns against is the obvious one — hand the whole notebook to
 a model and ask for a tidy version — because that is exactly ACE's *context
 collapse*: a rewrite shrinks toward whatever the rewriter found salient, and
 after a few passes what is left is the rewriter's notebook, not the
-person's. So the dream pass is **not** a rewrite. It is an agent with two
-verbs, each a single guarded edit through the same `Store` path every other
+person's. So the dream pass is **not** a rewrite. It is an agent with three
+verbs (`merge`, `delete` and `keep`), each a single guarded edit through the same `Store` path every other
 notebook write takes, and it is told to prefer doing nothing.
 
 **What it may do.** Merge entries that say the same thing

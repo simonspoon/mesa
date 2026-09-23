@@ -4,7 +4,7 @@ version = "1.7.0"
 edition = "2024"
 description = "Local-first project & task management for humans and agents"
 license = "MIT"
-repository = "https://github.com/simonspoon/mesa"
+repository = "https://github.com/simonspoon/naru"
 keywords = ["task-management", "cli", "agent", "sqlite"]
 categories = ["command-line-utilities"]
 

@@ -22,7 +22,7 @@ contents here.
 scripts/build.sh      # the ONLY supported release build → target/release/naru (+ target/release/mesa, the same program)
 scripts/build.sh --verify   # same chain, types checked against the export not git — for an uncommitted tree
 scripts/install.sh    # build.sh + copy naru onto PATH, mesa a symlink to it (PREFIX=/usr/local overrides ~/.local/bin)
-scripts/release.sh <version>  # the whole release ritual: bump Cargo.toml, commit, push main, tag, push tag (--dry-run prints it); needs MESA_ALLOW_PUSH=1
+scripts/release.sh <version>  # the whole release ritual: bump Cargo.toml, commit, push main, tag, push tag (--dry-run prints it); needs NARU_ALLOW_PUSH=1 (or MESA_ALLOW_PUSH=1)
 scripts/worktree-warm.sh    # seed a fresh worktree's target/ from main's (APFS clone + mtime sync); no args warms .claude/worktrees/*, elsewhere pass the path
 ```
 

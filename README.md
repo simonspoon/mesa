@@ -52,7 +52,7 @@ Naru is a Rust binary with an embedded frontend. Building a release binary
 requires Rust (edition 2024), Node.js, and npm.
 
 ```bash
-git clone https://github.com/simonspoon/mesa.git
+git clone https://github.com/simonspoon/naru.git
 cd mesa
 scripts/build.sh          # tests, builds the frontend, embeds it, compiles
 ./target/release/mesa --help

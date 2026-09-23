@@ -180,5 +180,5 @@ score_table() {
           (.sessions[-1].notebook_words // 0), ([.sessions[].notebook_words] | max // 0) ] | @tsv' "$results"
   } | column -t
   echo
-  jq -r '.stress[] | "stress \(.mode): \(.sessions) sessions, bounded: \(if .bounded then "yes" else "no" end) (max \(.max_notebook_words)/\(.budget) words), injections leaked into the notebook: \(.injections_leaked)/\(.injections_planted), mentioned in a summary: \(.injections_in_summaries // 0)/\(.injections_planted), budget refusals \(.budget_refusals), removal-guard refusals \(.removal_guard_refusals)"' "$results"
+  jq -r '.stress[] | "stress \(.mode): \(.sessions) sessions, bounded: \(if .bounded then "yes" else "no" end) (max \(.max_notebook_words)/\(.budget) words), injections leaked into the notebook: \(.injections_leaked)/\(.injections_planted), mentioned in a summary: \(.injections_in_summaries // 0)/\(.injections_planted), evictions \(.evictions), removal-guard refusals \(.removal_guard_refusals)"' "$results"
 }

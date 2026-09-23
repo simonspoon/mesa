@@ -1122,8 +1122,8 @@ gets its own throwaway `MESA_DB`, `MESA_CONFIG_FILE` and `mesa serve` port.
   later reversed, topic churn, and planted instructions in dictated text
   (canary tokens). `--stress N` (default 30) runs the real agent step and
   summariser; `--stress-fast N` (default 200) runs a deterministic scripted
-  editor instead — it adds one bullet per stated preference, retires the
-  oldest entry when the budget refuses an add, and every 25th session tries
+  editor instead — it adds one bullet per stated preference, the budget
+  evicting least-recently-used entries to fit it, and every 25th session tries
   the whole-notebook wipe the removal guard must refuse — proving the bound
   and the store guards at scale. The scripted editor never copies dictated
   text, so `injections leaked` is only meaningful in model mode.

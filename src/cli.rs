@@ -2527,22 +2527,13 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Spawn the dream pass: an agent that tidies the notebook between conversations
-    ///
-    /// Runs the `live-dream` config template (`docs/config.md`) with
-    /// `core::live::DREAM_PROMPT` and the active notebook, in the newest
-    /// conversation's folder. The agent merges duplicates and deletes what a
-    /// newer entry supersedes, one guarded command at a time; it never adds
-    /// a fact. `conflict` while a conversation is live — a dream pass runs
-    /// only between them. With fewer than two active entries nothing is
-    /// spawned and `{"spawned": false, "reason": ...}` is printed. CLI-only,
-    /// and takes no --quiet.
     /// Move one live-notebook entry into a project's notebook; prints the moved record
     ///
     /// For a bullet that turned out to be about one project (mesa task 1333).
     /// Same id and provenance; judged against the project's budget, evicting
     /// its least-recently-used entries as an add would.
-    #[command(after_help = "EXAMPLES
+    #[command(after_help = "\
+EXAMPLES
   mesa live memory move 12 --project naru")]
     Move {
         #[arg(value_name = "ID")]
@@ -2554,6 +2545,16 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
+    /// Spawn the dream pass: an agent that tidies the notebook between conversations
+    ///
+    /// Runs the `live-dream` config template (`docs/config.md`) with
+    /// `core::live::DREAM_PROMPT` and the active notebook, in the newest
+    /// conversation's folder. The agent merges duplicates and deletes what a
+    /// newer entry supersedes, one guarded command at a time; it never adds
+    /// a fact. `conflict` while a conversation is live — a dream pass runs
+    /// only between them. With fewer than two active entries nothing is
+    /// spawned and `{"spawned": false, "reason": ...}` is printed. CLI-only,
+    /// and takes no --quiet.
     Dream,
 }
 
@@ -5957,8 +5958,9 @@ fn spawn_memory_dream(store: &Store, project_id: i64) -> Result<()> {
 /// `naru memory import`: one entry per Claude Code memory topic file
 /// (`project_memory::import_body`), through the ordinary add path so the
 /// budget evicts as it would for any add. A file whose entry is already
-/// active in the notebook — or was already taken from an earlier file in
-/// this run — is skipped, which is what makes a re-import add nothing.
+/// in the notebook, active or retired — or was already taken from an
+/// earlier file in this run — is skipped, which is what makes a re-import
+/// add nothing, even after the budget evicted some of the first import.
 fn import_memory(
     store: &mut Store,
     project_id: i64,
@@ -5995,10 +5997,20 @@ fn import_memory(
         })
         .collect();
     files.sort();
-    let mut seen: std::collections::HashSet<String> = store
-        .list_notebook_in(Some(project_id), false)?
+    // Retired entries count too: an entry an earlier import added and the
+    // budget has since evicted (or a person deleted) must not come back on
+    // a re-import — that is what keeps a re-import at the budget a no-op.
+    let mut seen: std::collections::HashMap<String, &str> = store
+        .list_notebook_in(Some(project_id), true)?
         .into_iter()
-        .map(|e| e.body)
+        .map(|e| {
+            let reason = if e.retired_at.is_some() {
+                "already in the notebook, retired"
+            } else {
+                "already in the notebook"
+            };
+            (e.body, reason)
+        })
         .collect();
     let (mut imported, mut skipped, mut evicted) = (Vec::new(), Vec::new(), Vec::new());
     for path in files {
@@ -6017,10 +6029,11 @@ fn import_memory(
             skipped.push(json!({ "file": file, "reason": "empty" }));
             continue;
         };
-        if !seen.insert(body.clone()) {
-            skipped.push(json!({ "file": file, "reason": "already in the notebook" }));
+        if let Some(reason) = seen.get(&body) {
+            skipped.push(json!({ "file": file, "reason": reason }));
             continue;
         }
+        seen.insert(body.clone(), "already in the notebook");
         if dry_run {
             imported.push(json!({ "file": file, "id": null }));
             continue;

@@ -152,10 +152,11 @@ The code is the source of truth. These are the invariants you must not break:
 - **`--quiet` prints the compact projection instead of the full object.** Opt-in,
   long form only (no `-q`, no env var, no config key, never default-on), accepted
   on every mutation and `show`/`get`/`status` across `task`, `project`,
-  `diagram` (+ `frame`, `edge`), `inbox` and `live` — and on nothing else
-  (`list`, `turns`, `deps`,
+  `diagram` (+ `frame`, `edge`), `inbox`, `live` and `memory` — and on
+  nothing else (`list`, `turns`, `deps`,
   `events`, `types`, `next`, `resolve`, `execute`, `attachment`, `cc`,
-  `backup`, `serve` reject it as an unknown argument, exit 2). The quiet shape is the record minus
+  `backup`, `serve`, and `memory`'s `list`/`search`/`context`/`dream`/`import`
+  reject it as an unknown argument, exit 2). The quiet shape is the record minus
   its unbounded free-text field(s), derived by removing named keys from the
   serialized record — never a hand-written second projection (`quiet()` in
   `src/cli.rs`, with a key-parity `#[test]` per record type so a new field on a

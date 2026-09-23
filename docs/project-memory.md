@@ -125,9 +125,9 @@ overrides; a missing folder, or a project with no `local_path` and no
 `--from`, is `not_found`). One entry per topic `*.md` file other than
 `MEMORY.md` (the index): the frontmatter `description` (else `name`), ` — `,
 then the body, whitespace collapsed, cut at a word boundary with `…` to fit
-600 characters. A file whose entry is already active in the notebook — or
-came from an earlier file in the same run — is skipped, so a re-import adds
-nothing. Entries go through the ordinary add, so the budget evicts as usual.
+600 characters. A file whose entry is already in the notebook — active or
+retired, so an entry the budget evicted is not re-added — or came from an
+earlier file in the same run is skipped, so a re-import adds nothing. Entries go through the ordinary add, so the budget evicts as usual.
 Prints `{project_id, source, imported: [{file, id}], skipped: [{file,
 reason}], evicted: [ids]}`; `--dry-run` writes nothing, prints `id: null`
 for each would-be import, and does not predict evictions.

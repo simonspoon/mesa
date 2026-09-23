@@ -3382,6 +3382,18 @@ impl Store {
             }
             tasks
         };
+        // `merged_into` (migration index 57) has no ON DELETE action, so a
+        // retired row still pointing at an entry this delete cascades — a
+        // live merge whose result was moved into the project (mesa task
+        // 1333) — would fail the whole delete. Unhook those pointers first.
+        tx.execute(
+            "WITH RECURSIVE doomed(id) AS ( \
+                 SELECT ?1 UNION SELECT p.id FROM projects p JOIN doomed d ON p.parent_id = d.id) \
+             UPDATE live_notebook SET merged_into = NULL \
+             WHERE merged_into IN ( \
+                 SELECT id FROM live_notebook WHERE project_id IN (SELECT id FROM doomed))",
+            [id],
+        )?;
         tx.execute("DELETE FROM projects WHERE id = ?1", [id])?;
         // The cascade took the subtree's project notebooks (mesa task 1333);
         // the archive index is a standalone FTS table with no FK, so its
@@ -15640,6 +15652,35 @@ mod tests {
                 .and_then(|w| store.move_notebook_entry(w.entry.id, 999)),
             Err(Error::NotFound(_))
         ));
+    }
+
+    /// A live merge whose result was moved into a project leaves retired
+    /// live rows pointing at it through `merged_into`, which has no ON DELETE
+    /// action; deleting the project must still succeed, unhooking them.
+    #[test]
+    fn deleting_a_project_holding_a_moved_merge_result_succeeds() {
+        let (mut store, _dir) = temp_store();
+        let parent = project(&mut store, "Parent");
+        let child = store
+            .create_project("Child", None, None, None, Some(parent))
+            .unwrap()
+            .id;
+        let one = store.add_notebook_entry("ibis one").unwrap().entry;
+        let two = store.add_notebook_entry("ibis two").unwrap().entry;
+        let merged = store
+            .merge_notebook_entries(&[one.id, two.id], "ibis both")
+            .unwrap()
+            .entry;
+        store.move_notebook_entry(merged.id, child).unwrap();
+        store.delete_project(parent).unwrap();
+        assert!(matches!(
+            store.get_notebook_entry(merged.id),
+            Err(Error::NotFound(_))
+        ));
+        let one = store.get_notebook_entry(one.id).unwrap();
+        assert_eq!(one.merged_into, None);
+        assert_eq!(one.retired_reason.as_deref(), Some("merged"));
+        assert_eq!(store.get_notebook_entry(two.id).unwrap().merged_into, None);
     }
 
     /// Deleting a project destroys its notebook — the subtree's too — and

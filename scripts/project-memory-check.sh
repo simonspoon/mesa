@@ -261,7 +261,25 @@ run 0 "$NARU" memory import --project "$Q" --from "$MEM" --dry-run
 [ "$(jqs '.imported | length')" = "2" ] || fail "import --from reads the named folder"
 run 1 "$NARU" memory import --project "$Q" --from "$TMP/nowhere"
 [ "$(jqe .error.code)" = "not_found" ] || fail "import from a missing folder: not_found"
-ok "memory import: MEMORY.md skipped, description + body, long file cut with …, --dry-run writes nothing, re-import idempotent, missing folder not_found"
+# At the budget: three 250-word files overflow 500 words, so the first
+# import evicts; a re-import must still add nothing (the evicted entry is
+# retired, not gone).
+BIG="$TMP/big-memory"
+mkdir -p "$BIG"
+for w in x y z; do
+  for _ in $(seq 1 250); do printf '%s ' "$w"; done >"$BIG/$w.md"
+done
+run 0 "$NARU" project create "Big" --no-git
+B=$(jqs .id)
+run 0 "$NARU" memory import --project "$B" --from "$BIG"
+[ "$(jqs '.imported | length')" = "3" ] && [ "$(jqs '.evicted | length')" = "1" ] ||
+  fail "import past the budget: three imported, one evicted (got $STDOUT)"
+run 0 "$NARU" memory import --project "$B" --from "$BIG"
+[ "$(jqs '.imported | length')" = "0" ] && [ "$(jqs '.evicted | length')" = "0" ] ||
+  fail "re-import at the budget must add nothing (got $STDOUT)"
+[ "$(jqs '[.skipped[] | select(.reason == "already in the notebook, retired")] | length')" = "1" ] ||
+  fail "re-import names the evicted entry as retired (got $STDOUT)"
+ok "memory import: MEMORY.md skipped, description + body, long file cut with …, --dry-run writes nothing, re-import idempotent (at the budget too), missing folder not_found"
 
 # ---- dream: through the live-dream template, stub claude ----
 STUB="$TMP/stub"

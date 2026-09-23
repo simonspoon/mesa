@@ -53,8 +53,8 @@ What the definition says, in short:
    cc session <id>` for detail.
 2. **Attribution is best-effort.** A session links to a task through the
    task's `owner` (the session id), else the task's receipt
-   (`docs/receipts.md`), else the project whose `local_path` equals the
-   session's `cwd`. A session it cannot attribute is **skipped**: a finding
+   (`docs/receipts.md`), else the project whose `local_path`, or any entry of
+   its `previous_paths`, equals the session's `cwd` exactly. A session it cannot attribute is **skipped**: a finding
    must name a real task it was observed on, and the agent never guesses one.
 3. **The model per step.** The per-session skim is delegated to **haiku**
    subagents through the `Agent` tool (the cheapest read; the reads are

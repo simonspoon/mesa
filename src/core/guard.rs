@@ -401,9 +401,11 @@ pub fn running_minutes(session: &CcLiveSession) -> Option<i64> {
 ///    id — the same link `docs/receipts.md` uses. This is exact: the agent
 ///    itself said so.
 /// 2. **Whose folder is it working in?** The session's `cwd` matched by
-///    **exact** equality against a project's `local_path` (the rule
-///    `cc::collect_for_project` already uses — no prefix or subdirectory
-///    matching, because a worktree is not its parent repo), then that
+///    **exact** equality against a project's `local_path` or any of its
+///    `previous_paths` (the rule `cc::collect_for_project` already uses — no
+///    prefix or subdirectory matching, because a worktree is not its parent
+///    repo; a current `local_path` outranks another project's previous one,
+///    since the folder has moved on to its new owner), then that
 ///    project's `in_progress` tasks, oldest claim first and otherwise the most
 ///    recently updated. A guess, but a narrow one, and the alert says which
 ///    session it is about so a wrong task is a wrong *filing cabinet*, not a
@@ -420,10 +422,15 @@ pub fn resolve_task(store: &Store, session: &CcLiveSession) -> Result<Option<i64
     };
     // `list_projects_all`, not `list_projects`: an archived project's runaway
     // agent is still spending money.
-    let Some(project) = store
-        .list_projects_all()?
-        .into_iter()
+    let projects = store.list_projects_all()?;
+    let Some(project) = projects
+        .iter()
         .find(|p| p.local_path.as_deref() == Some(cwd))
+        .or_else(|| {
+            projects
+                .iter()
+                .find(|p| p.previous_paths.iter().any(|path| path == cwd))
+        })
     else {
         return Ok(None);
     };
@@ -602,6 +609,66 @@ mod tests {
         // Matching is exact: a subdirectory of the project folder is not it.
         s.cwd = Some(format!("{repo}/frontend"));
         assert_eq!(resolve_task(&store, &s).unwrap(), None);
+    }
+
+    #[test]
+    fn a_cwd_matching_a_previous_path_resolves_exactly_and_below_the_current_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("test.db")).unwrap();
+        let moved = store
+            .create_project("moved", None, None, Some("/home/me/new"), None)
+            .unwrap()
+            .id;
+        store.add_project_path(moved, "/home/me/old").unwrap();
+        let task = store
+            .create_task(
+                moved,
+                "moved work",
+                crate::core::types::Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .id;
+        store.claim_task(task, "someone-else", false).unwrap();
+
+        let mut s = session(50.0, 10, 10, 10);
+        s.session_id = "unknown-session".to_string();
+
+        // A session still running in the folder the project moved away from.
+        s.cwd = Some("/home/me/old".to_string());
+        assert_eq!(resolve_task(&store, &s).unwrap(), Some(task));
+        // Exact, as for `local_path`: a subdirectory of a previous path is not it.
+        s.cwd = Some("/home/me/old/frontend".to_string());
+        assert_eq!(resolve_task(&store, &s).unwrap(), None);
+
+        // A folder that is one project's `local_path` and another's previous
+        // path belongs to its current owner.
+        let current = store
+            .create_project("current", None, None, Some("/home/me/old"), None)
+            .unwrap()
+            .id;
+        let current_task = store
+            .create_task(
+                current,
+                "current work",
+                crate::core::types::Priority::Medium,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .id;
+        store
+            .claim_task(current_task, "someone-else", false)
+            .unwrap();
+        s.cwd = Some("/home/me/old".to_string());
+        assert_eq!(resolve_task(&store, &s).unwrap(), Some(current_task));
     }
 
     #[test]

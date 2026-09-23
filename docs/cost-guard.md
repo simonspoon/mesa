@@ -185,9 +185,10 @@ all. So `core::guard::resolve_task` asks two questions and accepts "no":
    Exact, because the agent itself said so — the same link `docs/receipts.md`
    uses to attach a transcript to a receipt.
 2. **Whose folder is it working in?** The session's `cwd` matched by **exact**
-   equality against a project's `local_path` — the rule
-   `cc::collect_for_project` already uses, with no prefix or subdirectory
-   matching, because a worktree is not its parent repo. Then that project's
+   equality against a project's `local_path` or any of its `previous_paths`
+   — the rule `cc::collect_for_project` already uses, with no prefix or
+   subdirectory matching, because a worktree is not its parent repo. A
+   current `local_path` outranks another project's previous path. Then that project's
    `in_progress` tasks, oldest claim first, an unclaimed one last. A guess, but
    a narrow one: the alert names the *session*, so a wrong task is a wrong
    filing cabinet, not a wrong story.

@@ -58,7 +58,8 @@ else.
 2. Attribute each session to a task, best-effort, in this order: the task
    whose `owner` is the session id; else the task's receipt
    (`mesa task receipt <id>`, the `cc_sessions` link); else the project whose
-   `local_path` equals the session's `cwd`, then its task closed in the
+   `local_path`, or any entry of its `previous_paths`, equals the session's
+   `cwd` exactly (a subdirectory is not a match), then its task closed in the
    window. A session you cannot attribute is SKIPPED — a finding must name a
    real task it was observed on, and you never guess one.
 

@@ -4218,6 +4218,11 @@ pub struct LiveNotebookEntry {
     /// clock a project notebook evicts on. Always null in the live notebook,
     /// which measures use in sessions (`last_used_session_id`).
     pub last_used_at: Option<String>,
+    /// When a dream pass kept this entry as a standing norm (mesa task 1337,
+    /// `mesa live memory keep`); null when it was never kept. A kept entry
+    /// is not a retirement candidate, and eviction takes it only once every
+    /// unkept entry is gone. Bounded, kept by `--quiet`.
+    pub kept_at: Option<String>,
 }
 
 /// What a notebook write — `add`, `replace` or `merge`, on the CLI and over

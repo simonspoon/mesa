@@ -25,6 +25,7 @@ function entry(over: Partial<LiveNotebookEntry> = {}): LiveNotebookEntry {
     merged_into: null,
     project_id: null,
     last_used_at: null,
+    kept_at: null,
     ...over,
   }
 }

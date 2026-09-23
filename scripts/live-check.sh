@@ -130,7 +130,10 @@
 #      staying active as a retirement candidate (mesa task 1337: `live start`
 #      retires nothing and says nothing, the dream prompt marks it
 #      `, unused`, the stop at which it crosses the mark spawns a dream pass
-#      and the next stop does not), the four `/api/live/memory` routes
+#      and the next stop does not; `live memory keep` stamping `kept_at`
+#      once, idempotently, with no live session, `--quiet` dropping `body`
+#      alone, and a kept entry no longer marked `, unused`; an unknown or
+#      retired id `not_found`), the four `/api/live/memory` routes
 #      with both halves of the security boundary in default mode AND under
 #      `--lan` (the Settings posture: `require_agent_access`, reads
 #      included), and `GET /api/live` carrying no notebook (the 2s poll stays
@@ -2852,11 +2855,32 @@ run 0 "$MESA" live memory list
 [ "$(jqs 'map(.id) | join(",")')" = "$C1,$C2" ] ||
   fail "candidates stay active: both entries must still be listed (got $STDOUT)"
 [ "$(jqs 'map(.retired_at) | unique | join(",")')" = "" ] || fail "no candidate may be retired"
-# The manual dream marks them too, and a live agent's prompt never does.
+# The dream keeps a standing norm (mesa task 1337): `keep` needs no live
+# session, stamps `kept_at` once, and is idempotent.
+grep -q 'mesa live memory keep <id>' "$STUB_DIR/last-prompt" ||
+  fail "the dream prompt must tell the dreamer to run live memory keep"
+run 0 "$MESA" live memory keep "$C2"
+[ "$(jqs .id)" = "$C2" ] || fail "live memory keep: echoes the entry"
+[ "$(jqs 'has("body")')" = "true" ] || fail "live memory keep prints the full record"
+KEPT_AT=$(jqs .kept_at)
+[ -n "$KEPT_AT" ] && [ "$KEPT_AT" != "null" ] || fail "live memory keep must stamp kept_at (got $STDOUT)"
+run 0 "$MESA" live memory keep "$C2" --quiet
+[ "$(jqs 'has("body")')" = "false" ] || fail "live memory keep --quiet drops body"
+[ "$(jqs .kept_at)" = "$KEPT_AT" ] || fail "keeping a kept entry keeps the first kept_at (got $STDOUT)"
+run 1 "$MESA" live memory keep 999999
+[ "$(jqe .error.code)" = "not_found" ] || fail "live memory keep on an unknown id: not_found"
+run 0 "$MESA" live memory show "$C1"
+[ "$(jqs .kept_at)" = "null" ] || fail "an entry never kept carries kept_at null"
+# The manual dream marks the candidate that was not kept, and a kept entry
+# is no longer one; a live agent's prompt never marks anything.
 run 0 "$MESA" live memory dream
-[ "$(jqs .spawned)" = "true" ] || fail "live memory dream over two candidates must spawn (got $STDOUT)"
-[ "$(grep -c ', unused\] CAND-' "$STUB_DIR/last-prompt")" = "2" ] ||
-  fail "the manual dream prompt must mark both candidates unused"
+[ "$(jqs .spawned)" = "true" ] || fail "live memory dream over two entries must spawn (got $STDOUT)"
+[ "$(grep -c ', unused\] CAND-' "$STUB_DIR/last-prompt")" = "1" ] ||
+  fail "the manual dream prompt must mark exactly the one unkept candidate unused"
+grep -q -- "- \[#$C1, .*, unused\] CAND-A" "$STUB_DIR/last-prompt" ||
+  fail "the unkept candidate #$C1 must still be marked unused"
+! grep -q -- "- \[#$C2, .*, unused\]" "$STUB_DIR/last-prompt" ||
+  fail "the kept entry #$C2 must no longer be marked unused"
 run 0 "$MESA" live start
 ! grep -q 'unused\]' "$STUB_DIR/last-prompt" || fail "the live agent's notebook lines carry no unused mark"
 grep -q -- "- \[#$C1, added .*\] CAND-A" "$STUB_DIR/last-prompt" ||
@@ -2865,7 +2889,9 @@ run 0 "$MESA" live stop >/dev/null
 # Empty again for the API section below.
 run 0 "$MESA" live memory delete "$C1"
 run 0 "$MESA" live memory delete "$C2"
-ok "live memory candidates: an entry unused for $NB_DECAY ended sessions stays active — live start retires nothing and says nothing, the stop it crosses the mark at spawns a dream whose prompt marks it \`, unused\`, the next stop does not, and the live agent's lines carry no mark"
+run 1 "$MESA" live memory keep "$C1"
+[ "$(jqe .error.code)" = "not_found" ] || fail "live memory keep on a retired entry: not_found"
+ok "live memory candidates: an entry unused for $NB_DECAY ended sessions stays active — live start retires nothing and says nothing, the stop it crosses the mark at spawns a dream whose prompt marks it \`, unused\`, the next stop does not, and the live agent's lines carry no mark; \`keep\` stamps kept_at once (no live session, --quiet drops body alone, unknown/retired not_found) and a kept entry is no longer marked unused"
 
 # ---- the API: four routes on require_agent_access, default mode ----
 PORT=17781

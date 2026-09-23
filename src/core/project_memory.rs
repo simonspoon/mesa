@@ -319,6 +319,7 @@ mod tests {
             merged_into: None,
             project_id: Some(1),
             last_used_at: Some("2026-09-20 11:00:00.123".into()),
+            kept_at: None,
         }
     }
 

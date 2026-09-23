@@ -65,4 +65,11 @@ project_id: number | null,
  * clock a project notebook evicts on. Always null in the live notebook,
  * which measures use in sessions (`last_used_session_id`).
  */
-last_used_at: string | null, };
+last_used_at: string | null, 
+/**
+ * When a dream pass kept this entry as a standing norm (mesa task 1337,
+ * `mesa live memory keep`); null when it was never kept. A kept entry
+ * is not a retirement candidate, and eviction takes it only once every
+ * unkept entry is gone. Bounded, kept by `--quiet`.
+ */
+kept_at: string | null, };

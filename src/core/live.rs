@@ -293,7 +293,9 @@ ten conversations. For each, delete it with `mesa live memory delete <id>` if \
 it is about one project, feature, device or task, or if a newer entry \
 supersedes it. Keep it if it is a standing preference or working norm that \
 still applies whatever the project. A norm is followed without being looked \
-up, so being unused does not show that it is no longer needed.
+up, so being unused does not show that it is no longer needed. For each \
+unused entry you keep, run `mesa live memory keep <id>`, so it is no longer \
+marked unused and is the last to go when the notebook is full.
 
 2. A contradiction you cannot resolve from the entries themselves is not \
 yours to resolve. Leave both entries in place and open a task for the person \
@@ -398,10 +400,11 @@ const LIVE_DREAM_MIN_TOKENS: usize = 3;
 /// `crossed` is the ids of the retirement candidates that reached the
 /// [`LIVE_NOTEBOOK_DECAY_SESSIONS`] mark **exactly** at the conversation that
 /// just ended — only the two stop sites pass any; a handoff and `live
-/// context` pass none. Not every candidate: the dream keeps a standing norm
-/// and cannot touch it (a touch needs a live conversation), so a kept norm
-/// stays a candidate for ever, and "any candidate" would spawn a dream at
-/// every stop and rest every handoff from then on. Crossing happens once per
+/// context` pass none. Not every candidate: a candidate the dream leaves in
+/// place without running `mesa live memory keep` on it (a touch needs a live
+/// conversation, and a keep is the dream's to forget) stays a candidate for
+/// ever, and "any candidate" would spawn a dream at every stop and rest every
+/// handoff from then on. Crossing happens once per
 /// entry, so each gets one automatic decision; every later pass, whatever
 /// triggered it, still sees it marked and may revisit it. The one chance
 /// can be missed — a session ended by a failed-spawn rollback runs no
@@ -824,6 +827,7 @@ mod tests {
             merged_into: None,
             project_id: None,
             last_used_at: None,
+            kept_at: None,
         }
     }
 

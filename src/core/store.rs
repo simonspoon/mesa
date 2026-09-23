@@ -1194,6 +1194,12 @@ const MIGRATIONS: &[&str] = &[
     // Always NULL on a live row.
     "ALTER TABLE live_notebook ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE;
      ALTER TABLE live_notebook ADD COLUMN last_used_at TEXT;",
+    // Task 1337: `kept_at` is when a dream pass kept a retirement candidate
+    // as a standing norm (`mesa live memory keep`). A kept entry is no longer
+    // a candidate, and eviction takes every unkept entry before it — a norm
+    // is followed without being touched, so it is least-recently-used by
+    // construction and plain LRU would evict it first. NULL = not kept.
+    "ALTER TABLE live_notebook ADD COLUMN kept_at TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1489,7 +1495,7 @@ const LIVE_SUMMARY_LIST_MAX: i64 = 500;
 
 const LIVE_NOTEBOOK_COLUMNS: &str = "id, body, created_at, updated_at, source_session_id, \
                                       last_used_session_id, retired_at, retired_reason, \
-                                      merged_into, project_id, last_used_at";
+                                      merged_into, project_id, last_used_at, kept_at";
 
 /// The clock a project notebook entry's `last_used_at` is stamped on
 /// (mesa task 1333): `datetime('now')` plus milliseconds, so an entry
@@ -1614,6 +1620,7 @@ fn row_to_notebook_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveNotebo
         merged_into: row.get(8)?,
         project_id: row.get(9)?,
         last_used_at: row.get(10)?,
+        kept_at: row.get(11)?,
     })
 }
 
@@ -6365,8 +6372,13 @@ impl Store {
     /// `notebook_retirement_candidates` rule, so an entry never attributed to
     /// any conversation is the oldest of all); in a project notebook (mesa
     /// task 1333) it is `last_used_at`, falling back to `created_at`. Ties
-    /// are broken by id ascending — the earlier-written entry goes first. A
-    /// soft retire like every other:
+    /// are broken by id ascending — the earlier-written entry goes first.
+    /// Before any of that, an entry a dream pass **kept** as a standing norm
+    /// (`kept_at`, mesa task 1337) goes only once every unkept entry is gone,
+    /// in the same LRU order among the kept ones: a norm is followed without
+    /// being touched, so plain LRU would evict it first. Nothing keeps a
+    /// project entry, so a project notebook's order is unchanged. A soft
+    /// retire like every other:
     /// the row and its archive index entry both stay, so `search` still finds
     /// it and `restore` undoes it. It always fits: one entry is at most
     /// [`live::LIVE_NOTEBOOK_ENTRY_MAX`] characters, far under the budget in
@@ -6376,8 +6388,8 @@ impl Store {
     /// about what the budget makes room for.
     fn evict_notebook_to_fit(conn: &Connection, scope: Option<i64>, keep: i64) -> Result<Vec<i64>> {
         let order = match scope {
-            None => "COALESCE(last_used_session_id, source_session_id, 0), id",
-            Some(_) => "COALESCE(last_used_at, created_at), id",
+            None => "kept_at IS NOT NULL, COALESCE(last_used_session_id, source_session_id, 0), id",
+            Some(_) => "kept_at IS NOT NULL, COALESCE(last_used_at, created_at), id",
         };
         let mut stmt = conn.prepare(&format!(
             "SELECT id, body FROM live_notebook WHERE retired_at IS NULL AND project_id IS ?1 \
@@ -6650,6 +6662,23 @@ impl Store {
         self.get_notebook_entry(id)
     }
 
+    /// Marks one active live-notebook entry as **kept** — a retirement
+    /// candidate the dream pass decided is a standing norm (mesa task 1337,
+    /// `mesa live memory keep`). Stamps `kept_at`, which takes the entry out
+    /// of [`Self::notebook_retirement_candidates`] and to the back of the
+    /// eviction order. Needs no live session — the dream pass runs between
+    /// conversations. Keeping a kept entry is a no-op that echoes it, the
+    /// first `kept_at` standing; an unknown or retired id is `NotFound`, as
+    /// for every other notebook write.
+    pub fn keep_notebook_entry(&mut self, id: i64) -> Result<LiveNotebookEntry> {
+        self.get_active_notebook_entry_in(None, id)?;
+        self.conn.execute(
+            "UPDATE live_notebook SET kept_at = COALESCE(kept_at, datetime('now')) WHERE id = ?1",
+            [id],
+        )?;
+        self.get_notebook_entry(id)
+    }
+
     /// Marks one active entry as used: the live notebook's rule is
     /// [`Self::touch_notebook_entry`]; a project entry (mesa task 1333) needs
     /// no session and stamps `last_used_at`, the clock its eviction reads.
@@ -6791,7 +6820,9 @@ impl Store {
     /// that count. Derived on every read and read-only: nothing is stored and
     /// nothing is retired — the dream pass is told which entries are
     /// candidates and decides, deleting a one-off and keeping a standing norm,
-    /// since a norm is followed without being looked up. (Until 1337 this
+    /// since a norm is followed without being looked up. An entry it kept
+    /// (`kept_at`, [`Self::keep_notebook_entry`]) is never a candidate again,
+    /// so the dream does not re-review it at every pass. (Until 1337 this
     /// predicate retired the rows as `decayed` at every live start.) A project
     /// notebook has no candidates (mesa task 1333): it has no conversations to
     /// count.
@@ -6802,7 +6833,7 @@ impl Store {
                      WHERE id > COALESCE(last_used_session_id, source_session_id, 0) \
                        AND ended_at IS NOT NULL) AS unused \
                   FROM live_notebook \
-                 WHERE retired_at IS NULL AND project_id IS NULL) \
+                 WHERE retired_at IS NULL AND project_id IS NULL AND kept_at IS NULL) \
              WHERE unused >= ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([n], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -14001,15 +14032,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            73,
-            "a fresh db should report user_version 73"
+            74,
+            "a fresh db should report user_version 74"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 73);
+        assert_eq!(version, 74);
     }
 
     /// Pins the project-notebook columns (mesa task 1333) at index 72
@@ -14024,6 +14055,19 @@ mod tests {
                 && MIGRATIONS[PROJECT_NOTEBOOK]
                     .contains("ALTER TABLE live_notebook ADD COLUMN last_used_at"),
             "migration {PROJECT_NOTEBOOK} is no longer the project notebook migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+    }
+
+    /// Pins the notebook's `kept_at` column (mesa task 1337) at index 73
+    /// (`user_version` 74), for the reason
+    /// [`the_live_summaries_table_arrives_at_migration_49`] gives.
+    #[test]
+    fn the_notebook_kept_at_column_arrives_at_migration_73() {
+        const KEPT_AT: usize = 73;
+        assert!(
+            MIGRATIONS[KEPT_AT].contains("ALTER TABLE live_notebook ADD COLUMN kept_at"),
+            "migration {KEPT_AT} is no longer the notebook kept_at migration — a \
              shipped migration was edited or reordered, which is never allowed"
         );
     }
@@ -15869,6 +15913,152 @@ mod tests {
             let gone = store.get_notebook_entry(id).unwrap();
             assert_eq!(gone.retired_reason.as_deref(), Some("evicted"));
         }
+    }
+
+    /// mesa task 1337: an entry the dream kept goes only after every unkept
+    /// one — even when it is older than all of them — and while unkept
+    /// entries remain, plain LRU still decides among them.
+    #[test]
+    fn notebook_eviction_takes_unkept_entries_before_kept_ones() {
+        let (mut store, _dir) = temp_store();
+        // Unattributed: the oldest of all in LRU order.
+        let kept = store.add_notebook_entry(&words_of(99, "k")).unwrap().entry;
+        store.keep_notebook_entry(kept.id).unwrap();
+        ended_session(&mut store);
+        let a = store.add_notebook_entry(&words_of(99, "a")).unwrap().entry;
+        let b = store.add_notebook_entry(&words_of(99, "b")).unwrap().entry;
+        store.add_notebook_entry(&words_of(99, "c")).unwrap();
+        store.add_notebook_entry(&words_of(99, "d")).unwrap();
+        // 495 + 99 = 594: one eviction, and it is A, not the older kept row.
+        let e = store.add_notebook_entry(&words_of(99, "e")).unwrap();
+        assert_eq!(evicted_ids(&e), vec![a.id]);
+        // 495 + 99 again: B, the next unkept one in LRU order.
+        let f = store.add_notebook_entry(&words_of(99, "f")).unwrap();
+        assert_eq!(evicted_ids(&f), vec![b.id]);
+        let still = store.get_notebook_entry(kept.id).unwrap();
+        assert_eq!(still.retired_at, None);
+        assert!(still.kept_at.is_some());
+    }
+
+    /// mesa task 1337: once only kept entries remain in the eviction order,
+    /// they go in LRU order among themselves — not in the order they were
+    /// kept — and the written row is still never taken.
+    #[test]
+    fn notebook_eviction_takes_kept_entries_last_in_lru_order() {
+        let (mut store, _dir) = temp_store();
+        let k1 = store.add_notebook_entry(&words_of(150, "k")).unwrap().entry;
+        ended_session(&mut store);
+        let k2 = store.add_notebook_entry(&words_of(150, "l")).unwrap().entry;
+        ended_session(&mut store);
+        let n = store.add_notebook_entry(&words_of(150, "n")).unwrap().entry;
+        // Kept newest-used first, so the order they were kept in is the
+        // reverse of their LRU order.
+        store.keep_notebook_entry(k2.id).unwrap();
+        store.keep_notebook_entry(k1.id).unwrap();
+        // 450 + 250 = 700: N (the one unkept) → 550, then K1 (the least
+        // recently used kept) → 400. K2 survives.
+        let x = store.add_notebook_entry(&words_of(250, "x")).unwrap();
+        assert_eq!(evicted_ids(&x), vec![n.id, k1.id]);
+        assert_eq!(store.get_notebook_entry(k2.id).unwrap().retired_at, None);
+        assert_eq!(store.notebook_words(None, None).unwrap(), 400);
+    }
+
+    /// mesa task 1337: a kept entry is never a retirement candidate, however
+    /// long it goes unused, so the dream does not re-review it — and so it
+    /// never crosses the mark that triggers an automatic dream either.
+    #[test]
+    fn a_kept_notebook_entry_is_not_a_retirement_candidate() {
+        let (mut store, _dir) = temp_store();
+        ended_session(&mut store);
+        let norm = store
+            .add_notebook_entry("Prefers short replies.")
+            .unwrap()
+            .entry;
+        let one_off = store
+            .add_notebook_entry("Pelican demo on Friday.")
+            .unwrap()
+            .entry;
+        for _ in 0..3 {
+            ended_session(&mut store);
+        }
+        assert_eq!(
+            store.notebook_retirement_candidates(3).unwrap(),
+            vec![(norm.id, 3), (one_off.id, 3)]
+        );
+        store.keep_notebook_entry(norm.id).unwrap();
+        assert_eq!(
+            store.notebook_retirement_candidates(3).unwrap(),
+            vec![(one_off.id, 3)]
+        );
+        ended_session(&mut store);
+        assert_eq!(
+            store.notebook_retirement_candidates(3).unwrap(),
+            vec![(one_off.id, 4)],
+            "still excluded as the count keeps rising"
+        );
+    }
+
+    /// mesa task 1337: `keep`'s shapes — no live session needed, idempotent
+    /// (the first `kept_at` stands), unknown/retired/another notebook's id
+    /// `NotFound` — and how the other writes treat the mark: a replace keeps
+    /// it, a merge result starts unkept, a restore leaves it as it was.
+    #[test]
+    fn keeping_a_notebook_entry_is_idempotent_and_survives_the_other_writes() {
+        let (mut store, _dir) = temp_store();
+        let a = store.add_notebook_entry("alpha norm").unwrap().entry;
+        let b = store.add_notebook_entry("beta note").unwrap().entry;
+        assert_eq!(a.kept_at, None, "an added entry starts unkept");
+        let kept = store.keep_notebook_entry(a.id).unwrap();
+        assert!(kept.kept_at.is_some(), "no live session needed");
+        store
+            .conn
+            .execute(
+                "UPDATE live_notebook SET kept_at = '2026-01-01 00:00:00' WHERE id = ?1",
+                [a.id],
+            )
+            .unwrap();
+        let again = store.keep_notebook_entry(a.id).unwrap();
+        assert_eq!(again.kept_at.as_deref(), Some("2026-01-01 00:00:00"));
+
+        assert!(matches!(
+            store.keep_notebook_entry(999),
+            Err(Error::NotFound(_))
+        ));
+        let p = project(&mut store, "kept-scope");
+        let theirs = store
+            .add_notebook_entry_in(Some(p), "a project bullet")
+            .unwrap()
+            .entry;
+        assert!(matches!(
+            store.keep_notebook_entry(theirs.id),
+            Err(Error::NotFound(_))
+        ));
+
+        let replaced = store
+            .replace_notebook_entry(a.id, "alpha norm, reworded")
+            .unwrap();
+        assert_eq!(
+            replaced.entry.kept_at.as_deref(),
+            Some("2026-01-01 00:00:00"),
+            "a replace keeps the mark"
+        );
+
+        store.keep_notebook_entry(b.id).unwrap();
+        let merged = store
+            .merge_notebook_entries(&[a.id, b.id], "alpha norm and beta note")
+            .unwrap();
+        assert_eq!(merged.entry.kept_at, None, "a merge result starts unkept");
+        assert!(
+            matches!(store.keep_notebook_entry(a.id), Err(Error::NotFound(_))),
+            "a retired entry is not_found"
+        );
+
+        let back = store.restore_notebook_entry(a.id).unwrap();
+        assert_eq!(
+            back.kept_at.as_deref(),
+            Some("2026-01-01 00:00:00"),
+            "a restore leaves the mark as it was"
+        );
     }
 
     /// The removal guard holds above the floor and stands down below it.

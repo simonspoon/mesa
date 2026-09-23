@@ -2470,6 +2470,19 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
+    /// Mark one entry as kept, a standing norm the dream pass decided stays; prints the record
+    ///
+    /// The dream pass's answer to an entry marked unused (mesa task 1337):
+    /// a kept entry is no longer a retirement candidate, and at the word
+    /// budget it is evicted only after every entry that is not kept. Needs no
+    /// live session; keeping a kept entry changes nothing.
+    Keep {
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Search the archive — every turn, summary and notebook entry — as a bare JSON array
     ///
     /// Every word must match (implicit AND); quotes and operators in the
@@ -5750,6 +5763,9 @@ fn run_live_memory(store: &mut Store, cmd: LiveMemoryCmd) -> Result<()> {
         LiveMemoryCmd::Touch { id, quiet } => {
             print_notebook_entry(&store.touch_notebook_entry(id)?, quiet);
         }
+        LiveMemoryCmd::Keep { id, quiet } => {
+            print_notebook_entry(&store.keep_notebook_entry(id)?, quiet);
+        }
         LiveMemoryCmd::Search { words, limit } => {
             print_json(&store.search_live_memory(&words.join(" "), limit)?);
         }
@@ -6107,8 +6123,9 @@ fn spawn_dream_pass(
 fn spawn_live_dream_after(store: &mut Store, session: &LiveSession) {
     // Only a stop passes the entries that just crossed the unused mark (mesa
     // task 1337): each crosses once, at the end of a conversation, so each
-    // gets one automatic decision — a kept norm stays a candidate and would
-    // otherwise re-trigger at every stop and handoff.
+    // gets one automatic decision — a norm the dream left without a `keep`
+    // stays a candidate and would otherwise re-trigger at every stop and
+    // handoff.
     let reason = match store.list_notebook(false).and_then(|entries| {
         Ok(live::dream_wanted(
             &entries,
@@ -7912,6 +7929,7 @@ mod tests {
             merged_into: None,
             project_id: None,
             last_used_at: None,
+            kept_at: None,
         }
     }
 
@@ -7937,6 +7955,8 @@ mod tests {
                 // kept.
                 "project_id",
                 "last_used_at",
+                // A timestamp (mesa task 1337): bounded, kept.
+                "kept_at",
             ]),
             "LiveNotebookEntry gained/lost a field: decide whether it belongs in \
              the --quiet shape before updating this list",

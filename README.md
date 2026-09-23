@@ -43,7 +43,7 @@ opens the database directly. Your data is a file on your disk.
 ## Install
 
 ```bash
-brew install simonspoon/tap/mesa
+brew install simonspoon/tap/naru
 ```
 
 ### Build from source
@@ -53,9 +53,9 @@ requires Rust (edition 2024), Node.js, and npm.
 
 ```bash
 git clone https://github.com/simonspoon/naru.git
-cd mesa
+cd naru
 scripts/build.sh          # tests, builds the frontend, embeds it, compiles
-./target/release/mesa --help
+./target/release/naru --help
 ```
 
 `scripts/build.sh` is the only supported release build: it runs `cargo test`

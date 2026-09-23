@@ -15,16 +15,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            name: mesa-linux-amd64
+            name: naru-linux-amd64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            name: mesa-linux-arm64
+            name: naru-linux-arm64
           - target: x86_64-apple-darwin
             os: macos-latest
-            name: mesa-darwin-amd64
+            name: naru-darwin-amd64
           - target: aarch64-apple-darwin
             os: macos-latest
-            name: mesa-darwin-arm64
+            name: naru-darwin-arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -57,7 +57,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: cp target/${{ matrix.target }}/release/mesa ${{ matrix.name }}
+        run: cp target/${{ matrix.target }}/release/naru ${{ matrix.name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -98,6 +98,6 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           gh api repos/simonspoon/homebrew-tap/dispatches \
             -f event_type=update-formula \
-            -f "client_payload[tool]=mesa" \
+            -f "client_payload[tool]=naru" \
             -f "client_payload[version]=$VERSION" \
-            -f "client_payload[repo]=simonspoon/mesa"
+            -f "client_payload[repo]=simonspoon/naru"

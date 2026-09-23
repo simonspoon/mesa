@@ -115,7 +115,7 @@ else
   grep -q "^version = \"$version\"\$" Cargo.toml || fail "Cargo.toml bump did not take"
 fi
 
-# cargo check refreshes Cargo.lock's own mesa entry to the new version. It is
+# cargo check refreshes Cargo.lock's own naru entry to the new version. It is
 # not the release build (scripts/build.sh is), but it IS a hard gate: under
 # set -e a failure aborts here, leaving Cargo.toml bumped and uncommitted for
 # you to fix or revert. Never make this failure non-fatal — a release that
@@ -137,4 +137,4 @@ echo "ok: $tag pushed"
 echo "  CI (.github/workflows/release.yml) now builds the binaries, publishes the"
 echo "  GitHub release and dispatches the Homebrew tap update — nothing local to do there."
 echo "  Locally, rebuild and install the new binary:"
-echo "    scripts/build.sh && cp target/release/mesa ~/.local/bin/mesa"
+echo "    scripts/build.sh && cp target/release/naru ~/.local/bin/naru"

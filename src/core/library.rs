@@ -71,6 +71,11 @@ pub struct Builtin {
 /// task is still `in_progress` with nothing pending, or closed with
 /// background work still running — body `core::stop_guard::STOP_GUARD_HOOK`,
 /// installed by `mesa library hook enable task-stop-guard --event Stop`.
+/// `project-memory` is the third (mesa task 1333): a `SessionStart` hook that
+/// prints the session folder's project notebook into its context — body
+/// `core::project_memory::PROJECT_MEMORY_HOOK`, installed by `naru library
+/// hook enable project-memory.sh --event SessionStart --matcher
+/// 'startup|resume|clear|compact'`.
 pub const BUILTINS: &[Builtin] = &[
     Builtin {
         id: crate::core::live::LIVE_AGENT_BUILTIN,
@@ -140,6 +145,13 @@ echo \"Claude Code stopped in $(pwd)\"
         kind: LibraryKind::Hook,
         scope: LibraryScope::User,
         body: crate::core::stop_guard::STOP_GUARD_HOOK,
+    },
+    Builtin {
+        id: crate::core::project_memory::PROJECT_MEMORY_HOOK_BUILTIN,
+        name: crate::core::project_memory::PROJECT_MEMORY_HOOK_NAME,
+        kind: LibraryKind::Hook,
+        scope: LibraryScope::User,
+        body: crate::core::project_memory::PROJECT_MEMORY_HOOK,
     },
 ];
 

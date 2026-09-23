@@ -32,8 +32,8 @@ use crate::core::{
     LiveBoardKind, LiveNotebookEntry, LiveNotebookWrite, LiveNotice, LiveRole, LiveSession,
     LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch,
     Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch,
-    TaskReceipt, agents, board, cc, config, files, library, live, look, migrate, receipt, retro,
-    system,
+    TaskReceipt, agents, board, cc, config, files, git, library, live, look, migrate,
+    project_memory, receipt, retro, system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -118,6 +118,10 @@ enum Command {
     /// Run a spoken conversation with mesa (the agent side of the Live page)
     #[command(subcommand)]
     Live(LiveCmd),
+    /// Each project's own notebook — the memory agents working in it keep,
+    /// printed into every new session there by the project-memory hook
+    #[command(subcommand)]
+    Memory(MemoryCmd),
     /// Attach local files to tasks; list, inspect, fetch, and delete them
     #[command(subcommand)]
     Attachment(AttachmentCmd),
@@ -2533,7 +2537,206 @@ EXAMPLES
     /// only between them. With fewer than two active entries nothing is
     /// spawned and `{"spawned": false, "reason": ...}` is printed. CLI-only,
     /// and takes no --quiet.
+    /// Move one live-notebook entry into a project's notebook; prints the moved record
+    ///
+    /// For a bullet that turned out to be about one project (mesa task 1333).
+    /// Same id and provenance; judged against the project's budget, evicting
+    /// its least-recently-used entries as an add would.
+    #[command(after_help = "EXAMPLES
+  mesa live memory move 12 --project naru")]
+    Move {
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// The project whose notebook it moves to (id or name)
+        #[arg(long, value_name = "PROJECT")]
+        project: String,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
     Dream,
+}
+
+/// Project notebooks (mesa task 1333, `docs/project-memory.md`): each
+/// project's own memory, kept by the agents working in it and printed into
+/// every new Claude Code session there by the `project-memory.sh`
+/// SessionStart hook — the replacement for Claude Code's folder memory.
+///
+/// Every verb takes `--project <id|name>`; without it the current folder is
+/// resolved (its repo's root commit, else the nearest project `local_path`
+/// or previous path), and a folder no project holds is `not_found`. The
+/// rules are the live notebook's, per project: 600 characters an entry, a
+/// 500-word budget that evicts the least-recently-used entry, a 30% removal
+/// guard, soft retirement. An id from another notebook is `not_found`.
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// List a project's notebook as a bare JSON array, oldest first (active entries only)
+    #[command(after_help = "\
+EXAMPLES
+  naru memory list
+  naru memory list --project naru --all")]
+    List {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        /// Include retired entries (evicted, deleted, merged)
+        #[arg(long)]
+        all: bool,
+    },
+    /// Print one entry, retired or not
+    #[command(visible_alias = "get")]
+    Show {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Add one entry; prints the stored record
+    ///
+    /// One fact about the project an agent working in it will want next
+    /// time: a build or test quirk, a convention, the reason behind a
+    /// decision, a pointer to a task id. Type the text after `add` (quoting is
+    /// optional; words are joined) — put --project and --quiet BEFORE it.
+    /// Past the notebook's word budget the least-recently-used entries are
+    /// retired as `evicted` and listed in the printed `evicted` array.
+    #[command(after_help = "\
+EXAMPLES
+  naru memory add --project naru Run cargo fmt before clippy.
+  naru memory add --quiet \"scripts/build.sh refuses a dirty frontend/src/types.\"")]
+    Add {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        /// The entry text (everything after `add`); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
+        /// Print the record without its `body` instead of in full (BEFORE the text)
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Rewrite one entry in place; prints the updated record
+    ///
+    /// Keeps the id, stamps `last_used_at`. `validation` when the edit removes
+    /// more than 30% of the notebook's words (once it holds 100).
+    Replace {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// The new text (everything after ID); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
+        /// Print the record without its `body` instead of in full (BEFORE the text)
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Retire one entry (it stays searchable); echoes the retired record
+    Delete {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Mark one entry as used, so it is the last to be evicted
+    Touch {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Fold two or more entries into one new entry; prints the new record
+    ///
+    /// Every source is retired as `merged` with `merged_into` pointing at the
+    /// new row. Entries from two different notebooks are `validation`. Put
+    /// --project, --ids and --quiet BEFORE the text.
+    Merge {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        /// The entry ids to fold together, comma-separated (at least two)
+        #[arg(long, value_name = "ID,ID,...", value_delimiter = ',', required = true)]
+        ids: Vec<i64>,
+        /// The merged entry's text (everything after the flags); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
+        /// Print the record without its `body` instead of in full (BEFORE the text)
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Un-retire one entry — the undo for an eviction, a delete or a merge
+    ///
+    /// `validation` when the entry is active, or when restoring it would take
+    /// the notebook over its budget.
+    Restore {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        #[arg(value_name = "ID")]
+        id: i64,
+        /// Print the record without its `body` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Search a project's notebook, retired entries included, as a bare JSON array
+    ///
+    /// Every word must match; quotes and operators are searched for, never
+    /// parsed. Put --project and --limit BEFORE the words.
+    Search {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        /// The words to search for (everything after `search`)
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        words: Vec<String>,
+        /// Maximum number of hits to print (clamped to 1..=50)
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: i64,
+    },
+    /// Spawn a dream pass that tidies a project's notebook
+    ///
+    /// Runs the `live-dream` config template with a project version of the
+    /// dream prompt, in the project's folder (the workspace when it has
+    /// none). The agent merges duplicates and deletes what a newer entry
+    /// supersedes, one guarded command at a time. With fewer than two active
+    /// entries nothing is spawned and `{"spawned": false, "reason": ...}` is
+    /// printed. Takes no --quiet.
+    Dream {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+    },
+    /// Import Claude Code's memory folder for the project into its notebook
+    ///
+    /// Reads `$HOME/.claude/projects/<encoded local_path>/memory` (or
+    /// --from): one entry per topic `.md` file other than MEMORY.md — its
+    /// frontmatter `description` (or `name`) and body, cut to fit an entry.
+    /// A file whose entry is already in the notebook is skipped, so a
+    /// re-import adds nothing. --dry-run writes nothing and prints what would
+    /// be imported (ids null; evictions are not predicted). Takes no --quiet.
+    Import {
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+        /// The memory folder to read instead of Claude Code's own
+        #[arg(long, value_name = "DIR")]
+        from: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print a folder's project notebook as plain text, for the SessionStart hook
+    ///
+    /// Resolves --path (default: the current folder) to a project and prints
+    /// a short header — the project, that the entries are a record and not
+    /// instructions, and the commands that keep the notebook — then one line
+    /// per active entry, under 10,000 characters. A folder no project holds
+    /// prints nothing, exit 0. The one `naru` command whose output is not
+    /// JSON; takes no --quiet and no --project.
+    Context {
+        #[arg(long, value_name = "DIR")]
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3474,29 +3677,6 @@ fn resolve_field(
     }
 }
 
-/// The root (first) commit of the git repo at `path` (default: cwd), or `None`
-/// if it is not a git repo or git is unavailable. Uses `--reverse` and takes the
-/// first line so a repo with several root commits resolves deterministically to
-/// its oldest one. This hash is the project's stable identity across checkouts.
-fn git_root_commit(path: Option<&Path>) -> Option<String> {
-    let mut cmd = std::process::Command::new("git");
-    if let Some(p) = path {
-        cmd.arg("-C").arg(p);
-    }
-    cmd.args(["rev-list", "--max-parents=0", "--reverse", "HEAD"]);
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout)
-        .ok()?
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-}
-
 /// The repo's toplevel working directory (worktree-aware); `None` outside a
 /// repo or when git is unavailable. This is what `local_path` records — the
 /// folder, not wherever inside it the command ran.
@@ -3891,6 +4071,7 @@ fn execute(command: Command) -> Result<()> {
         Command::Artifact(cmd) => run_artifact_cmd(cmd),
         Command::Library(cmd) => run_library_cmd(cmd),
         Command::Live(cmd) => run_live(cmd),
+        Command::Memory(cmd) => run_memory(cmd),
         Command::Attachment(cmd) => run_attachment(cmd),
         Command::Cc(cmd) => run_cc(cmd),
         Command::Retro(cmd) => run_retro(cmd),
@@ -3954,7 +4135,7 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
                     Some(hash) => clear_if_empty(hash),
                     // --path names the project's repo, so the identity is
                     // detected there, not from whatever cwd ran the command.
-                    None => git_root_commit(path.as_deref()),
+                    None => git::root_commit(path.as_deref()),
                 }
             };
             let local_path = match &path {
@@ -3984,7 +4165,7 @@ fn run_project(cmd: ProjectCmd) -> Result<()> {
             }
         }
         ProjectCmd::Resolve { path } => {
-            let commit = git_root_commit(path.as_deref()).ok_or_else(|| {
+            let commit = git::root_commit(path.as_deref()).ok_or_else(|| {
                 Error::Validation(
                     "not a git repository (or git unavailable); cannot resolve a project".into(),
                 )
@@ -5582,7 +5763,7 @@ fn run_live_memory(store: &mut Store, cmd: LiveMemoryCmd) -> Result<()> {
     match cmd {
         LiveMemoryCmd::List { all } => print_json(&store.list_notebook(all)?),
         LiveMemoryCmd::Show { id, quiet } => {
-            print_notebook_entry(&store.get_notebook_entry(id)?, quiet);
+            print_notebook_entry(&store.get_notebook_entry_in(None, id)?, quiet);
         }
         LiveMemoryCmd::Add { text, quiet } => {
             print_notebook_write(&store.add_notebook_entry(&text.join(" "))?, quiet);
@@ -5605,8 +5786,256 @@ fn run_live_memory(store: &mut Store, cmd: LiveMemoryCmd) -> Result<()> {
         LiveMemoryCmd::Restore { id, quiet } => {
             print_notebook_entry(&store.restore_notebook_entry(id)?, quiet);
         }
+        LiveMemoryCmd::Move { id, project, quiet } => {
+            let project = resolve_project(store, &project)?;
+            print_notebook_write(&store.move_notebook_entry(id, project)?, quiet);
+        }
         LiveMemoryCmd::Dream => spawn_live_dream(store)?,
     }
+    Ok(())
+}
+
+/// `naru memory` (mesa task 1333): a project's notebook. Every verb but
+/// `context` names its project with `--project` or, failing that, by the
+/// folder it runs in ([`memory_project`]).
+fn run_memory(cmd: MemoryCmd) -> Result<()> {
+    let mut store = Store::open_default()?;
+    let store = &mut store;
+    match cmd {
+        MemoryCmd::List { project, all } => {
+            let p = memory_project(store, project.as_deref())?;
+            print_json(&store.list_notebook_in(Some(p), all)?);
+        }
+        MemoryCmd::Show { project, id, quiet } => {
+            let p = memory_project(store, project.as_deref())?;
+            print_notebook_entry(&store.get_notebook_entry_in(Some(p), id)?, quiet);
+        }
+        MemoryCmd::Add {
+            project,
+            text,
+            quiet,
+        } => {
+            let p = memory_project(store, project.as_deref())?;
+            print_notebook_write(
+                &store.add_notebook_entry_in(Some(p), &text.join(" "))?,
+                quiet,
+            );
+        }
+        MemoryCmd::Replace {
+            project,
+            id,
+            text,
+            quiet,
+        } => {
+            let p = memory_project(store, project.as_deref())?;
+            print_notebook_write(
+                &store.replace_notebook_entry_in(Some(p), id, &text.join(" "))?,
+                quiet,
+            );
+        }
+        MemoryCmd::Delete { project, id, quiet } => {
+            let p = memory_project(store, project.as_deref())?;
+            print_notebook_entry(&store.delete_notebook_entry_in(Some(p), id)?, quiet);
+        }
+        MemoryCmd::Touch { project, id, quiet } => {
+            let p = memory_project(store, project.as_deref())?;
+            print_notebook_entry(&store.touch_notebook_entry_in(Some(p), id)?, quiet);
+        }
+        MemoryCmd::Merge {
+            project,
+            ids,
+            text,
+            quiet,
+        } => {
+            let p = memory_project(store, project.as_deref())?;
+            print_notebook_write(
+                &store.merge_notebook_entries_in(Some(p), &ids, &text.join(" "))?,
+                quiet,
+            );
+        }
+        MemoryCmd::Restore { project, id, quiet } => {
+            let p = memory_project(store, project.as_deref())?;
+            print_notebook_entry(&store.restore_notebook_entry_in(Some(p), id)?, quiet);
+        }
+        MemoryCmd::Search {
+            project,
+            words,
+            limit,
+        } => {
+            let p = memory_project(store, project.as_deref())?;
+            print_json(&store.search_memory_in(Some(p), &words.join(" "), limit)?);
+        }
+        MemoryCmd::Dream { project } => {
+            let p = memory_project(store, project.as_deref())?;
+            spawn_memory_dream(store, p)?;
+        }
+        MemoryCmd::Import {
+            project,
+            from,
+            dry_run,
+        } => {
+            let p = memory_project(store, project.as_deref())?;
+            import_memory(store, p, from, dry_run)?;
+        }
+        MemoryCmd::Context { path } => {
+            let dir = match path {
+                Some(dir) => dir,
+                None => std::env::current_dir()?,
+            };
+            if let Some(project) = project_memory::resolve_project_for_path(store, &dir)? {
+                let entries = store.list_notebook_in(Some(project.id), false)?;
+                print!("{}", project_memory::context_text(&project, &entries));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The project a `naru memory` verb addresses: `--project` (an id or a name,
+/// checked to exist), else the current folder through
+/// `project_memory::resolve_project_for_path`. A folder no project holds is
+/// `not_found`, naming the folder and the flag.
+fn memory_project(store: &Store, arg: Option<&str>) -> Result<i64> {
+    if let Some(arg) = arg {
+        let id = resolve_project(store, arg)?;
+        return Ok(store.get_project(id)?.id);
+    }
+    let cwd = std::env::current_dir()?;
+    project_memory::resolve_project_for_path(store, &cwd)?
+        .map(|p| p.id)
+        .ok_or_else(|| {
+            Error::NotFound(format!(
+                "no project holds {}; pass --project <id|name>, or run from inside a \
+                 project's repo or local_path",
+                cwd.display()
+            ))
+        })
+}
+
+/// `naru memory dream`: the live dream's spawn, for one project's notebook —
+/// the same `live-dream` template through `agents::spawn_bg`, the prompt
+/// `project_memory::dream_prompt`, in the project's `local_path` when that
+/// folder exists and the workspace otherwise, with no session `{id}`. There
+/// is no live-conversation `conflict`: a project notebook is not a live
+/// prompt's input. A failed spawn is `unavailable`, as the live verb's is.
+fn spawn_memory_dream(store: &Store, project_id: i64) -> Result<()> {
+    let entries = store.list_notebook_in(Some(project_id), false)?;
+    if entries.len() < 2 {
+        let active = entries.len();
+        print_json(&serde_json::json!({
+            "spawned": false,
+            "reason": format!(
+                "the notebook holds {active} active {}; a dream pass needs at least two",
+                if active == 1 { "entry" } else { "entries" }
+            ),
+        }));
+        return Ok(());
+    }
+    let dir = store
+        .get_project(project_id)?
+        .local_path
+        .filter(|dir| Path::new(dir).is_dir())
+        .unwrap_or_else(|| config::workspace_dir().to_string_lossy().into_owned());
+    let prompt = project_memory::dream_prompt(project_id, &entries);
+    let receipt = library::prompts(store)
+        .map_err(|e| e.to_string())
+        .and_then(|prompts| {
+            agents::spawn_bg(
+                config::LIVE_DREAM,
+                &dir,
+                None,
+                Some("project memory dream"),
+                Some(&prompt),
+                &prompts,
+            )
+        })
+        .map_err(|e| Error::Unavailable(format!("could not spawn the dream pass: {e}")))?;
+    print_json(&serde_json::json!({ "spawned": true, "receipt": receipt }));
+    Ok(())
+}
+
+/// `naru memory import`: one entry per Claude Code memory topic file
+/// (`project_memory::import_body`), through the ordinary add path so the
+/// budget evicts as it would for any add. A file whose entry is already
+/// active in the notebook — or was already taken from an earlier file in
+/// this run — is skipped, which is what makes a re-import add nothing.
+fn import_memory(
+    store: &mut Store,
+    project_id: i64,
+    from: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let source = match from {
+        Some(dir) => dir,
+        None => {
+            let project = store.get_project(project_id)?;
+            let local = project.local_path.ok_or_else(|| {
+                Error::NotFound(format!(
+                    "project {project_id} has no local_path, so it has no Claude Code memory \
+                     folder; pass --from <dir>"
+                ))
+            })?;
+            let home = std::env::var("HOME")
+                .map_err(|_| Error::NotFound("HOME is not set; pass --from <dir>".into()))?;
+            project_memory::claude_memory_dir(Path::new(&home), &local)
+        }
+    };
+    if !source.is_dir() {
+        return Err(Error::NotFound(format!(
+            "no memory folder at {}",
+            source.display()
+        )));
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&source)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && p.extension().is_some_and(|x| x == "md")
+                && p.file_name().is_some_and(|n| n != "MEMORY.md")
+        })
+        .collect();
+    files.sort();
+    let mut seen: std::collections::HashSet<String> = store
+        .list_notebook_in(Some(project_id), false)?
+        .into_iter()
+        .map(|e| e.body)
+        .collect();
+    let (mut imported, mut skipped, mut evicted) = (Vec::new(), Vec::new(), Vec::new());
+    for path in files {
+        let file = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                skipped.push(json!({ "file": file, "reason": format!("unreadable: {e}") }));
+                continue;
+            }
+        };
+        let Some(body) = project_memory::import_body(&text) else {
+            skipped.push(json!({ "file": file, "reason": "empty" }));
+            continue;
+        };
+        if !seen.insert(body.clone()) {
+            skipped.push(json!({ "file": file, "reason": "already in the notebook" }));
+            continue;
+        }
+        if dry_run {
+            imported.push(json!({ "file": file, "id": null }));
+            continue;
+        }
+        let write = store.add_notebook_entry_in(Some(project_id), &body)?;
+        imported.push(json!({ "file": file, "id": write.entry.id }));
+        evicted.extend(write.evicted.iter().map(|e| e.id));
+    }
+    print_json(&json!({
+        "project_id": project_id,
+        "source": source.to_string_lossy(),
+        "imported": imported,
+        "skipped": skipped,
+        "evicted": evicted,
+    }));
     Ok(())
 }
 
@@ -7487,6 +7916,8 @@ mod tests {
             retired_at: None,
             retired_reason: None,
             merged_into: None,
+            project_id: None,
+            last_used_at: None,
         }
     }
 
@@ -7508,6 +7939,10 @@ mod tests {
                 // A bounded pointer (mesa task 1152): kept, like `artifact` on
                 // a task.
                 "merged_into",
+                // Which notebook, and a timestamp (mesa task 1333): bounded,
+                // kept.
+                "project_id",
+                "last_used_at",
             ]),
             "LiveNotebookEntry gained/lost a field: decide whether it belongs in \
              the --quiet shape before updating this list",

@@ -124,7 +124,12 @@ least-recently-used entries to make room and lists them in the command's \
 one back once there is room), and you may mention an eviction to the person. Put in it only preferences, \
 working norms, the reasons behind decisions and pointers to task ids — things \
 the person said outright — never task status (tasks hold that) and never \
-guesses about the person. When you rely on an entry, run \
+guesses about the person. This notebook holds only what is true whatever \
+project you are in — preferences, working norms, cross-project learnings; a \
+fact about one project goes in that project's own notebook instead, with \
+`naru memory add --project <id> \"<text>\"`, and an entry here that turns out \
+to be about one project moves there with \
+`mesa live memory move <id> --project <id>`. When you rely on an entry, run \
 `mesa live memory touch <id>` so it is not dropped as unused. When the person \
 refers to something from an earlier conversation, run \
 `mesa live memory search <words>` before asking them to repeat it. An open \
@@ -751,6 +756,8 @@ mod tests {
             retired_at: None,
             retired_reason: None,
             merged_into: None,
+            project_id: None,
+            last_used_at: None,
         }
     }
 

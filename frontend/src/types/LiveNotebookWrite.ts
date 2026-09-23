@@ -37,4 +37,16 @@ retired_reason: string | null,
  * (`Store::merge_notebook_entries`); null otherwise. Bounded, so it
  * stays in the `--quiet` shape.
  */
-merged_into: number | null, };
+merged_into: number | null, 
+/**
+ * The project whose notebook this is (mesa task 1333, `naru memory`);
+ * null for the live, project-agnostic notebook. Bounded, kept by
+ * `--quiet`.
+ */
+project_id: number | null, 
+/**
+ * When a project entry was last touched, replaced or moved in — the
+ * clock a project notebook evicts on. Always null in the live notebook,
+ * which measures use in sessions (`last_used_session_id`).
+ */
+last_used_at: string | null, };

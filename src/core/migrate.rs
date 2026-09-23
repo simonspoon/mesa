@@ -323,28 +323,6 @@ fn find_repos(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The root (first) commit of the repo at `path` — the same
-/// `git rev-list --max-parents=0 --reverse HEAD`, first line, that
-/// `project create` binds — or `None` when git cannot say.
-fn git_root_commit(path: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["rev-list", "--max-parents=0", "--reverse", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout)
-        .ok()?
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-}
-
 /// Every absolute path a settings file names in its string values: tokens
 /// split on whitespace and quotes that begin with `/`, `~/` or `$HOME/`
 /// (the latter two expanded onto `home`) and have at least two components,
@@ -814,7 +792,12 @@ fn detect_relocation(
     find_repos(home, 6, &mut repos);
     let found: Vec<(String, String)> = repos
         .iter()
-        .filter_map(|r| Some((r.to_string_lossy().into_owned(), git_root_commit(r)?)))
+        .filter_map(|r| {
+            Some((
+                r.to_string_lossy().into_owned(),
+                crate::core::git::root_commit(Some(r))?,
+            ))
+        })
         .collect();
     let pairs: Vec<(String, String)> = under
         .iter()

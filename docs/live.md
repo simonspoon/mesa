@@ -712,6 +712,17 @@ mesa task 1152 `merged_into` (migration index 57 — for a `merged` row, the
 entry it was folded into; "Dreaming" below). A ts-exported
 `LiveNotebookEntry`, since the Settings page reads and edits it.
 
+**Project notebooks share this table** (mesa task 1333,
+`docs/project-memory.md`): a row with a `project_id` is that project's
+notebook — `naru memory`, printed into Claude Code sessions by the
+`project-memory.sh` SessionStart hook — and `project_id IS NULL` is the live
+notebook this section describes, whose every read, guard, budget, eviction,
+decay, prompt, dream, merge and search is scoped to it and behaves exactly as
+before. Since the same task rule 9 keeps only project-agnostic memory here
+(preferences, working norms, cross-project learnings) and sends a fact about
+one project to that project's notebook; `mesa live memory move <id>
+--project <p>` files an existing entry across.
+
 **Retiring is a soft delete.** The row stays, its archive index row stays,
 and it drops out of the prompt and the default `list`. That is what "stays in
 the archive" means mechanically: a bullet somebody wrote is still something an

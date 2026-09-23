@@ -4208,6 +4208,15 @@ pub struct LiveNotebookEntry {
     /// stays in the `--quiet` shape.
     #[ts(type = "number | null")]
     pub merged_into: Option<i64>,
+    /// The project whose notebook this is (mesa task 1333, `naru memory`);
+    /// null for the live, project-agnostic notebook. Bounded, kept by
+    /// `--quiet`.
+    #[ts(type = "number | null")]
+    pub project_id: Option<i64>,
+    /// When a project entry was last touched, replaced or moved in — the
+    /// clock a project notebook evicts on. Always null in the live notebook,
+    /// which measures use in sessions (`last_used_session_id`).
+    pub last_used_at: Option<String>,
 }
 
 /// What a notebook write — `add`, `replace` or `merge`, on the CLI and over

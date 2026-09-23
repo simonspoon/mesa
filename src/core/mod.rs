@@ -14,6 +14,7 @@ pub mod listen;
 pub mod live;
 pub mod look;
 pub mod migrate;
+pub mod project_memory;
 pub mod receipt;
 pub mod retro;
 

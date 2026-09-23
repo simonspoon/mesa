@@ -21,6 +21,31 @@ const DIFF_CAP: usize = 256 * 1024;
 /// (same order-of-magnitude judgement as DIFF_CAP).
 const LOG_CAP: usize = 100;
 
+/// The root (first) commit of the git repo at `path` (default: cwd), or `None`
+/// if it is not a git repo or git is unavailable. Uses `--reverse` and takes the
+/// first line so a repo with several root commits resolves deterministically to
+/// its oldest one. This hash is the project's stable identity across checkouts
+/// — what `project create` binds, `project resolve` and `mesa migrate` look up,
+/// and the first thing the project-memory resolver asks (mesa task 1333).
+pub fn root_commit(path: Option<&std::path::Path>) -> Option<String> {
+    let mut cmd = Command::new("git");
+    if let Some(p) = path {
+        cmd.arg("-C").arg(p);
+    }
+    cmd.args(["rev-list", "--max-parents=0", "--reverse", "HEAD"]);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout)
+        .ok()?
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 /// Reads the working-tree status of the repo at `dir`, or `None` when `dir`
 /// is not a git repo / git is unavailable.
 pub fn status_of(dir: &str) -> Option<GitStatus> {

@@ -23,6 +23,8 @@ function entry(over: Partial<LiveNotebookEntry> = {}): LiveNotebookEntry {
     retired_at: null,
     retired_reason: null,
     merged_into: null,
+    project_id: null,
+    last_used_at: null,
     ...over,
   }
 }

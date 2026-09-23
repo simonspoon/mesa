@@ -17,7 +17,7 @@ persona's model and tools, and the `/inbox-triage` phrase the old default
 spawned was never registered anywhere — it was a plugin skill matched by
 name, and the library prompt that shared its name was an orphan nothing
 invoked, with rules that had drifted from the skill's. An agent definition
-carries its own model (triage is cheap — `sonnet`), its own tool list with
+carries its own model (`opus` at medium effort), its own tool list with
 **no `Edit`/`Write`/`NotebookEdit`** so a triage can never touch project
 code, and lives in the library as one source of truth synced to
 `.claude/agents/inbox-triage.md`.

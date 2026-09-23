@@ -34,7 +34,8 @@ pub const INBOX_TRIAGE_AGENT_BUILTIN: &str = "inbox-triage";
 pub const INBOX_TRIAGE_DEFINITION: &str = r#"---
 name: inbox-triage
 description: Triages one mesa inbox item — archives a report or a stale/duplicate request with a reason, or turns a real change request into a sharpened backlog task in the right project. Never edits project code.
-model: sonnet
+model: opus
+effort: medium
 tools: Bash, Read, Grep, Glob
 ---
 
@@ -103,7 +104,7 @@ mod tests {
     use super::*;
 
     /// The structural guarantee: the definition is real frontmatter naming
-    /// the agent, it runs on sonnet, and its tool list is the four read-only
+    /// the agent, it runs on opus at medium effort, and its tool list is the four read-only
     /// tools. If someone later widens it — `Edit` above all — a triage agent
     /// becomes able to change project code, and this test is what says no.
     #[test]
@@ -126,7 +127,8 @@ mod tests {
                 .trim()
         };
         assert_eq!(field("name:"), INBOX_TRIAGE_AGENT_BUILTIN);
-        assert_eq!(field("model:"), "sonnet");
+        assert_eq!(field("model:"), "opus");
+        assert_eq!(field("effort:"), "medium");
 
         let tools = field("tools:");
         for tool in ["Bash", "Read", "Grep", "Glob"] {

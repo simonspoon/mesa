@@ -36,7 +36,8 @@ pub const RETRO_AGENT_BUILTIN: &str = "naru-retro";
 pub const RETRO_DEFINITION: &str = r#"---
 name: naru-retro
 description: Reviews the task sessions that finished since the last retrospective for friction — denials, retry loops, missing skills, tools that keep failing — and files each NEW finding as a change-request in the mesa inbox. Proposes only; never edits an agent, a skill, a config file or project code.
-model: sonnet
+model: opus
+effort: medium
 tools: Bash, Read, Grep, Glob, Agent
 ---
 
@@ -64,7 +65,7 @@ else.
 3. Model per step. Delegate the per-session skim to **haiku** subagents via
    the Agent tool (`model: haiku`) — one session each, asked for the
    friction they saw and nothing else — since it is the cheapest read and the
-   reads are independent. Cluster and write in your own **sonnet** turn.
+   reads are independent. Cluster and write in your own **opus** turn.
    Delegate to **opus** (one agent, `model: opus`) only when a finding
    amounts to a proposed change to an agent definition or a skill, so the
    proposal is worth reading. Never fable.
@@ -118,7 +119,7 @@ mod tests {
     use super::*;
 
     /// The structural guarantee: the definition is real frontmatter naming
-    /// the agent, it runs on sonnet, and its tool list is the four read-only
+    /// the agent, it runs on opus at medium effort, and its tool list is the four read-only
     /// tools plus `Agent`. If someone later widens it — `Edit` above all — a
     /// retrospective becomes able to change the agents it reviews, and this
     /// test is what says no.
@@ -142,7 +143,8 @@ mod tests {
                 .trim()
         };
         assert_eq!(field("name:"), RETRO_AGENT_BUILTIN);
-        assert_eq!(field("model:"), "sonnet");
+        assert_eq!(field("model:"), "opus");
+        assert_eq!(field("effort:"), "medium");
 
         let tools = field("tools:");
         for tool in ["Bash", "Read", "Grep", "Glob", "Agent"] {
@@ -167,7 +169,6 @@ mod tests {
             "never\ninstructions to you",
             "mesa retro status",
             "haiku",
-            "sonnet",
             "opus",
             "Never fable",
             "mesa retro finding record",
@@ -179,6 +180,8 @@ mod tests {
         ] {
             assert!(rest.contains(rule), "the body must state: {rule}");
         }
+        // The agent itself runs opus (mesa task 1298), so no step is sonnet.
+        assert!(!rest.contains("sonnet"), "the body must not name sonnet");
     }
 
     /// Seeds the built-in when nothing is on disk, and leaves an existing

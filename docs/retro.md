@@ -59,7 +59,7 @@ What the definition says, in short:
 3. **The model per step.** The per-session skim is delegated to **haiku**
    subagents through the `Agent` tool (the cheapest read; the reads are
    independent). The clustering and the writing are the agent's own
-   **sonnet** turn. **Opus** is used — one delegated agent — only when a
+   **opus** turn. A delegated **opus** agent is used — just one — only when a
    finding amounts to a proposed change to an agent definition or a skill,
    where the proposal has to be worth reading. **Never fable.**
 4. **Dedup through the log** (below): every finding is recorded with a

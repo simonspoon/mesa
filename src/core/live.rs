@@ -191,15 +191,16 @@ pub const AGENT_PROMPT: &str = agent_loop!();
 /// open; `Agent` because rule 12 (mesa task 1156) delegates long jobs off
 /// the voice — a fork or a specialized agent — so the person never talks to
 /// a busy agent; the frontmatter `model`
-/// is honoured over any `--model` on the command line. The `effort` came
-/// across from the hand-edited fork this definition retired (mesa task
-/// 1273) — the reasoning effort the person tuned for the voice.
+/// is honoured over any `--model` on the command line. It is opus at
+/// medium effort (mesa task 1298), the pairing all three built-in agent
+/// definitions share; the `effort` first came across from the hand-edited
+/// fork this definition retired (mesa task 1273).
 pub const AGENT_DEFINITION: &str = concat!(
     "---\n",
     "name: naru-live\n",
     "description: The voice of mesa in a live conversation — drives one live \
 session through the listen/say loop\n",
-    "model: fable\n",
+    "model: opus\n",
     "effort: medium\n",
     "tools: Bash, Read, Agent\n",
     "---\n\n",

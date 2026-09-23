@@ -705,7 +705,9 @@ up (see "The CLI surface" below).
 `id`, `body`, `created_at`, `updated_at`, `source_session_id`,
 `last_used_session_id` (both `REFERENCES live_sessions ON DELETE SET NULL` —
 an entry outlives the conversation that wrote it), `retired_at`,
-`retired_reason` (`decayed` | `deleted` | `replaced` | `merged`), and since
+`retired_reason` (`decayed` | `evicted` | `deleted` | `replaced` | `merged`
+— `evicted` since mesa task 1331, a plain string with no CHECK, so no
+migration), and since
 mesa task 1152 `merged_into` (migration index 57 — for a `merged` row, the
 entry it was folded into; "Dreaming" below). A ts-exported
 `LiveNotebookEntry`, since the Settings page reads and edits it.
@@ -743,9 +745,6 @@ store, the CLI and the Settings page's meter all share.
 **The guards**, every one `validation` (exit 1 / 422) with a message naming
 the numbers, judged in `Store` on the notebook the write *would leave*:
 
-- an add or replace that would take the active notebook over the budget
-  ("the notebook would hold 505 words, over its 500-word budget; replace or
-  delete an entry first");
 - a body that is empty or over the entry max;
 - a replace or delete that removes more than 30% of the active notebook's
   words **once it holds at least 100** ("this edit would remove 99 of the
@@ -754,6 +753,32 @@ the numbers, judged in `Store` on the notebook the write *would leave*:
   three bullets could never lose one. The rule exists because "edit one item
   at a time" is worth more as a store rule than as a request: it is the one
   thing that makes context collapse impossible in a single command.
+
+**The budget evicts rather than refuses** (mesa task 1331). An add, replace
+or merge that would take the active notebook past the 500 words still
+succeeds: in the **same transaction** as the write, `Store` retires the
+least-recently-used active entries as **`evicted`**, one at a time, until the
+notebook fits again (`Store::evict_notebook_to_fit`). "Least recently used"
+is `last_used_session_id` ascending, falling back to `source_session_id`, and
+to "oldest of all" when both are null (an entry written before any
+conversation existed) — the same `COALESCE` decay counts from — with ties
+broken by **id ascending**, so the earlier-written entry goes first. The row
+being written (the new entry, the replaced one, the merged one) is never
+evicted, and since one entry is at most 600 characters it always fits on its
+own. An eviction is a soft retire exactly like decay: the row and its archive
+index entry stay, `search` still finds it and `restore` brings it back. It is
+**not** judged by the removal rule — that rule is about the edit the caller
+asked for, and is checked before the write on the caller's own edit alone;
+what the budget makes room for is not the agent hollowing the notebook out.
+The command answers a `LiveNotebookWrite`: the written entry's keys **as
+before, at the top level**, plus an `evicted` array of the full retired
+records, least recently used first, `[]` when nothing went — on the CLI
+(`add`/`replace`/`merge`) and over `POST`/`PATCH /api/live/memory`
+alike. Under `--quiet` the key set holds and every member drops `body`, the
+composite rule. A **restore** does not evict: one that would pass the budget
+is still `validation` ("the notebook would hold 505 words, over its 500-word
+budget; replace or delete an entry first"), since un-retiring one row should
+not silently retire another.
 
 **Decay** (`Store::retire_decayed_notebook(n)`) retires, as `decayed`, every
 active entry whose count of *ended* sessions with an id above its last use
@@ -935,11 +960,11 @@ is retired as **`merged`** — a fourth `retired_reason`, beside `decayed`,
 (migration index 57) pointing at the row that replaced it, and the new row
 is inserted with the **earliest-created** source's `source_session_id`, so
 provenance survives the fold, `last_used_session_id` stamped and the archive
-indexed as an add is. Both guards are judged on the notebook the merge would
-leave: the budget on `active − merged + new` words, and the removal rule on
-the **net** words removed (once the notebook holds the floor), so folding
-three bullets into one can hollow the notebook out no more than a delete
-could. `list --all` therefore shows what became what, which is the
+indexed as an add is. The removal rule is judged on the **net** words the
+merge would remove (once the notebook holds the floor), so folding three
+bullets into one can hollow the notebook out no more than a delete could; a
+result past the budget (`active − merged + new` words) evicts as an add does,
+never the merged row, and the sources retire as `merged`, not `evicted`. `list --all` therefore shows what became what, which is the
 "reviewable" half of the task's rule.
 
 **Restore is the undo** (`Store::restore_notebook_entry`,
@@ -2885,8 +2910,10 @@ summary riding along, and that the archive is append-only (a summary for a
 session older than 25 already-summarised ones lands and every earlier row
 survives); section 14 runs the `mesa live memory` round trip with its
 `--quiet` key set, `touch` refused with no live session, every guard by its
-numbers (the entry bound, the budget, the 30% removal rule above the
-100-word floor and any edit below it), a retired row surviving in `list
+numbers (the entry bound, the 30% removal rule above the 100-word floor and
+any edit below it), the budget evicting the least-recently-used entries on an
+add, a replace and a merge (mesa task 1331: `evicted` in the JSON, the row
+retired as `evicted`, still found by `search`), a retired row surviving in `list
 --all` and in `search`, `search` hitting a turn, a summary and a note by kind
 with a query full of quotes and operators, decay retiring every entry unused
 for N ended sessions at the next `live start`, and the four

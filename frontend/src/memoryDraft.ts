@@ -54,7 +54,7 @@ export function metaLine(entry: LiveNotebookEntry): string {
 }
 
 /** Whether a typed body is worth sending: non-blank and within the entry
- *  length. The budget and the removal guard are the server's — a 422 comes
+ *  length. The removal guard is the server's — a 422 comes
  *  back inline. */
 export function isSendable(body: string): boolean {
   const trimmed = body.trim()

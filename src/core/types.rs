@@ -4168,7 +4168,9 @@ pub struct LiveSummary {
 /// archive, `Store::search_live_memory`) with `retired_at`/`retired_reason`
 /// stamped, and drops out of the prompt and the default list. `decayed` is the
 /// automatic kind — an entry no conversation has used for
-/// `live::LIVE_NOTEBOOK_DECAY_SESSIONS` ended sessions — `deleted` an explicit
+/// `live::LIVE_NOTEBOOK_DECAY_SESSIONS` ended sessions — `evicted` the other
+/// automatic one (mesa task 1331: the least-recently-used entry an add,
+/// replace or merge pushed past the word budget), `deleted` an explicit
 /// one, `merged` a source folded into another row by a dream pass (mesa task
 /// 1152, `merged_into` naming the row that replaced it), and `replaced` is
 /// reserved for a future rewrite-as-new-row path (a replace today updates the
@@ -4198,14 +4200,29 @@ pub struct LiveNotebookEntry {
     #[ts(type = "number | null")]
     pub last_used_session_id: Option<i64>,
     pub retired_at: Option<String>,
-    /// `decayed` | `deleted` | `replaced` | `merged`, null while the entry is
-    /// active.
+    /// `decayed` | `evicted` | `deleted` | `replaced` | `merged`, null while
+    /// the entry is active.
     pub retired_reason: Option<String>,
     /// For a `merged` retirement, the entry this one was folded into
     /// (`Store::merge_notebook_entries`); null otherwise. Bounded, so it
     /// stays in the `--quiet` shape.
     #[ts(type = "number | null")]
     pub merged_into: Option<i64>,
+}
+
+/// What a notebook write — `add`, `replace` or `merge`, on the CLI and over
+/// `POST`/`PATCH /api/live/memory` — answers (mesa task 1331): the entry
+/// written, **flattened**, so every key a plain [`LiveNotebookEntry`] carries
+/// stays at the top level where callers already read it, plus `evicted` —
+/// the entries the write retired as `evicted` to bring the notebook back
+/// within its word budget, least recently used first, each the full retired
+/// record. Empty when the write fitted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct LiveNotebookWrite {
+    #[serde(flatten)]
+    pub entry: LiveNotebookEntry,
+    pub evicted: Vec<LiveNotebookEntry>,
 }
 
 /// One match from `mesa live memory search` (mesa task 1147): a row of the

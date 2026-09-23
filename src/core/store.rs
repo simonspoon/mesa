@@ -12,10 +12,10 @@ use super::types::{
     DiagramView, DiffStat, EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit,
     InboxItem, InboxKind, LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction,
     LiveBoard, LiveBoardKind, LiveBoardSummary, LiveContext, LiveMemoryHit, LiveNotebookEntry,
-    LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority,
-    Project, RetroFinding, RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind,
-    ScriptRunRecord, ScriptRunStatus, Status, Task, TaskEvent, TaskReceipt, Waypoint,
-    is_valid_artifact_content_type, task_name,
+    LiveNotebookWrite, LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn,
+    LiveWindow, Priority, Project, RetroFinding, RetroRun, RetroStatus, Script, ScriptArg,
+    ScriptArgKind, ScriptRunRecord, ScriptRunStatus, Status, Task, TaskEvent, TaskReceipt,
+    Waypoint, is_valid_artifact_content_type, task_name,
 };
 
 #[derive(Debug)]
@@ -6233,67 +6233,126 @@ impl Store {
     }
 
     /// Adds one notebook entry, attributed to [`Self::notebook_session`].
-    /// `validation` when the active notebook would exceed its word budget —
-    /// the notebook rides in every live prompt, so it is bounded here rather
-    /// than trimmed later.
-    pub fn add_notebook_entry(&mut self, body: &str) -> Result<LiveNotebookEntry> {
+    /// The notebook rides in every live prompt, so it is bounded here rather
+    /// than trimmed later — but at the word budget the write is not refused
+    /// (mesa task 1331): in the same transaction the least-recently-used
+    /// entries are retired as `evicted` until it fits again
+    /// ([`Self::evict_notebook_to_fit`]), and answered beside the new row.
+    pub fn add_notebook_entry(&mut self, body: &str) -> Result<LiveNotebookWrite> {
         let body = Self::validate_notebook_body(body)?;
-        let after = self.notebook_words(None)? + live::word_count(body);
-        if live::over_budget(after) {
-            return Err(Error::Validation(live::budget_message(after)));
-        }
         let session = self.notebook_session()?;
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "INSERT INTO live_notebook (body, created_at, updated_at, source_session_id, \
                                         last_used_session_id) \
              VALUES (?1, datetime('now'), datetime('now'), ?2, ?2)",
             (body, session),
         )?;
-        let id = self.conn.last_insert_rowid();
-        self.conn.execute(
+        let id = tx.last_insert_rowid();
+        tx.execute(
             "INSERT INTO live_memory_fts (kind, ref_id, session_id, text) \
              VALUES ('note', ?1, ?2, ?3)",
             (id, session, body),
         )?;
-        self.get_notebook_entry(id)
+        let evicted = Self::evict_notebook_to_fit(&tx, id)?;
+        tx.commit()?;
+        self.notebook_write(id, &evicted)
+    }
+
+    /// Retires, as `evicted`, the least-recently-used **active** entries
+    /// until the active notebook is back within
+    /// [`live::LIVE_NOTEBOOK_BUDGET_WORDS`] (mesa task 1331), never `keep` —
+    /// the row the calling write just wrote. Answers the evicted ids, oldest
+    /// used first. "Least recently used" is `last_used_session_id`
+    /// ascending, falling back to `source_session_id` and then to 0 when
+    /// both are null (the `retire_decayed_notebook` rule, so an entry never
+    /// attributed to any conversation is the oldest of all), ties broken by
+    /// id ascending — the earlier-written entry goes first. A soft retire
+    /// exactly like decay: the row and its archive index entry both stay, so
+    /// `search` still finds it and `restore` undoes it. It always fits: one
+    /// entry is at most [`live::LIVE_NOTEBOOK_ENTRY_MAX`] characters, far
+    /// under the budget in words. Runs inside the write's own transaction,
+    /// after the removal guard has judged the write, so an eviction is never
+    /// counted against that guard — the guard is about the edit the caller
+    /// asked for, not about what the budget makes room for.
+    fn evict_notebook_to_fit(conn: &Connection, keep: i64) -> Result<Vec<i64>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, body FROM live_notebook WHERE retired_at IS NULL \
+             ORDER BY COALESCE(last_used_session_id, source_session_id, 0), id",
+        )?;
+        let active = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut words: usize = active.iter().map(|(_, b)| live::word_count(b)).sum();
+        let mut evicted = Vec::new();
+        for (id, body) in &active {
+            if !live::over_budget(words) {
+                break;
+            }
+            if *id == keep {
+                continue;
+            }
+            conn.execute(
+                "UPDATE live_notebook SET retired_at = datetime('now'), \
+                    retired_reason = 'evicted' \
+                 WHERE id = ?1 AND retired_at IS NULL",
+                [id],
+            )?;
+            words -= live::word_count(body);
+            evicted.push(*id);
+        }
+        Ok(evicted)
+    }
+
+    /// A notebook write's answer: the row written plus what it evicted.
+    fn notebook_write(&self, id: i64, evicted: &[i64]) -> Result<LiveNotebookWrite> {
+        Ok(LiveNotebookWrite {
+            entry: self.get_notebook_entry(id)?,
+            evicted: evicted
+                .iter()
+                .map(|&e| self.get_notebook_entry(e))
+                .collect::<Result<Vec<_>>>()?,
+        })
     }
 
     /// Rewrites one active entry in place — same id, same `created_at`, same
     /// `source_session_id`, so its provenance survives the edit — stamping
-    /// `updated_at` and `last_used_session_id`. Two `validation` guards: the
-    /// resulting notebook must fit the budget, and the edit may not remove
-    /// more than [`live::LIVE_NOTEBOOK_EDIT_MAX_REMOVAL`] of the notebook's
-    /// words once it holds [`live::LIVE_NOTEBOOK_EDIT_FLOOR_WORDS`] — the
-    /// rule that stops one command from hollowing the notebook out.
-    pub fn replace_notebook_entry(&mut self, id: i64, body: &str) -> Result<LiveNotebookEntry> {
+    /// `updated_at` and `last_used_session_id`. One `validation` guard: the
+    /// edit may not remove more than [`live::LIVE_NOTEBOOK_EDIT_MAX_REMOVAL`]
+    /// of the notebook's words once it holds
+    /// [`live::LIVE_NOTEBOOK_EDIT_FLOOR_WORDS`] — the rule that stops one
+    /// command from hollowing the notebook out. A result past the word
+    /// budget evicts, as an add does (mesa task 1331), never this entry.
+    pub fn replace_notebook_entry(&mut self, id: i64, body: &str) -> Result<LiveNotebookWrite> {
         let body = Self::validate_notebook_body(body)?;
         let entry = self.get_active_notebook_entry(id)?;
         let others = self.notebook_words(Some(id))?;
         let before = others + live::word_count(&entry.body);
         let after = others + live::word_count(body);
-        if live::over_budget(after) {
-            return Err(Error::Validation(live::budget_message(after)));
-        }
         if live::removes_too_much(before, after) {
             return Err(Error::Validation(live::removal_message(before, after)));
         }
         let session = self.notebook_session()?;
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "UPDATE live_notebook SET body = ?2, updated_at = datetime('now'), \
                 last_used_session_id = COALESCE(?3, last_used_session_id) \
              WHERE id = ?1",
             (id, body, session),
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM live_memory_fts WHERE kind = 'note' AND ref_id = ?1",
             [id],
         )?;
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO live_memory_fts (kind, ref_id, session_id, text) \
              VALUES ('note', ?1, ?2, ?3)",
             (id, entry.source_session_id, body),
         )?;
-        self.get_notebook_entry(id)
+        let evicted = Self::evict_notebook_to_fit(&tx, id)?;
+        tx.commit()?;
+        self.notebook_write(id, &evicted)
     }
 
     /// Retires one active entry as `deleted` and echoes it. The row and its
@@ -6327,12 +6386,13 @@ impl Store {
     /// `source_session_id` — provenance survives a merge — with
     /// `last_used_session_id` stamped and the archive indexed exactly as an
     /// add is. Fewer than two distinct ids is `validation`; an unknown or
-    /// retired id is `not_found`. Both guards are judged on the notebook the
-    /// merge would leave: the budget on `active − merged + new` words, and
-    /// the removal rule on the **net** words removed, so a merge that
-    /// condenses three bullets into one cannot hollow the notebook out any
-    /// more than a delete could.
-    pub fn merge_notebook_entries(&mut self, ids: &[i64], body: &str) -> Result<LiveNotebookEntry> {
+    /// retired id is `not_found`. The removal rule is judged on the **net**
+    /// words the merge would remove, so a merge that condenses three bullets
+    /// into one cannot hollow the notebook out any more than a delete could;
+    /// a result past the word budget (`active − merged + new` words) evicts
+    /// in the same transaction, as an add does (mesa task 1331), never the
+    /// merged row.
+    pub fn merge_notebook_entries(&mut self, ids: &[i64], body: &str) -> Result<LiveNotebookWrite> {
         let body = Self::validate_notebook_body(body)?;
         let mut distinct = ids.to_vec();
         distinct.sort_unstable();
@@ -6349,9 +6409,6 @@ impl Store {
         let merged_words: usize = sources.iter().map(|e| live::word_count(&e.body)).sum();
         let before = self.notebook_words(None)?;
         let after = before - merged_words + live::word_count(body);
-        if live::over_budget(after) {
-            return Err(Error::Validation(live::budget_message(after)));
-        }
         if live::removes_too_much(before, after) {
             return Err(Error::Validation(live::removal_message(before, after)));
         }
@@ -6384,8 +6441,9 @@ impl Store {
                 (source.id, id),
             )?;
         }
+        let evicted = Self::evict_notebook_to_fit(&tx, id)?;
         tx.commit()?;
-        self.get_notebook_entry(id)
+        self.notebook_write(id, &evicted)
     }
 
     /// Un-retires one row, whatever retired it — the undo for a delete, a
@@ -6393,8 +6451,9 @@ impl Store {
     /// `merged_into` are cleared and nothing else on the row moves, so its
     /// provenance reads exactly as before. An active id is `validation`
     /// (there is nothing to restore), and a restore that would take the
-    /// active notebook over its budget is refused with the budget message,
-    /// the same rule an add answers to. Restoring a merge's source leaves
+    /// active notebook over its budget is refused with the budget message —
+    /// unlike an add, a restore does not evict (mesa task 1331 changed only
+    /// the three writes that carry new text). Restoring a merge's source leaves
     /// the merged row active too — the caller decides which to keep.
     pub fn restore_notebook_entry(&mut self, id: i64) -> Result<LiveNotebookEntry> {
         let entry = self.get_notebook_entry(id)?;
@@ -15015,14 +15074,18 @@ mod tests {
         let (mut store, _dir) = temp_store();
         let orphan = store
             .add_notebook_entry("  before any conversation  ")
-            .unwrap();
+            .unwrap()
+            .entry;
         assert_eq!(orphan.body, "before any conversation", "trimmed");
         assert_eq!(orphan.source_session_id, None);
         assert_eq!(orphan.last_used_session_id, None);
         assert_eq!(orphan.retired_at, None);
 
         let ended = ended_session(&mut store);
-        let between = store.add_notebook_entry("between conversations").unwrap();
+        let between = store
+            .add_notebook_entry("between conversations")
+            .unwrap()
+            .entry;
         assert_eq!(between.source_session_id, Some(ended));
         assert_eq!(between.last_used_session_id, Some(ended));
         assert!(matches!(
@@ -15031,7 +15094,10 @@ mod tests {
         ));
 
         let live = store.start_live_session(None).unwrap();
-        let during = store.add_notebook_entry("during a conversation").unwrap();
+        let during = store
+            .add_notebook_entry("during a conversation")
+            .unwrap()
+            .entry;
         assert_eq!(during.source_session_id, Some(live.id));
         let touched = store.touch_notebook_entry(orphan.id).unwrap();
         assert_eq!(touched.last_used_session_id, Some(live.id));
@@ -15057,34 +15123,129 @@ mod tests {
         let err = store.add_notebook_entry(&long).unwrap_err();
         assert!(err.to_string().contains("600"), "{err}");
         let exact = "y".repeat(live::LIVE_NOTEBOOK_ENTRY_MAX);
-        assert_eq!(store.add_notebook_entry(&exact).unwrap().body, exact);
+        assert_eq!(store.add_notebook_entry(&exact).unwrap().entry.body, exact);
     }
 
-    /// The budget is judged on the notebook the write would leave behind,
-    /// active entries only, and names the numbers.
+    fn words_of(n: usize, word: &str) -> String {
+        vec![word; n].join(" ")
+    }
+
+    fn evicted_ids(write: &LiveNotebookWrite) -> Vec<i64> {
+        write.evicted.iter().map(|e| e.id).collect()
+    }
+
+    /// mesa task 1331: a write that fits — up to and including exactly the
+    /// budget — evicts nothing, and a retired entry no longer counts.
     #[test]
-    fn notebook_budget_bounds_the_active_notebook() {
+    fn notebook_write_under_the_budget_evicts_nothing() {
         let (mut store, _dir) = temp_store();
         // 5 entries × 99 words = 495 words.
-        let ninety_nine = ["w"; 99].join(" ");
+        let ninety_nine = words_of(99, "w");
         let mut ids = Vec::new();
         for _ in 0..5 {
-            ids.push(store.add_notebook_entry(&ninety_nine).unwrap().id);
+            let write = store.add_notebook_entry(&ninety_nine).unwrap();
+            assert!(write.evicted.is_empty());
+            ids.push(write.entry.id);
         }
-        let err = store
-            .add_notebook_entry("one two three four five six")
-            .unwrap_err();
-        assert!(matches!(err, Error::Validation(_)));
-        assert!(err.to_string().contains("501 words"), "{err}");
-        assert!(err.to_string().contains("500-word"), "{err}");
-        store.add_notebook_entry("one two three four five").unwrap();
-        assert!(matches!(
-            store.replace_notebook_entry(ids[0], &format!("{ninety_nine} extra")),
-            Err(Error::Validation(_))
-        ));
-        // A retired entry no longer counts.
+        let exact = store.add_notebook_entry("one two three four five").unwrap();
+        assert!(exact.evicted.is_empty(), "the budget is inclusive");
+        assert_eq!(store.notebook_words(None).unwrap(), 500);
+        // A retired entry no longer counts: 401 + 99 fits again.
         store.delete_notebook_entry(ids[0]).unwrap();
-        store.add_notebook_entry("room again").unwrap();
+        let write = store.add_notebook_entry(&ninety_nine).unwrap();
+        assert!(write.evicted.is_empty());
+        assert_eq!(store.list_notebook(false).unwrap().len(), 6);
+    }
+
+    /// mesa task 1331: past the budget the least-recently-used active
+    /// entries are retired as `evicted`, as many as it takes, ordered by
+    /// `last_used_session_id` (falling back to `source_session_id`, then to
+    /// "oldest of all" when neither is set) and then by id — soft-retired,
+    /// so search still finds them and restore undoes it.
+    #[test]
+    fn notebook_eviction_is_least_recently_used_with_an_id_tie_break() {
+        let (mut store, _dir) = temp_store();
+        // Before any conversation: no session at all, so the oldest.
+        let never = store
+            .add_notebook_entry(&format!("heron {}", words_of(9, "n")))
+            .unwrap()
+            .entry;
+        assert_eq!(never.last_used_session_id, None);
+        ended_session(&mut store);
+        let a = store.add_notebook_entry(&words_of(99, "a")).unwrap().entry;
+        let b = store
+            .add_notebook_entry(&format!("pelican {}", words_of(98, "b")))
+            .unwrap()
+            .entry;
+        ended_session(&mut store);
+        let c = store.add_notebook_entry(&words_of(99, "c")).unwrap().entry;
+        let d = store.add_notebook_entry(&words_of(99, "d")).unwrap().entry;
+        // A is relied on in the live conversation: it is now the most
+        // recently used, whatever its id.
+        store.start_live_session(None).unwrap();
+        store.touch_notebook_entry(a.id).unwrap();
+        assert_eq!(store.notebook_words(None).unwrap(), 406);
+
+        // 406 + 150 = 556: evict `never` (10, no session) → 546, then B
+        // (99, the older session) → 447. A, older by id than B, survives.
+        let e = store.add_notebook_entry(&words_of(150, "e")).unwrap();
+        assert_eq!(evicted_ids(&e), vec![never.id, b.id]);
+        for gone in &e.evicted {
+            assert_eq!(gone.retired_reason.as_deref(), Some("evicted"));
+            assert!(gone.retired_at.is_some());
+        }
+        assert_eq!(e.evicted[1].body, b.body, "the full retired record");
+        assert_eq!(store.notebook_words(None).unwrap(), 447);
+
+        // 447 + 150 = 597: C and D share a session, so the lower id goes.
+        let f = store.add_notebook_entry(&words_of(150, "f")).unwrap();
+        assert_eq!(evicted_ids(&f), vec![c.id]);
+        assert_eq!(store.notebook_words(None).unwrap(), 498);
+        let active: Vec<i64> = store
+            .list_notebook(false)
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(active, vec![a.id, d.id, e.entry.id, f.entry.id]);
+
+        // Soft-retired exactly like decay: still in the archive...
+        let hits = store.search_live_memory("pelican", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].ref_id, b.id);
+        assert_eq!(store.search_live_memory("heron", 10).unwrap().len(), 1);
+        // ...and restorable once there is room.
+        store.delete_notebook_entry(d.id).unwrap();
+        let back = store.restore_notebook_entry(never.id).unwrap();
+        assert_eq!(back.retired_reason, None);
+        assert_eq!(back.retired_at, None);
+    }
+
+    /// mesa task 1331: the row being written is never evicted, even when it
+    /// is itself the least recently used — and an eviction is not an edit
+    /// the removal guard judges: here it retires 40% of the notebook.
+    #[test]
+    fn notebook_eviction_never_takes_the_written_row() {
+        let (mut store, _dir) = temp_store();
+        let a = store.add_notebook_entry(&words_of(99, "a")).unwrap().entry;
+        let b = store.add_notebook_entry(&words_of(99, "b")).unwrap().entry;
+        let c = store.add_notebook_entry(&words_of(99, "c")).unwrap().entry;
+        store.add_notebook_entry(&words_of(99, "d")).unwrap();
+        store.add_notebook_entry(&words_of(99, "e")).unwrap();
+        // 495 words, every entry unattributed, so A — the lowest id — is
+        // first in eviction order. Replacing it with 300 words lands at 696:
+        // A is skipped, B and C (198 of 495 words) go.
+        let write = store
+            .replace_notebook_entry(a.id, &words_of(300, "z"))
+            .unwrap();
+        assert_eq!(write.entry.id, a.id);
+        assert_eq!(write.entry.retired_at, None);
+        assert_eq!(evicted_ids(&write), vec![b.id, c.id]);
+        assert_eq!(store.notebook_words(None).unwrap(), 498);
+        for id in [b.id, c.id] {
+            let gone = store.get_notebook_entry(id).unwrap();
+            assert_eq!(gone.retired_reason.as_deref(), Some("evicted"));
+        }
     }
 
     /// The removal guard holds above the floor and stands down below it.
@@ -15092,14 +15253,14 @@ mod tests {
     fn notebook_edits_may_not_remove_more_than_a_share_above_the_floor() {
         let (mut store, _dir) = temp_store();
         // Below the floor: a notebook of 3 words can lose them all.
-        let small = store.add_notebook_entry("one two three").unwrap();
+        let small = store.add_notebook_entry("one two three").unwrap().entry;
         store.delete_notebook_entry(small.id).unwrap();
         assert!(store.list_notebook(false).unwrap().is_empty());
 
         // 120 words in three entries of 40: deleting one is 33%, refused;
         // replacing one with 10 words removes 30 (25%), allowed.
         let forty = ["w"; 40].join(" ");
-        let a = store.add_notebook_entry(&forty).unwrap();
+        let a = store.add_notebook_entry(&forty).unwrap().entry;
         store.add_notebook_entry(&forty).unwrap();
         store.add_notebook_entry(&forty).unwrap();
         let err = store.delete_notebook_entry(a.id).unwrap_err();
@@ -15114,7 +15275,7 @@ mod tests {
             "{err}"
         );
         let ten = ["v"; 10].join(" ");
-        let replaced = store.replace_notebook_entry(a.id, &ten).unwrap();
+        let replaced = store.replace_notebook_entry(a.id, &ten).unwrap().entry;
         assert_eq!(replaced.body, ten);
         assert_eq!(replaced.id, a.id);
         assert_eq!(replaced.created_at, a.created_at);
@@ -15143,7 +15304,10 @@ mod tests {
     fn notebook_entries_decay_after_n_ended_sessions_unless_touched() {
         let (mut store, _dir) = temp_store();
         let first = ended_session(&mut store);
-        let stale = store.add_notebook_entry("a pelican preference").unwrap();
+        let stale = store
+            .add_notebook_entry("a pelican preference")
+            .unwrap()
+            .entry;
         assert_eq!(stale.source_session_id, Some(first));
         for _ in 0..2 {
             ended_session(&mut store);
@@ -15153,7 +15317,10 @@ mod tests {
             "2 < 3"
         );
         let live = store.start_live_session(None).unwrap();
-        let fresh = store.add_notebook_entry("a heron preference").unwrap();
+        let fresh = store
+            .add_notebook_entry("a heron preference")
+            .unwrap()
+            .entry;
         store.touch_notebook_entry(stale.id).unwrap();
         store.end_live_session(live.id).unwrap();
         // 3 ended sessions after `first`, but the touch moved the clock.
@@ -15192,16 +15359,19 @@ mod tests {
         let first = ended_session(&mut store);
         let a = store
             .add_notebook_entry("prefers short spoken replies")
-            .unwrap();
+            .unwrap()
+            .entry;
         let second = ended_session(&mut store);
         let b = store
             .add_notebook_entry("wants replies kept brief when spoken")
-            .unwrap();
+            .unwrap()
+            .entry;
         assert_eq!(a.source_session_id, Some(first));
         assert_eq!(b.source_session_id, Some(second));
         let gone = store
             .add_notebook_entry("a bullet already deleted")
-            .unwrap();
+            .unwrap()
+            .entry;
         store.delete_notebook_entry(gone.id).unwrap();
 
         assert!(matches!(
@@ -15232,7 +15402,8 @@ mod tests {
 
         let merged = store
             .merge_notebook_entries(&[b.id, a.id], "prefers short spoken replies (pelican)")
-            .unwrap();
+            .unwrap()
+            .entry;
         assert_eq!(merged.body, "prefers short spoken replies (pelican)");
         assert_eq!(
             merged.source_session_id,
@@ -15272,49 +15443,64 @@ mod tests {
         ));
     }
 
-    /// A merge is judged on the notebook it would leave: the budget on the
-    /// net words, and the removal rule on the net words removed once the
-    /// notebook holds the floor.
+    /// A merge is judged on the notebook it would leave: the removal rule on
+    /// the net words removed once the notebook holds the floor, and — mesa
+    /// task 1331 — a net result past the budget evicts rather than refusing,
+    /// never the merged row, the sources retiring as `merged`, not `evicted`.
     #[test]
     fn notebook_merge_is_judged_on_net_words() {
         let (mut store, _dir) = temp_store();
-        let ninety_nine = ["w"; 99].join(" ");
+        let ninety_nine = words_of(99, "w");
         let mut ids = Vec::new();
         for _ in 0..5 {
-            ids.push(store.add_notebook_entry(&ninety_nine).unwrap().id);
+            ids.push(store.add_notebook_entry(&ninety_nine).unwrap().entry.id);
         }
-        // 495 words. Merging two 99-word entries (198 out) into 204 words
-        // nets +6: 501, over budget — judged on the merge, not on an add.
-        let err = store
-            .merge_notebook_entries(&ids[..2], &["m"; 204].join(" "))
-            .unwrap_err();
-        assert!(matches!(err, Error::Validation(_)));
-        assert!(err.to_string().contains("501 words"), "{err}");
-        // Into 203 words nets +5: exactly 500, allowed.
-        let merged = store
-            .merge_notebook_entries(&ids[..2], &["m"; 203].join(" "))
+        // 495 words. Merging two 99-word entries (198 out) into 203 words
+        // nets +5: exactly 500, nothing evicted.
+        let exact = store
+            .merge_notebook_entries(&ids[..2], &words_of(203, "m"))
             .unwrap();
+        assert!(exact.evicted.is_empty());
         assert_eq!(store.notebook_words(None).unwrap(), 500);
-        // 500 words; merging three 99-word entries into 10 words removes
-        // 287 (57%): refused by the removal rule, naming the net numbers.
+        // Merging ids[2] and ids[3] (198 out) into 199 nets +1: 501. The
+        // merged row sorts last, so ids[4] — the least recently used of the
+        // rest, by id since nothing here has a session — is evicted, landing
+        // at 402.
+        let merged = store
+            .merge_notebook_entries(&ids[2..4], &words_of(199, "m"))
+            .unwrap();
+        assert_eq!(evicted_ids(&merged), vec![ids[4]]);
+        assert_eq!(merged.evicted[0].retired_reason.as_deref(), Some("evicted"));
+        assert_eq!(merged.entry.retired_at, None);
+        assert_eq!(store.notebook_words(None).unwrap(), 402);
+        for source in [ids[2], ids[3]] {
+            let source = store.get_notebook_entry(source).unwrap();
+            assert_eq!(source.retired_reason.as_deref(), Some("merged"));
+            assert_eq!(source.merged_into, Some(merged.entry.id));
+        }
+        // 402 words; merging the two left into 10 words removes 392 of them:
+        // refused by the removal rule, naming the net numbers, evicting
+        // nothing.
+        let both = [exact.entry.id, merged.entry.id];
         let err = store
-            .merge_notebook_entries(&ids[2..5], &["m"; 10].join(" "))
+            .merge_notebook_entries(&both, &words_of(10, "m"))
             .unwrap_err();
         assert!(matches!(err, Error::Validation(_)));
         assert!(
             err.to_string()
-                .contains("remove 287 of the notebook's 500 words"),
+                .contains("remove 392 of the notebook's 402 words"),
             "{err}"
         );
-        // Into 150 words removes 147 (29.4%): allowed.
-        store
-            .merge_notebook_entries(&ids[2..5], &["m"; 150].join(" "))
-            .unwrap();
-        assert_eq!(store.notebook_words(None).unwrap(), 353);
         assert_eq!(store.list_notebook(false).unwrap().len(), 2);
+        // Into 300 words removes 102 (25.4%): allowed.
+        store
+            .merge_notebook_entries(&both, &words_of(300, "m"))
+            .unwrap();
+        assert_eq!(store.notebook_words(None).unwrap(), 300);
+        assert_eq!(store.list_notebook(false).unwrap().len(), 1);
         assert_eq!(
             store.get_notebook_entry(ids[0]).unwrap().merged_into,
-            Some(merged.id)
+            Some(exact.entry.id)
         );
     }
 
@@ -15324,8 +15510,8 @@ mod tests {
     #[test]
     fn notebook_restore_unretires_any_reason_within_the_budget() {
         let (mut store, _dir) = temp_store();
-        let a = store.add_notebook_entry("first bullet").unwrap();
-        let b = store.add_notebook_entry("second bullet").unwrap();
+        let a = store.add_notebook_entry("first bullet").unwrap().entry;
+        let b = store.add_notebook_entry("second bullet").unwrap().entry;
         assert!(matches!(
             store.restore_notebook_entry(a.id),
             Err(Error::Validation(_))
@@ -15336,7 +15522,8 @@ mod tests {
         ));
         let merged = store
             .merge_notebook_entries(&[a.id, b.id], "both bullets")
-            .unwrap();
+            .unwrap()
+            .entry;
         let restored = store.restore_notebook_entry(a.id).unwrap();
         assert_eq!(restored.retired_at, None);
         assert_eq!(restored.retired_reason, None);
@@ -15410,7 +15597,8 @@ mod tests {
             .unwrap();
         let note = store
             .add_notebook_entry("hooks: one script mode, task 1143")
-            .unwrap();
+            .unwrap()
+            .entry;
 
         let hits = store.search_live_memory("hooks", 10).unwrap();
         let mut kinds: Vec<&str> = hits.iter().map(|h| h.kind.as_str()).collect();

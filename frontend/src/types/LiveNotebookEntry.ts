@@ -12,7 +12,9 @@
  * archive, `Store::search_live_memory`) with `retired_at`/`retired_reason`
  * stamped, and drops out of the prompt and the default list. `decayed` is the
  * automatic kind — an entry no conversation has used for
- * `live::LIVE_NOTEBOOK_DECAY_SESSIONS` ended sessions — `deleted` an explicit
+ * `live::LIVE_NOTEBOOK_DECAY_SESSIONS` ended sessions — `evicted` the other
+ * automatic one (mesa task 1331: the least-recently-used entry an add,
+ * replace or merge pushed past the word budget), `deleted` an explicit
  * one, `merged` a source folded into another row by a dream pass (mesa task
  * 1152, `merged_into` naming the row that replaced it), and `replaced` is
  * reserved for a future rewrite-as-new-row path (a replace today updates the
@@ -41,8 +43,8 @@ source_session_id: number | null,
  */
 last_used_session_id: number | null, retired_at: string | null, 
 /**
- * `decayed` | `deleted` | `replaced` | `merged`, null while the entry is
- * active.
+ * `decayed` | `evicted` | `deleted` | `replaced` | `merged`, null while
+ * the entry is active.
  */
 retired_reason: string | null, 
 /**

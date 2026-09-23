@@ -601,7 +601,7 @@ function KeymapSection() {
  * list with an inline edit and a delete per row and an add box at the bottom
  * rather than one draft with one save button. Every write is one request for
  * one entry — the notebook is edited one item at a time, never rewritten
- * whole — and a 422 (the budget, the entry length, the 30%-removal guard)
+ * whole — and a 422 (the entry length, the 30%-removal guard)
  * shows inline beside the row that asked. The meter is computed here off the
  * same word rule the server judges by (`memoryDraft.ts`).
  *
@@ -706,9 +706,11 @@ function MemorySection() {
         The live notebook: what earlier conversations left for later ones —
         preferences, working norms, the reasons behind decisions, pointers to
         task ids. Every active entry is read by the agent holding the next
-        conversation, so it is budgeted. Entries are edited one at a time; an
-        entry no conversation has used for ten sessions retires on its own,
-        and a retired entry stays searchable with{' '}
+        conversation, so it is budgeted: a write that would pass the budget
+        retires the least-recently-used entries to make room. Entries are
+        edited one at a time; an entry no conversation has used for ten
+        sessions retires on its own, and a retired entry stays searchable
+        with{' '}
         <code>mesa live memory search</code>.
       </p>
       <p className={overBudget(words) ? 'error' : 'muted'}>

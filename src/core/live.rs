@@ -117,7 +117,11 @@ on.
 9. The notebook at the end of your prompt is what earlier conversations left \
 for you. Keep it with `mesa live memory add \"<one bullet>\"`, \
 `mesa live memory replace <id> \"<text>\"` and `mesa live memory delete <id>` — \
-one item per command, never rewriting it whole. Put in it only preferences, \
+one item per command, never rewriting it whole. The notebook has a word \
+budget: an add, replace or merge that would pass it retires the \
+least-recently-used entries to make room and lists them in the command's \
+`evicted` array (still searchable, and `mesa live memory restore <id>` brings \
+one back once there is room), and you may mention an eviction to the person. Put in it only preferences, \
 working norms, the reasons behind decisions and pointers to task ids — things \
 the person said outright — never task status (tasks hold that) and never \
 guesses about the person. When you rely on an entry, run \
@@ -349,7 +353,7 @@ pub const LIVE_NOTEBOOK_ENTRY_MAX: usize = 600;
 /// this many words — 60% of [`LIVE_NOTEBOOK_BUDGET_WORDS`]. Below it a
 /// notebook has room to grow, and a consolidation agent reading it would
 /// mostly find nothing to do; at it, the next `add` is a few conversations
-/// from being refused, and duplicates are what a notebook that size is most
+/// from evicting an entry, and duplicates are what a notebook that size is most
 /// likely to hold.
 pub const LIVE_DREAM_MIN_WORDS: usize = 300;
 
@@ -417,7 +421,9 @@ pub fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
-/// Whether an active notebook of `words` words is past the budget.
+/// Whether an active notebook of `words` words is past the budget — the
+/// point at which an add, replace or merge evicts (mesa task 1331) and a
+/// restore is refused with [`budget_message`].
 pub fn over_budget(words: usize) -> bool {
     words > LIVE_NOTEBOOK_BUDGET_WORDS
 }
@@ -755,9 +761,15 @@ mod tests {
     fn dream_prompt_carries_every_active_entry_and_no_retired_one() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = crate::core::Store::open(&dir.path().join("test.db")).unwrap();
-        let kept = store.add_notebook_entry("prefers short replies").unwrap();
-        let also = store.add_notebook_entry("task 42 is the roadmap").unwrap();
-        let gone = store.add_notebook_entry("a deleted bullet").unwrap();
+        let kept = store
+            .add_notebook_entry("prefers short replies")
+            .unwrap()
+            .entry;
+        let also = store
+            .add_notebook_entry("task 42 is the roadmap")
+            .unwrap()
+            .entry;
+        let gone = store.add_notebook_entry("a deleted bullet").unwrap().entry;
         store.delete_notebook_entry(gone.id).unwrap();
 
         let prompt = dream_prompt(&store, Some(7));
@@ -1062,10 +1074,12 @@ mod tests {
             .unwrap();
         let kept = store
             .add_notebook_entry("prefers the board sorted by priority")
-            .unwrap();
+            .unwrap()
+            .entry;
         let gone = store
             .add_notebook_entry("a bullet that will be deleted")
-            .unwrap();
+            .unwrap()
+            .entry;
         store.delete_notebook_entry(gone.id).unwrap();
         let prompt = agent_prompt(&store, 100);
         assert!(prompt.contains("Drive mesa live session 100 (lease 1)."));

@@ -29,10 +29,11 @@ use crate::core::{
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch,
     FrameShape, ImportDoc, InboxItem, InboxKind, LIVE_TEXT_MAX, LibraryBundle, LibraryItem,
     LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus, LiveAction, LiveBoard,
-    LiveBoardKind, LiveNotebookEntry, LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary,
-    LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg,
-    ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, TaskReceipt, agents, board, cc,
-    config, files, library, live, look, migrate, receipt, retro, system,
+    LiveBoardKind, LiveNotebookEntry, LiveNotebookWrite, LiveNotice, LiveRole, LiveSession,
+    LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch,
+    Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch,
+    TaskReceipt, agents, board, cc, config, files, library, live, look, migrate, receipt, retro,
+    system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -2406,8 +2407,9 @@ EXAMPLES
     /// a pointer to a task id — something the person said outright. Never
     /// task status, never a guess about the person. Type the text after `add`
     /// (quoting is optional; words are joined) — put --quiet BEFORE it,
-    /// exactly as `live say` requires. `validation` when the notebook would
-    /// exceed its word budget.
+    /// exactly as `live say` requires. Past the notebook's word budget the
+    /// least-recently-used entries are retired as `evicted` (still searchable,
+    /// `restore` undoes it) and listed in the printed `evicted` array.
     #[command(after_help = "\
 EXAMPLES
   mesa live memory add Prefers short spoken replies; no lists read aloud.
@@ -2426,8 +2428,8 @@ EXAMPLES
     /// Rewrite one entry in place; prints the updated record
     ///
     /// Keeps the id and the provenance, stamps the session that edited it.
-    /// `validation` when the result would exceed the budget, or when the edit
-    /// removes more than 30% of the notebook's words (once it holds 100).
+    /// `validation` when the edit removes more than 30% of the notebook's
+    /// words (once it holds 100). Past the budget it evicts, as `add` does.
     #[command(after_help = "\
 EXAMPLES
   mesa live memory replace 3 Prefers short spoken replies.
@@ -2488,8 +2490,9 @@ EXAMPLES
     /// The dream pass's edit (mesa task 1152). Every source is retired as
     /// `merged` with `merged_into` pointing at the new row, which takes the
     /// oldest source's provenance. Judged like a replace on the notebook it
-    /// would leave: `validation` past the budget, or when the net words
-    /// removed exceed the 30% one edit may (once it holds 100). Put --ids
+    /// would leave: `validation` when the net words removed exceed the 30%
+    /// one edit may (once it holds 100), and past the budget it evicts, as
+    /// `add` does. Put --ids
     /// and --quiet BEFORE the text, exactly as `add` requires.
     #[command(after_help = "\
 EXAMPLES
@@ -3781,6 +3784,25 @@ fn print_live_summary(summary: &LiveSummary, is_quiet: bool) {
 
 fn print_notebook_entry(entry: &LiveNotebookEntry, is_quiet: bool) {
     print_record(entry, is_quiet, QUIET_DROP_LIVE_NOTEBOOK);
+}
+
+/// Print what an `add`/`replace`/`merge` answers (mesa task 1331): the entry
+/// with its `evicted` array beside it. Under `--quiet` the key set is
+/// unchanged — the entry loses `body` and so does each evicted member, the
+/// composite rule (compact the members, keep the structure).
+fn print_notebook_write(write: &LiveNotebookWrite, is_quiet: bool) {
+    if is_quiet {
+        print_json(&quiet_notebook_write(write));
+    } else {
+        print_json(write);
+    }
+}
+
+fn quiet_notebook_write(write: &LiveNotebookWrite) -> serde_json::Value {
+    let mut value = quiet(&write.entry, QUIET_DROP_LIVE_NOTEBOOK);
+    value["evicted"] =
+        serde_json::Value::Array(quiet_all(&write.evicted, QUIET_DROP_LIVE_NOTEBOOK));
+    value
 }
 
 /// Print one task receipt: the full record, or the record minus
@@ -5563,10 +5585,10 @@ fn run_live_memory(store: &mut Store, cmd: LiveMemoryCmd) -> Result<()> {
             print_notebook_entry(&store.get_notebook_entry(id)?, quiet);
         }
         LiveMemoryCmd::Add { text, quiet } => {
-            print_notebook_entry(&store.add_notebook_entry(&text.join(" "))?, quiet);
+            print_notebook_write(&store.add_notebook_entry(&text.join(" "))?, quiet);
         }
         LiveMemoryCmd::Replace { id, text, quiet } => {
-            print_notebook_entry(&store.replace_notebook_entry(id, &text.join(" "))?, quiet);
+            print_notebook_write(&store.replace_notebook_entry(id, &text.join(" "))?, quiet);
         }
         LiveMemoryCmd::Delete { id, quiet } => {
             print_notebook_entry(&store.delete_notebook_entry(id)?, quiet);
@@ -5578,7 +5600,7 @@ fn run_live_memory(store: &mut Store, cmd: LiveMemoryCmd) -> Result<()> {
             print_json(&store.search_live_memory(&words.join(" "), limit)?);
         }
         LiveMemoryCmd::Merge { ids, text, quiet } => {
-            print_notebook_entry(&store.merge_notebook_entries(&ids, &text.join(" "))?, quiet);
+            print_notebook_write(&store.merge_notebook_entries(&ids, &text.join(" "))?, quiet);
         }
         LiveMemoryCmd::Restore { id, quiet } => {
             print_notebook_entry(&store.restore_notebook_entry(id)?, quiet);
@@ -7497,6 +7519,42 @@ mod tests {
             ))),
             minus(&full, QUIET_DROP_LIVE_NOTEBOOK),
         );
+    }
+
+    /// mesa task 1331: an add/replace/merge answers the entry flattened plus
+    /// `evicted`; `--quiet` keeps that key set, dropping `body` from the
+    /// entry and from every evicted member.
+    #[test]
+    fn live_notebook_write_quiet_drops_body_everywhere() {
+        let mut gone = sample_notebook_entry();
+        gone.id = 1;
+        gone.retired_at = Some("2026-09-02 00:00:00".into());
+        gone.retired_reason = Some("evicted".into());
+        let write = LiveNotebookWrite {
+            entry: sample_notebook_entry(),
+            evicted: vec![gone],
+        };
+        let entry_keys = keys(&sample_notebook_entry());
+        let full = keys(&write);
+        let mut expected = entry_keys.clone();
+        expected.push("evicted".into());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted_owned(expected),
+            "LiveNotebookWrite gained/lost a field: decide whether it belongs in \
+             the --quiet shape before updating this test",
+        );
+        let q = quiet_notebook_write(&write);
+        assert_eq!(
+            sorted_owned(value_keys(&q)),
+            minus(&full, QUIET_DROP_LIVE_NOTEBOOK),
+        );
+        let member = &q["evicted"][0];
+        assert_eq!(
+            sorted_owned(value_keys(member)),
+            minus(&entry_keys, QUIET_DROP_LIVE_NOTEBOOK),
+        );
+        assert_eq!(member["retired_reason"], "evicted");
     }
 
     #[test]

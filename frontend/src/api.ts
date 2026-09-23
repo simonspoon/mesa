@@ -31,6 +31,7 @@ import type { ConfigSpeech } from './types/ConfigSpeech'
 import type { ConfigListen } from './types/ConfigListen'
 import type { ConfigLive } from './types/ConfigLive'
 import type { LiveNotebookEntry } from './types/LiveNotebookEntry'
+import type { LiveNotebookWrite } from './types/LiveNotebookWrite'
 import type { ConfigWatchers } from './types/ConfigWatchers'
 import type { Diagram } from './types/Diagram'
 import type { DiagramEvent } from './types/DiagramEvent'
@@ -1414,18 +1415,20 @@ export function listLiveMemory(): Promise<LiveNotebookEntry[]> {
   return request('/api/live/memory')
 }
 
-/** Adds one entry. 422 `validation` names the word budget when the notebook
- *  would exceed it, or the entry length bound. */
-export function addLiveMemory(body: string): Promise<LiveNotebookEntry> {
+/** Adds one entry. 422 `validation` names the entry length bound. Past the
+ *  word budget the least-recently-used entries are retired as `evicted` and
+ *  listed in the answer's `evicted` array (mesa task 1331). */
+export function addLiveMemory(body: string): Promise<LiveNotebookWrite> {
   return request('/api/live/memory', jsonInit('POST', { body }))
 }
 
-/** Rewrites one entry in place (same id, same provenance). 422 past the
- *  budget or when the edit removes more than 30% of the notebook's words. */
+/** Rewrites one entry in place (same id, same provenance). 422 when the edit
+ *  removes more than 30% of the notebook's words; past the budget it evicts
+ *  as an add does. */
 export function updateLiveMemory(
   id: number,
   body: string,
-): Promise<LiveNotebookEntry> {
+): Promise<LiveNotebookWrite> {
   return request(`/api/live/memory/${id}`, jsonInit('PATCH', { body }))
 }
 

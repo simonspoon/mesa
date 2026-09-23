@@ -110,3 +110,31 @@ export function takesToSpeak(
 ): boolean {
   return spokenText(turn) !== null && maySpeak(speaker, client)
 }
+
+/**
+ * What `run()` does with a turn it reaches that has words (mesa task 1327):
+ *
+ * - `leave` — another browser holds the voice (`takesToSpeak` is false), so
+ *   the turn is taken in hand for nothing and stays pending for the speaker.
+ * - `speak` — this page says it.
+ * - `read` — this page would say it, but the person has muted Naru's voice on
+ *   this browser. The words are on screen, so the turn counts as heard:
+ *   taken in hand and stamped `played_at` exactly as a spoken one is, which
+ *   is why unmuting never replays what arrived while muted.
+ *
+ * Muting deliberately sits *under* the claim rather than beside it: it
+ * changes what the page holding the voice does with a turn, never who holds
+ * it, so a muted speaker keeps the conversation silent rather than quietly
+ * handing its voice to some other open tab.
+ */
+export type SpokenTurnVerdict = 'leave' | 'speak' | 'read'
+
+export function spokenTurnVerdict(
+  turn: LiveTurn,
+  speaker: string | null,
+  client: string,
+  speechMuted: boolean,
+): SpokenTurnVerdict {
+  if (!takesToSpeak(turn, speaker, client)) return 'leave'
+  return speechMuted ? 'read' : 'speak'
+}

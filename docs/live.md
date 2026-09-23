@@ -1922,6 +1922,38 @@ at all.** It existed purely to *be* the gesture a browser's autoplay policy
 weighs, and CLAUDE.md said so outright. It now makes exactly one call, the
 claim — still no session state, still nothing the agent sees.
 
+### Muting the voice (mesa task 1327)
+
+The panel head carries a speaker button beside Pause, offered on Pause's
+terms (live, and this browser has joined). It silences the synthesiser and
+nothing else: the session stays live, the microphone and the typed box keep
+working, actions are still performed in order, and every reply still lands in
+the transcript as text. It is a separate state from the listen switch's
+`muted`, which is the microphone — the voice's is `speechMuted` in `LiveHub`.
+Browser-side and route-free like pause, never persisted, and cleared when the
+conversation ends.
+
+While muted, a turn this page would have spoken is **read** instead
+(`liveSpeaker.ts::spokenTurnVerdict`): taken in hand and stamped `played_at`
+as it lands, exactly as a spoken turn is once it ends. So unmuting replays
+nothing — the person read those — and only turns arriving afterwards are
+spoken. A sentence sounding at the press is cut off at once and counts as
+done, the opposite of pause, which hands it back to be said again from its
+start (`releaseForReplay`). Muting sits *under* the speaker claim, never
+beside it: it changes what the page holding the voice does with a turn, not
+who holds it, so a muted speaker keeps the conversation quiet rather than
+silently handing its voice to another open tab, and a turn another browser
+speaks is left for that browser whether this one is muted or not. One
+known edge: when **no** browser holds the claim (`speaker` is `null` — a
+stale claim with two pages joined, say), a muted page stamps each turn
+`played_at` as it arrives, so another, unmuted page that has not reached
+those turns yet will not speak them. That is accepted: an unclaimed
+conversation is speakable by every client, and the alternative — leaving the
+turns unstamped — would replay the whole backlog on unmute. Since
+nothing sounds, `speaking` never goes true — the aperture never shows
+speaking, `shouldListen` keeps the microphone open, and barge-in is never
+engaged.
+
 ## The header hub (`LiveHub`, task 857)
 
 The conversation lives in the **header**, not on a page: a control cluster on

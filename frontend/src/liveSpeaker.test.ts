@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import { liveClientId, MAX_LIVE_CLIENT_ID, maySpeak, takesToSpeak } from './liveSpeaker'
+import {
+  liveClientId,
+  MAX_LIVE_CLIENT_ID,
+  maySpeak,
+  spokenTurnVerdict,
+  takesToSpeak,
+} from './liveSpeaker'
 import { pendingTurns } from './liveTurns'
 import type { LiveTurn } from './types/LiveTurn'
 
@@ -118,5 +124,28 @@ describe('takesToSpeak', () => {
     expect(take(null)).toEqual([5])
     // …and having said it, B does not say it again on the next poll.
     expect(take(null)).toEqual([])
+  })
+})
+
+describe('spokenTurnVerdict', () => {
+  it('speaks a turn this page holds the voice for, unless speech is muted', () => {
+    expect(spokenTurnVerdict(turn(5), 'tab-a', 'tab-a', false)).toBe('speak')
+    expect(spokenTurnVerdict(turn(5), null, 'tab-a', false)).toBe('speak')
+    // Muted: the turn is read rather than said — taken in hand and stamped,
+    // so unmuting does not replay it.
+    expect(spokenTurnVerdict(turn(5), 'tab-a', 'tab-a', true)).toBe('read')
+    expect(spokenTurnVerdict(turn(5), null, 'tab-a', true)).toBe('read')
+  })
+
+  it('leaves a turn another browser speaks, muted or not', () => {
+    // A muted page never consumes a turn it could not have said anyway: the
+    // speaker still says it, and a freed page can still pick it up.
+    expect(spokenTurnVerdict(turn(5), 'tab-a', 'tab-b', false)).toBe('leave')
+    expect(spokenTurnVerdict(turn(5), 'tab-a', 'tab-b', true)).toBe('leave')
+  })
+
+  it('leaves a turn that says nothing, which the action path stamps itself', () => {
+    const silent = turn(5, { text: '', action: 'navigate', target: '#/inbox' })
+    expect(spokenTurnVerdict(silent, 'tab-a', 'tab-a', true)).toBe('leave')
   })
 })

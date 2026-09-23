@@ -46,7 +46,7 @@ import {
 import { currentContext, sameContext, subscribeContext } from '../liveContext'
 import { mayHold, SegmentChain } from '../liveDrain'
 import { isPausePhrase } from '../livePausePhrase'
-import { liveClientId, takesToSpeak } from '../liveSpeaker'
+import { liveClientId, spokenTurnVerdict } from '../liveSpeaker'
 import {
   audioInputs,
   chosenInput,
@@ -266,10 +266,10 @@ function BoardMark() {
 }
 
 /**
- * The head's three presses, as glyphs (mesa task 1069).
+ * The head's presses, as glyphs (mesa task 1069; the voice switch, 1327).
  *
- * Pause, End and Close are 44px squares in a strip that also holds a 44px
- * aperture and a title, and three words there would be a paragraph. They are
+ * Mute, Pause, End and Close are 44px squares in a strip that also holds a 44px
+ * aperture and a title, and four words there would be a paragraph. They are
  * drawn rather than lettered for `LiveMark`'s reason: one stroked path in
  * `currentColor` takes the button's amber/red/muted and its hover for free,
  * and each has a real `aria-label`, so nothing is lost to the reader who
@@ -303,6 +303,23 @@ function ResumeMark() {
       focusable="false"
     >
       <path d="M8 5l11 7-11 7z" />
+    </svg>
+  )
+}
+
+/** Naru's voice: a speaker with sound waves, or struck through when muted. */
+function SpeakerMark({ muted }: { muted: boolean }) {
+  return (
+    <svg
+      className="live-icon-mark"
+      viewBox="0 0 24 24"
+      width="15"
+      height="15"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M4 9v6h4l5 4V5L8 9H4z" />
+      <path d={muted ? 'M16 9l5 6M21 9l-5 6' : 'M16 9a4 4 0 0 1 0 6M18.5 6.5a7.5 7.5 0 0 1 0 11'} />
     </svg>
   )
 }
@@ -548,6 +565,20 @@ export function LiveHub({
   const setPausedNow = useCallback((next: boolean) => {
     pausedRef.current = next
     setPaused(next)
+  }, [])
+  // The person's own switch on Naru's *voice* (mesa task 1327) — distinct
+  // from `muted` below, which is the microphone. While it is on this page
+  // says nothing: every turn it would have spoken is read instead
+  // (`liveSpeaker.ts::spokenTurnVerdict`), taken in hand and stamped
+  // `played_at`, while actions are still performed in order and the
+  // microphone and the typed box carry on. Browser-side and this browser's
+  // alone, like pause — no route, no claim change — and the ref is what
+  // `run()` reads, since it advances from media events.
+  const [speechMuted, setSpeechMuted] = useState(false)
+  const speechMutedRef = useRef(false)
+  const setSpeechMutedNow = useCallback((next: boolean) => {
+    speechMutedRef.current = next
+    setSpeechMuted(next)
   }, [])
   // The person's own switch on the microphone (mesa task 887). Still
   // *initialises* muted — a page with no conversation joined is not listening
@@ -2258,7 +2289,13 @@ export function LiveHub({
         markPlayed(turn.id)
         continue
       }
-      if (!takesToSpeak(turn, session?.speaker ?? null, client)) {
+      const verdict = spokenTurnVerdict(
+        turn,
+        session?.speaker ?? null,
+        client,
+        speechMutedRef.current,
+      )
+      if (verdict === 'leave') {
         // Another browser holds the voice. This page takes the turn in hand
         // for *nothing* — it stays on the pending list, so the speaker says
         // it, and if that browser is closed mid-sentence and its claim goes
@@ -2267,6 +2304,12 @@ export function LiveHub({
         continue
       }
       handled.current.add(turn.id)
+      if (verdict === 'read') {
+        // Speech muted (mesa task 1327): the words are on screen, so the turn
+        // is heard as it lands — stamped now, never queued for unmute.
+        markPlayed(turn.id)
+        continue
+      }
       speak(turn.id, ctx)
       return
     }
@@ -2310,13 +2353,15 @@ export function LiveHub({
       // outlive one: the next `Go live` starts talking rather than starting
       // paused with no control on screen to say why.
       setPausedNow(false)
+      // Nor does a muted voice (mesa task 1327), for the same reason.
+      setSpeechMutedNow(false)
       // Nor does a recording (task 889): it was said to a conversation that no
       // longer exists, and nothing will ever send it.
       setRecordingNow('')
       setInterimNow('')
     }
     wasLive.current = live
-  }, [live, silence, setPausedNow, setRecordingNow, setInterimNow])
+  }, [live, silence, setPausedNow, setSpeechMutedNow, setRecordingNow, setInterimNow])
 
   // The header never unmounts, but strict-mode remounts in dev do pass here:
   // drop the body still arriving and hand the clock back.
@@ -2572,6 +2617,24 @@ export function LiveHub({
     // open `reclaim` now declines, as it should: a recognized sentence reaches
     // the conversation with the keyboard anywhere.
     reclaim('hub-press', armed.current)
+    pump.current()
+  }
+
+  /**
+   * Muting Naru's voice on this browser, and back (mesa task 1327). Route-free
+   * like `togglePause`, but where a pause hands the sentence it cut off back
+   * to the run, muting counts it as heard: the turn is already in `handled`,
+   * so it is stamped here and the run goes on reading whatever else is
+   * pending. Unmuting touches nothing — the backlog was read as it landed, and
+   * only turns arriving after this are spoken.
+   */
+  function toggleSpeechMuted() {
+    const next = !speechMutedRef.current
+    setSpeechMutedNow(next)
+    if (!next) return
+    const cut = sounding.current
+    silence()
+    if (cut !== null) markPlayed(cut)
     pump.current()
   }
 
@@ -2870,6 +2933,24 @@ export function LiveHub({
                     {path === 'auris' && recognizes && <LiveMeter level={level} />}
                   </div>
                   <div className="live-head-actions">
+                    {/* Muting Naru's voice (mesa task 1327), on Pause's terms:
+                        live, and this browser is in it. The microphone and
+                        the transcript carry on; only the speech stops. */}
+                    {pauseButton && (
+                      <button
+                        type="button"
+                        className="live-icon live-icon-speech"
+                        aria-pressed={speechMuted}
+                        aria-label={
+                          speechMuted ? 'unmute spoken replies' : 'mute spoken replies'
+                        }
+                        title={speechMuted ? 'Unmute spoken replies' : 'Mute spoken replies'}
+                        tabIndex={open ? undefined : -1}
+                        onClick={toggleSpeechMuted}
+                      >
+                        <SpeakerMark muted={speechMuted} />
+                      </button>
+                    )}
                     {/* Stepping out without ending it (mesa task 882) — offered
                         only while the conversation is live and this browser is
                         in it. Sits before End so the press that destroys the

@@ -1825,8 +1825,8 @@ fn row_to_script(row: &rusqlite::Row<'_>) -> rusqlite::Result<Script> {
     })
 }
 
-/// Longest allowed [`ScriptArg::name`]. It becomes an `MESA_ARG_*` env-var
-/// suffix, so it is bounded for the same reason its charset is.
+/// Longest allowed [`ScriptArg::name`]. It becomes a `NARU_ARG_*`/`MESA_ARG_*`
+/// env-var suffix, so it is bounded for the same reason its charset is.
 const SCRIPT_ARG_NAME_MAX: usize = 64;
 
 fn validate_script_name(name: &str) -> Result<String> {
@@ -15675,7 +15675,7 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, Error::Validation(_)), "{bad:?} was accepted");
         }
-        // `a-b` and `A_B` collapse onto the same MESA_ARG_A_B variable.
+        // `a-b` and `A_B` collapse onto the same NARU_ARG_A_B variable.
         let dupes = vec![
             script_arg("a-b", ScriptArgKind::Text),
             script_arg("A_B", ScriptArgKind::Text),

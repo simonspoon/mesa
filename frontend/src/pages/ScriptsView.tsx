@@ -48,7 +48,7 @@ function cwdFor(script: Script, projects: Project[]): string {
 
 /** One row of the declared-argument editor. The name is the load-bearing
  * field — it becomes both a positional (`$1`, `$2`, … in declared order) and
- * an `MESA_ARG_*` variable, which is why its charset is constrained and why
+ * a `NARU_ARG_*` variable, which is why its charset is constrained and why
  * reordering rows changes what the body's `$n` mean. */
 function ArgRow({
   arg,
@@ -193,7 +193,7 @@ function ScriptForm({
         <p className="muted">
           Shell source, handed to <code>bash -c</code> verbatim. Arguments arrive
           as <code>&quot;$1&quot;</code>, <code>&quot;$2&quot;</code>, … in the order declared below,
-          and as <code>&quot;$MESA_ARG_NAME&quot;</code>. Values are never spliced into
+          and as <code>&quot;$NARU_ARG_NAME&quot;</code> (<code>$MESA_ARG_NAME</code> too). Values are never spliced into
           this text.
         </p>
         <CodeEditor

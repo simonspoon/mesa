@@ -1068,8 +1068,9 @@ enum ScriptCmd {
     ///
     /// Declared arguments reach the body twice over: positionally in declared
     /// order (`"$1"`, `"$2"`, …; `$0` is the script name) and as
-    /// MESA_ARG_<NAME> in the environment. Declaring them is mandatory — the
-    /// list is what the web form renders and what `script run` validates
+    /// NARU_ARG_<NAME> in the environment (MESA_ARG_<NAME> too, same value,
+    /// for scripts written before the rename). Declaring them is mandatory —
+    /// the list is what the web form renders and what `script run` validates
     /// against; nothing is ever parsed out of the body.
     #[command(after_help = "\
 ARGUMENTS
@@ -1083,7 +1084,7 @@ ARGUMENTS
     Conflicts with --arg.
 
 EXAMPLES
-  mesa script create deploy 'set -eu; echo \"deploying $MESA_ARG_ENV\"' \\
+  mesa script create deploy 'set -eu; echo \"deploying $NARU_ARG_ENV\"' \\
     --arg env:text:required=staging
   mesa script create --name tidy --body-file - < tidy.sh --project mesa
   mesa script create fmt 'cargo fmt' --arg-json '[{\"name\":\"mode\",\
@@ -1220,9 +1221,10 @@ EXAMPLES
     /// ~/.mesa here is Naru's config dir: ~/.naru if that exists, else ~/.mesa if that exists, else ~/.naru.
     ///
     /// A value is never interpolated into a string a shell parses: it arrives
-    /// as one positional argument and as MESA_ARG_<NAME>. A declared argument
-    /// with no value on this call is genuinely unset, so `set -u` fires rather
-    /// than the body reading an empty string.
+    /// as one positional argument and as NARU_ARG_<NAME> (and MESA_ARG_<NAME>,
+    /// the same value under its pre-rename name). A declared argument with no
+    /// value on this call is genuinely unset under both names, so `set -u`
+    /// fires rather than the body reading an empty string.
     #[command(after_help = "\
 EXAMPLES
   mesa script run deploy --set env=production

@@ -127,7 +127,7 @@ describe('argError', () => {
 
 describe('argsError', () => {
   it('rejects two names that would become the same env var', () => {
-    // `-`→`_` and upper-casing collapse these onto MESA_ARG_A_B.
+    // `-`→`_` and upper-casing collapse these onto NARU_ARG_A_B.
     expect(argsError([draftArg('a-b', 'text'), draftArg('A_B', 'text')])).toMatch(/duplicate/)
   })
 

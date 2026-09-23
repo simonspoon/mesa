@@ -9,7 +9,9 @@
 //!
 //! * positionally: `bash -c <body> <script-name> <v1> <v2> …` in declared
 //!   order, so the body reads `"$1"`, `"$2"`, … (`$0` is the script's name);
-//! * by environment: `MESA_ARG_<NAME>` (upper-cased, `-`→`_`).
+//! * by environment: `NARU_ARG_<NAME>` (upper-cased, `-`→`_`), and
+//!   `MESA_ARG_<NAME>` beside it with the identical value, so a script written
+//!   before the rename (mesa task 1301) keeps working.
 //!
 //! so a value of `; rm -rf / #` is a string the script may read and never
 //! syntax. (The agent hooks in `config.rs` hold the same line the other way
@@ -38,29 +40,31 @@ use crate::core::types::{
     Script, ScriptArg, ScriptArgKind, ScriptRun, ScriptRunEvent, ScriptStream,
 };
 
-/// Prefix of every environment variable this module sets on a run.
-pub const ALL_ENV_PREFIX: &str = "MESA_ARG_";
+/// Prefixes of every environment variable this module sets on a run: each
+/// argument is exported under both, `NARU_ARG_` the primary name and
+/// `MESA_ARG_` the pre-rename one (mesa task 1324), with the identical value.
+pub const ENV_PREFIXES: [&str; 2] = ["NARU_ARG_", "MESA_ARG_"];
 
 /// Captured stdout/stderr are capped so a chatty script can't balloon the JSON
 /// the UI and CLI print (the `hooks.rs` cap, same size).
 const OUTPUT_CAP: usize = 64 * 1024;
 
-/// The environment variable one declared argument arrives in: the name
-/// upper-cased with `-` folded to `_`, under [`ALL_ENV_PREFIX`]. `Store`
+/// The environment variables one declared argument arrives in: the name
+/// upper-cased with `-` folded to `_`, under each of [`ENV_PREFIXES`]. `Store`
 /// constrains an arg name to `^[A-Za-z_][A-Za-z0-9_-]*$` precisely so this
 /// mapping is total and collision-free.
-pub fn env_var_name(arg_name: &str) -> String {
-    format!(
-        "{ALL_ENV_PREFIX}{}",
-        arg_name.to_ascii_uppercase().replace('-', "_")
-    )
+pub fn env_var_names_for(arg_name: &str) -> [String; 2] {
+    let suffix = arg_name.to_ascii_uppercase().replace('-', "_");
+    ENV_PREFIXES.map(|prefix| format!("{prefix}{suffix}"))
 }
 
-/// Every variable name this call *could* set — the sweep list for
-/// `env_remove`, so a variable the script declares but this call has no value
-/// for is removed rather than inherited from mesa's own environment.
+/// Every variable name this call *could* set, under both prefixes — the sweep
+/// list for `env_remove`, so a variable the script declares but this call has
+/// no value for is removed rather than inherited from mesa's own environment.
 pub fn env_var_names(args: &[ScriptArg]) -> Vec<String> {
-    args.iter().map(|a| env_var_name(&a.name)).collect()
+    args.iter()
+        .flat_map(|a| env_var_names_for(&a.name))
+        .collect()
 }
 
 /// Checks a supplied value map against the declared arguments and returns the
@@ -140,13 +144,15 @@ fn command(script: &Script, resolved: &BTreeMap<String, String>, cwd: Option<&st
         cmd.arg(resolved.get(&arg.name).map(String::as_str).unwrap_or(""));
     }
     // Remove every variable this feature can set, then set only the ones this
-    // call actually has — the whole reason `${MESA_ARG_X-UNSET}` can tell
-    // "not supplied" from "empty".
+    // call actually has — the whole reason `${NARU_ARG_X-UNSET}` (and its
+    // `MESA_ARG_X` twin) can tell "not supplied" from "empty".
     for var in env_var_names(&script.args) {
         cmd.env_remove(var);
     }
     for (name, value) in resolved {
-        cmd.env(env_var_name(name), value);
+        for var in env_var_names_for(name) {
+            cmd.env(var, value);
+        }
     }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -425,12 +431,21 @@ mod tests {
     }
 
     #[test]
-    fn env_var_name_upper_cases_and_folds_dashes() {
-        assert_eq!(env_var_name("target"), "MESA_ARG_TARGET");
-        assert_eq!(env_var_name("dry-run"), "MESA_ARG_DRY_RUN");
+    fn env_var_names_upper_case_fold_dashes_and_carry_both_prefixes() {
+        assert_eq!(
+            env_var_names_for("target"),
+            ["NARU_ARG_TARGET".to_string(), "MESA_ARG_TARGET".to_string()]
+        );
+        assert_eq!(
+            env_var_names_for("dry-run"),
+            [
+                "NARU_ARG_DRY_RUN".to_string(),
+                "MESA_ARG_DRY_RUN".to_string()
+            ]
+        );
         assert_eq!(
             env_var_names(&[arg("a", ScriptArgKind::Text, false)]),
-            vec!["MESA_ARG_A".to_string()]
+            vec!["NARU_ARG_A".to_string(), "MESA_ARG_A".to_string()]
         );
     }
 
@@ -481,7 +496,7 @@ mod tests {
     #[test]
     fn run_passes_values_positionally_and_by_environment() {
         let s = script(
-            "printf '%s|%s|%s' \"$0\" \"$1\" \"$MESA_ARG_DRY_RUN\"",
+            "printf '%s|%s|%s|%s' \"$0\" \"$1\" \"$NARU_ARG_DRY_RUN\" \"$MESA_ARG_DRY_RUN\"",
             vec![
                 arg("dry-run", ScriptArgKind::Text, true),
                 arg("second", ScriptArgKind::Text, true),
@@ -489,7 +504,7 @@ mod tests {
         );
         let out = run(&s, &values(&[("dry-run", "yes"), ("second", "two")]), None).unwrap();
         assert_eq!(out.exit_code, 0);
-        assert_eq!(out.stdout, "demo|yes|yes");
+        assert_eq!(out.stdout, "demo|yes|yes|yes");
         assert_eq!(out.script_id, 7);
     }
 
@@ -507,15 +522,17 @@ mod tests {
     #[test]
     fn run_leaves_an_unsupplied_argument_genuinely_unset() {
         let s = script(
-            "set -u; printf '%s' \"${MESA_ARG_NOTE-UNSET}\"",
+            "set -u; printf '%s|%s' \"${NARU_ARG_NOTE-UNSET}\" \"${MESA_ARG_NOTE-UNSET}\"",
             vec![arg("note", ScriptArgKind::Text, false)],
         );
-        // Even with the variable set in mesa's own environment, the sweep
-        // removes it: "not supplied" must never read a stale value.
+        // Even with both variables set in mesa's own environment, the sweep
+        // removes them: "not supplied" must never read a stale value.
+        unsafe { std::env::set_var("NARU_ARG_NOTE", "stale") };
         unsafe { std::env::set_var("MESA_ARG_NOTE", "stale") };
         let out = run(&s, &values(&[]), None).unwrap();
+        unsafe { std::env::remove_var("NARU_ARG_NOTE") };
         unsafe { std::env::remove_var("MESA_ARG_NOTE") };
-        assert_eq!(out.stdout, "UNSET");
+        assert_eq!(out.stdout, "UNSET|UNSET");
     }
 
     #[test]
@@ -617,7 +634,7 @@ mod tests {
     #[test]
     fn stream_shares_the_value_plumbing_of_run() {
         let s = script(
-            "printf '%s|%s\\n' \"$1\" \"${MESA_ARG_NOTE-UNSET}\"",
+            "printf '%s|%s\\n' \"$1\" \"${NARU_ARG_NOTE-UNSET}\"",
             vec![
                 arg("t", ScriptArgKind::Text, true),
                 arg("note", ScriptArgKind::Text, false),

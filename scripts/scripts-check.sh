@@ -8,8 +8,10 @@
 #   * a run's nonzero exit is DATA: the CLI exits 0 carrying `exit_code`;
 #   * no argument value is ever interpolated into a string a shell parses — a
 #     `; rm -rf ... #` value is echoed literally and creates nothing;
-#   * a declared argument with no value this call is genuinely UNSET on the
-#     child (`${MESA_ARG_X-UNSET}` under `set -u`), never empty;
+#   * a declared argument's value arrives as NARU_ARG_<NAME> and, identical,
+#     as the pre-rename MESA_ARG_<NAME> (mesa task 1324); with no value this
+#     call BOTH are genuinely UNSET on the child (`${NARU_ARG_X-UNSET}` under
+#     `set -u`), never empty, even when the server's own env has them set;
 #   * output over 64 KiB is truncated with the `[truncated]` marker;
 #   * cwd is resolved server-side: a project-bound script runs in that
 #     project's `local_path`, an unbound one in `~/.naru/workspace`, and a
@@ -336,20 +338,23 @@ ok "CLI script run --set: only the FIRST = splits NAME=VALUE; the value keeps it
 
 # ---- UNSET, not empty: the env_remove sweep ----
 
-run 0 "$MESA" script create unsetter 'set -u; printf "%s" "${MESA_ARG_NOTE-UNSET}"' --arg 'note:text'
-# Poison mesa's own environment: "not supplied" must not read a stale value.
-export MESA_ARG_NOTE=stale
+run 0 "$MESA" script create unsetter \
+  'set -u; printf "%s|%s" "${NARU_ARG_NOTE-UNSET}" "${MESA_ARG_NOTE-UNSET}"' --arg 'note:text'
+# Poison mesa's own environment under BOTH names: "not supplied" must not read
+# a stale value through either.
+export NARU_ARG_NOTE=stale MESA_ARG_NOTE=stale
 run 0 "$MESA" script run unsetter
-[ "$(jqs .stdout)" = "UNSET" ] ||
-  fail "UNSET: an unsupplied declared arg must be unset, not empty/stale, got: $STDOUT"
+[ "$(jqs .stdout)" = "UNSET|UNSET" ] ||
+  fail "UNSET: an unsupplied declared arg must be unset under both names, not empty/stale, got: $STDOUT"
 [ "$(jqs .exit_code)" = "0" ] || fail "UNSET: the body must have run under set -u"
 run 0 "$MESA" script run unsetter --set note=given
-[ "$(jqs .stdout)" = "given" ] || fail "UNSET: a supplied value must arrive: $STDOUT"
-unset MESA_ARG_NOTE
-ok "an unsupplied declared argument leaves MESA_ARG_<NAME> genuinely UNSET (not empty, not stale) under set -u"
+[ "$(jqs .stdout)" = "given|given" ] ||
+  fail "a supplied value must arrive as NARU_ARG_* AND MESA_ARG_*, identical: $STDOUT"
+unset NARU_ARG_NOTE MESA_ARG_NOTE
+ok "a supplied value arrives as NARU_ARG_<NAME> and MESA_ARG_<NAME> alike; an unsupplied one leaves BOTH genuinely UNSET (not empty, not stale) under set -u"
 
 # set -u itself fires on the unset variable when the body does not default it
-run 0 "$MESA" script create strict 'set -u; printf "%s" "$MESA_ARG_NOTE"' --arg 'note:text'
+run 0 "$MESA" script create strict 'set -u; printf "%s" "$NARU_ARG_NOTE"' --arg 'note:text'
 run 0 "$MESA" script run strict
 [ "$(jqs .exit_code)" != "0" ] || fail "set -u must fire on a genuinely unset variable"
 [ "$(jqs '.stderr | test("unbound variable")')" = "true" ] ||

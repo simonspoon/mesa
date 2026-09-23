@@ -88,7 +88,7 @@ function ArgField({
         {control}
       </label>
       <span className="muted script-arg-hint">
-        ${'{'}MESA_ARG_{arg.name.toUpperCase().replace(/-/g, '_')}
+        ${'{'}NARU_ARG_{arg.name.toUpperCase().replace(/-/g, '_')}
         {'}'}
         {arg.default !== null && ` · default ${arg.default}`}
       </span>

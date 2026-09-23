@@ -10,7 +10,8 @@ import type { ScriptArgKind } from "./ScriptArgKind";
 export type ScriptArg = { 
 /**
  * Identifier: `^[A-Za-z_][A-Za-z0-9_-]*$`, ≤64 chars, unique within the
- * script. Constrained because it becomes an `MESA_ARG_*` env-var suffix.
+ * script. Constrained because it becomes a `NARU_ARG_*`/`MESA_ARG_*`
+ * env-var suffix.
  */
 name: string, 
 /**

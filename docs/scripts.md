@@ -49,8 +49,8 @@ that outlives the connection that started it. Three shapes, one executor.
   process is not storage. Two functions: `validate_values` (pure; the CLI and
   the API both call it, so they cannot diverge on what a valid call is) and
   the executor, in two shapes over **one** private `command()` builder — the
-  body, the positional and `MESA_ARG_*` values, the env sweep and the cwd are
-  built in exactly one place: `run` (capture-and-return, the `hooks.rs`
+  body, the positional and `NARU_ARG_*`/`MESA_ARG_*` values, the env sweep and
+  the cwd are built in exactly one place: `run` (capture-and-return, the `hooks.rs`
   executor shape, used by the CLI and `POST …/run`) and `start` +
   `Streaming::stream` (line by line, used by `POST …/run/stream`, below).
 - **No value is ever interpolated into a string a shell parses.** This is the
@@ -58,16 +58,19 @@ that outlives the connection that started it. Three shapes, one executor.
   exists. The body goes to `bash -c` as **one verbatim argument**; the values
   reach it two ways bash *sets* rather than parses — positionally in declared
   order (`bash -c <body> <name> <v1> <v2> …`, so the body reads `"$1"`, `"$2"`,
-  …, and `$0` is the script's name) and as `MESA_ARG_<NAME>` in the environment
-  (upper-cased, `-`→`_`). A value of `; rm -rf / #` is therefore a string the
-  script may read and never syntax. Nothing here may become string
-  concatenation.
+  …, and `$0` is the script's name) and as `NARU_ARG_<NAME>` in the environment
+  (upper-cased, `-`→`_`) — and, with the identical value, as the pre-rename
+  `MESA_ARG_<NAME>`, so a script written before the rename keeps working (mesa
+  task 1324; `ENV_PREFIXES` in `scripts.rs`). A value of `; rm -rf / #` is
+  therefore a string the script may read and never syntax. Nothing here may
+  become string concatenation.
 - **"Not supplied" must be genuinely unset, not empty.** `run` `env_remove`s
-  every variable the script's arg list could ever produce, *then* sets only the
-  ones this call resolved — copied from `agents.rs::spawn_script`. That sweep is
-  what lets a body under `set -u` fail loudly instead of reading a stale value
-  inherited from Naru's own environment, and what makes
-  `${MESA_ARG_X-UNSET}` a meaningful test. (Positions cannot express absence
+  every variable the script's arg list could ever produce — under **both**
+  prefixes — *then* sets only the ones this call resolved — copied from
+  `agents.rs::spawn_script`. That sweep is what lets a body under `set -u` fail
+  loudly instead of reading a stale value inherited from Naru's own
+  environment, and what makes `${NARU_ARG_X-UNSET}` (and
+  `${MESA_ARG_X-UNSET}`) a meaningful test. (Positions cannot express absence
   without shifting every later `$n`, so an unsupplied argument still occupies
   its position as an empty string; the environment is where absence lives.)
 - **A nonzero exit is data, not a failure** — the hooks posture exactly. All

@@ -1764,7 +1764,8 @@ impl ScriptArgKind {
 #[ts(export, export_to = "../frontend/src/types/")]
 pub struct ScriptArg {
     /// Identifier: `^[A-Za-z_][A-Za-z0-9_-]*$`, ≤64 chars, unique within the
-    /// script. Constrained because it becomes an `MESA_ARG_*` env-var suffix.
+    /// script. Constrained because it becomes a `NARU_ARG_*`/`MESA_ARG_*`
+    /// env-var suffix.
     pub name: String,
     /// Human label for the form; the `name` is used when absent.
     pub label: Option<String>,

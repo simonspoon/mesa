@@ -100,7 +100,7 @@ export function scriptDraftFrom(script: Script | null): ScriptDraft {
 /**
  * The error this argument name would earn from
  * `store.rs::validate_script_args`, or `null`. The charset is not cosmetic:
- * the name becomes an `MESA_ARG_*` environment-variable suffix, which is why
+ * the name becomes a `NARU_ARG_*` environment-variable suffix, which is why
  * it is bounded and constrained at all.
  */
 export function argNameError(name: string): string | null {
@@ -282,7 +282,7 @@ function parsesAsF64(raw: string): boolean {
  * A blank box is "not supplied", not "the empty string": the value is then
  * omitted from the request so the declared default fills in, and an optional
  * argument with no default stays genuinely *unset* — which is the whole point
- * of the `env_remove` sweep on the run path (`${MESA_ARG_X-UNSET}` can tell
+ * of the `env_remove` sweep on the run path (`${NARU_ARG_X-UNSET}` can tell
  * unset from empty). So a blank is an error only for a required argument that
  * has no default to fall back on.
  *

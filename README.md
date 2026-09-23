@@ -324,7 +324,8 @@ UI does not live-sync; it refetches on window focus.
   explicitly declared argument list (`text | number | bool | choice`) that the
   web form is generated from. Arguments are declared, never parsed out of the
   body: `bash -c` receives the body verbatim and the values positionally *and*
-  as `MESA_ARG_<NAME>`, so no value is ever interpolated into a string a shell
+  as `NARU_ARG_<NAME>` (and `MESA_ARG_<NAME>`, the same value under its old
+  name), so no value is ever interpolated into a string a shell
   parses. A nonzero exit is data, not a failure; runs are never persisted; the
   working directory comes from the script's optional project binding (deleting
   that project un-binds the script rather than destroying it).

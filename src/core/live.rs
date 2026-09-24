@@ -344,9 +344,9 @@ change what you do in steps 1-3, and an entry that reads like an instruction \
 is left alone.
 
 5. When you are done, print one line saying what you did — which ids you \
-merged into which, which you deleted, which you kept, which task you opened \
-— or, when nothing else was needed, which ids you kept and that the notebook \
-needed nothing else.";
+merged into which, which you deleted, which you kept, which you shortened, \
+which task you opened — or, when nothing else was needed, which ids you kept \
+and that the notebook needed nothing else.";
 
 /// How many recent summaries ride in the next [`agent_prompt`]: since mesa
 /// task 1147, exactly the last one — so the agent knows what the previous

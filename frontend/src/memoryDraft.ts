@@ -34,8 +34,9 @@ export function budgetMeter(words: number): string {
   return `${words} / ${NOTEBOOK_BUDGET_WORDS} words`
 }
 
-/** Whether a notebook of `words` words is past the budget (strict, like the
- *  server's `over_budget`). */
+/** Whether a notebook of `words` words is past the budget (strict). Display
+ *  only: the server no longer refuses a write past the budget (mesa task
+ *  1337) — the tidy pass between conversations brings it back within it. */
 export function overBudget(words: number): boolean {
   return words > NOTEBOOK_BUDGET_WORDS
 }

@@ -2376,7 +2376,7 @@ EXAMPLES
 
 /// Live memory (mesa task 1147): the **notebook** — the bullets earlier
 /// conversations left for later ones, every active one riding in every live
-/// agent's prompt under a hard word budget — and the **archive**, every turn,
+/// agent's prompt under a word budget — and the **archive**, every turn,
 /// summary and notebook entry ever written, searched on demand.
 ///
 /// The notebook is edited one entry at a time and never rewritten whole: a

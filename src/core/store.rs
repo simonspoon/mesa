@@ -876,8 +876,9 @@ const MIGRATIONS: &[&str] = &[
     //
     // `live_notebook` holds the bullets earlier conversations leave for later
     // ones; the whole active notebook rides in every live agent's prompt, so
-    // it is bounded by `live::LIVE_NOTEBOOK_BUDGET_WORDS` (in `Store`, not the
-    // schema) and edited one row at a time. Retiring is a SOFT delete —
+    // it is budgeted by `live::LIVE_NOTEBOOK_BUDGET_WORDS`, kept within it by
+    // the dream pass (mesa task 1337), not the schema, and edited one row at
+    // a time. Retiring is a SOFT delete —
     // `retired_at` + `retired_reason` (`decayed` | `deleted` | `replaced`;
     // nothing writes `decayed` since mesa task 1337, old rows keep it) —
     // so a retired entry stays in the archive below. Both session FKs are

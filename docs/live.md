@@ -1085,7 +1085,7 @@ The two moments:
    summariser (a failed spawn is a stderr/log line, the printed record and
    the response unchanged). The summariser and the dream then run
    **concurrently**, and that is deliberate: every notebook edit either
-   makes goes through the guarded `Store` paths (the budget, the removal
+   makes goes through the guarded `Store` paths (the removal
    share, a merge's net-words rule), so the worst case is one of the
    summariser's two `add`s landing after the dream read the notebook — a
    bullet the *next* pass sees — never a lost or half-written entry.

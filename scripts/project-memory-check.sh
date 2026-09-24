@@ -285,6 +285,13 @@ run 0 "$NARU" memory import --project "$B" --from "$BIG"
 [ "$(jqs '.imported | length')" = "0" ] || fail "re-import past the budget must add nothing (got $STDOUT)"
 [ "$(jqs '[.skipped[] | select(.reason == "already in the notebook, retired")] | length')" = "1" ] ||
   fail "re-import names the deleted entry as retired (got $STDOUT)"
+# Over its budget, the context header says so and names the dream (750 words
+# left after the delete).
+mkdir -p "$TMP/big-folder"
+run 0 "$NARU" project update "$B" --path "$TMP/big-folder"
+run 0 "$NARU" memory context --path "$TMP/big-folder"
+grep -qF "The notebook holds 750 of its 500 words, over its budget; run \`naru memory dream --project $B\` to tidy it." <<<"$STDOUT" ||
+  fail "context over the budget names the dream (got $STDOUT)"
 ok "memory import: MEMORY.md skipped, description + body, long file cut with …, --dry-run writes nothing, re-import idempotent (past the budget too, nothing retired), missing folder not_found"
 
 # ---- dream: through the live-dream template, stub claude ----

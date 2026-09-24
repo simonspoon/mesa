@@ -710,7 +710,8 @@ function MemorySection() {
         budget, and the tidy pass between conversations brings the notebook
         back within it. Entries are
         edited one at a time; an entry no conversation has used for ten
-        sessions retires on its own, and a retired entry stays searchable
+        sessions becomes a candidate the tidy pass reviews — a one-off is
+        retired, a standing norm kept — and a retired entry stays searchable
         with{' '}
         <code>mesa live memory search</code>.
       </p>

@@ -45,6 +45,7 @@ import {
 } from '../liveCapture'
 import { currentContext, sameContext, subscribeContext } from '../liveContext'
 import { mayHold, SegmentChain } from '../liveDrain'
+import { DiscardLedger, liveCancelVerdict } from '../liveCancel'
 import {
   emptyInkBook,
   inkCarrier,
@@ -1415,6 +1416,21 @@ export function LiveHub({
   // land behind the flush instead of in front of it. `null` while no capture
   // is running (the browser path, mesa speaking, a pause).
   const cutRef = useRef<(() => void) | null>(null)
+  // The discard key's ledger (mesa task 1354, `liveCancel.ts`). Each press
+  // of the switch off commits the stretch of listening it ends and each
+  // `live-cancel` discards it; every capture run — either engine — remembers
+  // the stretch it started in, so a segment still on its way back from
+  // `auris`, or a final the recognizer's `stop()` delivers late, can tell it
+  // was heard before a discard and never lands: not in this recording, and not
+  // in the next one either, which a quick second Escape would otherwise have
+  // opened in time to receive it. A committed stretch is immune, so a drain
+  // the switch started still sends what the switch sent.
+  const discardsRef = useRef<DiscardLedger | null>(null)
+  if (discardsRef.current === null) discardsRef.current = new DiscardLedger()
+  // Whether the mute in force is the discard key's own — the only mute the
+  // same key may lift (`liveCancel.ts`). Any other press of the switch clears
+  // it.
+  const mutedByCancelRef = useRef(false)
 
   // The recording's other boundary (mesa task 917): silence, not just the
   // switch. A timeout re-armed on every dependency change, reading the live
@@ -1459,24 +1475,42 @@ export function LiveHub({
   }, [segmentOpen, hearing, silenceVerdict])
 
   const toggleListening = useCallback(
-    (next: boolean) => {
+    (next: boolean, discard = false) => {
       // The ref first, before the cut and the close below: a segment that
       // settles from here on must read this press, and `setMutedNow` a few
       // lines down would only be re-affirming it. The same reason
       // `listeningRef` is written here rather than left to its effect.
       mutedRef.current = next
+      mutedByCancelRef.current = next && discard
       // Opening the microphone is a press that says "talk to me here", so it
       // claims the voice (mesa task 1267). Closing it gives nothing up: a
       // muted page still hears mesa, and moving the voice to another tab
       // because this one stopped talking would be a second surprise.
       if (!next) claimVoice()
-      if (next) {
+      if (next && discard) {
+        // The discard key (mesa task 1354) is the switch off *without* the
+        // send: nothing is cut onto the chain and nothing is flushed. The
+        // generation moves first, so everything heard up to this press — the
+        // utterance still open, a segment in flight, a late final — is
+        // recognised as stale wherever it settles, and the recording and the
+        // preview go now — unless the last switch-off is still draining, when
+        // the recording is that committed stretch's, waiting on the flush
+        // queued behind its segments, and nothing of this stretch can have
+        // reached it yet (its segments are queued behind that flush).
+        discardsRef.current!.discard()
+        if (!chainRef.current?.draining) {
+          setRecordingNow('')
+          setInterimNow('')
+        }
+      } else if (next) {
         // The switch off is the send (mesa task 1154): the utterance still
         // open is cut onto the chain first, then the chain is closed — which
         // flushes at once when nothing is outstanding, and otherwise makes
         // the flush the step after the last segment already heard, so what
         // was still being transcribed at the press is sent with the rest
-        // rather than dropped behind a recording already gone.
+        // rather than dropped behind a recording already gone. The stretch is
+        // committed first, so a discard pressed while it drains leaves it be.
+        discardsRef.current!.commit()
         cutRef.current?.()
         chainRef.current?.close()
       } else if (!chainRef.current?.draining) {
@@ -1536,6 +1570,44 @@ export function LiveHub({
     return () => window.removeEventListener('keydown', onKey)
   }, [toggleListening, keymap])
 
+  // The discard key (mesa task 1354, `live-cancel`, Escape by default): the
+  // person was interrupted mid-sentence, so what the microphone has heard and
+  // not yet sent is dropped and the microphone muted; the same key again —
+  // or the switch — opens it. A bare key, so `matchesShortcut` runs it past
+  // `shouldIgnoreShortcut` like any other, with the capture box the one field
+  // it is still claimed from (`keymap.ts`'s `CLAIMED_FROM`).
+  //
+  // Escape is also every dialog's, menu's and bar's way out, and those must
+  // win. The hub mounts first and re-registers whenever its dependencies move,
+  // so listener order proves nothing; instead the decision waits one task,
+  // until every listener has had the keystroke, and stands down if any of
+  // them `preventDefault`ed it (`liveCancelVerdict`). Nothing here prevents
+  // it in turn, so a key the conversation does not want is never swallowed.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // A held key repeats, and each repeat would toggle discard and resume.
+      if (e.repeat) return
+      if (!matchesShortcut('live-cancel', e, keymap)) return
+      window.setTimeout(() => {
+        const verdict = liveCancelVerdict({
+          live,
+          joined: unlocked,
+          supported,
+          blocked,
+          paused: pausedRef.current,
+          muted: mutedRef.current,
+          mutedByCancel: mutedByCancelRef.current,
+          defaultPrevented: e.defaultPrevented,
+          composing: e.isComposing,
+        })
+        if (verdict === 'discard') toggleListening(true, true)
+        else if (verdict === 'resume') toggleListening(false)
+      }, 0)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [toggleListening, keymap, live, unlocked, supported, blocked])
+
   // Capture opens a stream and a worklet rather than a recognizer (mesa task
   // 956) — this is the auris half of the pair task 957 added, guarded on
   // `path === 'auris'` so it and the recognizer effect below are mutually
@@ -1560,6 +1632,10 @@ export function LiveHub({
   useEffect(() => {
     if (!wantsMic || transcribes === null || path !== 'auris') return
     let running = true
+    // The stretch this run hears in (mesa task 1354): once the discard key
+    // ends it, nothing this run heard is the person's to send.
+    const stretch = discardsRef.current!.current
+    const discarded = () => discardsRef.current!.isDiscarded(stretch)
     let stream: MediaStream | null = null
     let ctx: AudioContext | null = null
     let node: AudioWorkletNode | null = null
@@ -1631,6 +1707,7 @@ export function LiveHub({
       try {
         const { text: raw } = await transcribeAudio(toBase64(wav))
         if (!running && !outlives) return
+        if (discarded()) return
         // A segment that came back is proof this page is still in touch, so
         // whatever the last failure was, it is over.
         setActionError(null)
@@ -1674,7 +1751,7 @@ export function LiveHub({
           if (grown.flush !== null) void postRef.current(grown.flush, false)
         }
       } catch (err: unknown) {
-        if (!running && !outlives) return
+        if ((!running && !outlives) || discarded()) return
         // This effect only runs at all once the mount probe found auris
         // available (`path === 'auris'`), so a failure here is auris crashing
         // on this one clip, not the missing-binary case `listenPath` already
@@ -1702,7 +1779,9 @@ export function LiveHub({
      */
     const cutOpen = () => {
       const cut = vadCut(vad)
-      if (cut !== null && ctx !== null) {
+      // A discarded utterance is not even posted: the person asked for it to
+      // be dropped, not transcribed and then ignored.
+      if (cut !== null && ctx !== null && !discarded()) {
         const wav = wavFromFrames(frames, cut.startedAt - PRE_ROLL_MS, cut.endedAt, ctx.sampleRate)
         if (wav.length > 44) chain.enqueue(() => send(wav, cut.endedAt, true))
       }
@@ -1757,7 +1836,7 @@ export function LiveHub({
         const wav = wavFromFrames(frames, startedAt - PRE_ROLL_MS, endedAt, ctx.sampleRate)
         // A header-only WAV is a window with nothing in it — nothing anybody
         // said, so nothing worth waking a decoder for.
-        if (wav.length > 44) chain.enqueue(() => send(wav, endedAt))
+        if (wav.length > 44 && !discarded()) chain.enqueue(() => send(wav, endedAt))
       }
       frames = dropBefore(frames, (vad.startedAt ?? at) - PRE_ROLL_MS)
     }
@@ -2085,6 +2164,12 @@ export function LiveHub({
     // cleanup just closed.
     let running = true
     let current: SpeechRecognitionLike | null = null
+    // The stretch this run hears in (mesa task 1354): the `stop()` a discard
+    // causes still delivers the pending sentence as a final, and that sentence
+    // is exactly the one the person discarded. This engine never drains (it
+    // never enqueues on the chain), so a switch-off has already flushed what
+    // its stretch held and the commit has nothing left to protect here.
+    const stretch = discardsRef.current!.current
     // The chosen microphone's stream, held for as long as this effect run is:
     // the engine ends and reopens by itself (the ~60s cap, a long silence),
     // and reacquiring the device on each of those would blink the browser's
@@ -2165,6 +2250,7 @@ export function LiveHub({
       engine.continuous = true
       engine.interimResults = true
       engine.onresult = (event) => {
+        if (discardsRef.current!.isDiscarded(stretch)) return
         // Every result restarts the silence wait, interim or settled alike —
         // a pause the person fills back in mid-sentence must not be read as
         // them having finished (mesa task 917).

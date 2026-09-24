@@ -40,6 +40,9 @@ export function TaskModal({
         )
       )
         return
+      // Marked as well as stopped, so the live conversation's Escape stands
+      // down (mesa task 1354).
+      e.preventDefault()
       e.stopPropagation()
       onClose()
     }

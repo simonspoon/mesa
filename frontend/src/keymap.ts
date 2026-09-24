@@ -13,7 +13,7 @@ import type { ConfigKeymap } from './types/ConfigKeymap'
  * Keyboard shortcuts section and the command palette's key caps read the same
  * answer the listeners act on.
  *
- * Only the four global **window** listeners are here. The Files tab's chords,
+ * Only the global **window** listeners are here. The Files tab's chords,
  * the code editor's Cmd/Ctrl+S and a modal's Escape stay hard-coded on
  * purpose: each belongs to one surface that is on screen and owns the keyboard
  * while it is, which is a different thing from a binding the whole app answers
@@ -29,6 +29,7 @@ export type KeymapAction =
   | 'focus-right'
   | 'create-task'
   | 'live-listen'
+  | 'live-cancel'
 
 export interface KeymapActionSpec {
   id: KeymapAction
@@ -96,7 +97,29 @@ export const ACTIONS: KeymapActionSpec[] = [
     blurb: 'Opens and shuts the microphone during a live conversation',
     defaults: ['Mod+Shift+L'],
   },
+  {
+    id: 'live-cancel',
+    label: 'Live conversation: discard and mute',
+    blurb:
+      'Drops what the microphone has heard but not yet sent and mutes it; again to listen',
+    defaults: ['Escape'],
+  },
 ]
+
+/**
+ * The one text control an action is still claimed *from*, when its chord is
+ * bare (mesa task 1354) — `shouldIgnoreShortcut`'s `claimedFrom`, the idea
+ * `CHORD_FIELDS` in `keyboardScope.ts` already has for the Files tab's chords.
+ * `live-cancel` keeps the live capture box: it holds the keyboard for most of
+ * a conversation, so an Escape pressed while dictating usually lands there,
+ * and Escape types nothing into it. Every other field still stands it down.
+ * Honoured only for a key that types nothing (`e.key` longer than one
+ * character): the action is rebindable, and a printable key bound to it would
+ * otherwise fire on every keystroke typed into the box.
+ */
+const CLAIMED_FROM: Partial<Record<KeymapAction, string>> = {
+  'live-cancel': '.live-input',
+}
 
 /** What every action is bound to right now. */
 export type Keymap = Record<KeymapAction, string[]>
@@ -272,7 +295,8 @@ export function matchesShortcut(
 ): boolean {
   const chord = matchedChord(action, e, keymap)
   if (chord === null) return false
-  if (!hasModifier(chord) && shouldIgnoreShortcut(e)) return false
+  const claimedFrom = e.key.length === 1 ? undefined : CLAIMED_FROM[action]
+  if (!hasModifier(chord) && shouldIgnoreShortcut(e, claimedFrom)) return false
   return true
 }
 

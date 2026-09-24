@@ -40,6 +40,10 @@ export function CreateTaskModal({
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === "Escape") {
+        // Marked as well as stopped: the live conversation's discard key is
+        // Escape too, and stands down for an Escape another listener claimed
+        // (mesa task 1354) — stopping it cannot reach a sibling window listener.
+        e.preventDefault();
         e.stopPropagation();
         onClose();
       }

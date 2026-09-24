@@ -2924,7 +2924,7 @@ fn validate_guard(key: &str, value: &serde_json::Value) -> Result<(), String> {
 /// contract. `keymap_defaults_match_the_frontend_table` is the test that pins
 /// the two id/chord lists together; edit one and edit the other.
 ///
-/// Only the four **global window listeners** are here. A Files-tab chord, the
+/// Only the **global window listeners** are here. A Files-tab chord, the
 /// editor's Cmd/Ctrl+S and a modal's Escape are component-local — they belong
 /// to one surface that is on screen, which is a different thing from a binding
 /// the whole app answers to.
@@ -2936,6 +2936,7 @@ pub const KEYMAP_ACTIONS: &[(&str, &[&str])] = &[
     ("focus-right", &["l", "ArrowRight"]),
     ("create-task", &["a"]),
     ("live-listen", &["Mod+Shift+L"]),
+    ("live-cancel", &["Escape"]),
 ];
 
 /// The most chords one action may be bound to. A **sanity bound, not a
@@ -5728,6 +5729,8 @@ mod tests {
         );
         assert_eq!(keymap_default("create-task"), Some(&["a"][..]));
         assert_eq!(keymap_default("live-listen"), Some(&["Mod+Shift+L"][..]));
+        // The live conversation's discard-and-mute key (mesa task 1354).
+        assert_eq!(keymap_default("live-cancel"), Some(&["Escape"][..]));
         assert_eq!(keymap_default("nope"), None);
         // What mesa ships must itself pass the rule it enforces on a save.
         let shipped: HashMap<String, Vec<String>> = KEYMAP_ACTIONS
@@ -5775,7 +5778,7 @@ mod tests {
             .unwrap();
         assert_eq!(row.value, Some(vec!["n".to_string()]));
         assert_eq!(row.default, vec!["a".to_string()]);
-        // Only the override is stored — the other six actions stay absent.
+        // Only the override is stored — the other seven actions stay absent.
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(written["keymap"].as_object().unwrap().len(), 1);

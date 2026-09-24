@@ -24,7 +24,11 @@ const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/
  * 2. The event target is inside a text input, textarea, contenteditable, or
  *    native <select> — typing and native select option-cycling/type-ahead.
  *    A function key is the one exception, for the reason `FUNCTION_KEY`
- *    above gives.
+ *    above gives. The other is `claimedFrom`: a selector naming the one text
+ *    control a caller's shortcut is still claimed from (mesa task 1354 — the
+ *    live capture box for `live-cancel`'s Escape, since that box holds the
+ *    keyboard for most of a conversation and Escape types nothing into it).
+ *    Rules 3–5 still apply there; only this rule stands aside.
  * 3. The event target is inside an xterm terminal pane (`.xterm` or
  *    `.agent-terminal`).
  * 4. A diagram canvas is mounted anywhere on the page (`.diagram`) —
@@ -32,13 +36,14 @@ const FUNCTION_KEY = /^F([1-9]|1[0-9]|2[0-4])$/
  * 5. A modal that owns its own key handling is open (create-task/
  *    create-project/command-palette backdrops).
  */
-export function shouldIgnoreShortcut(e: KeyboardEvent): boolean {
+export function shouldIgnoreShortcut(e: KeyboardEvent, claimedFrom?: string): boolean {
   if (e.metaKey || e.ctrlKey || e.altKey) return true
 
   const target = e.target instanceof Element ? e.target : null
 
   if (
     !FUNCTION_KEY.test(e.key) &&
+    !(claimedFrom !== undefined && target?.closest(claimedFrom)) &&
     target?.closest(
       'input, textarea, select, [contenteditable=""], [contenteditable="true"]',
     )

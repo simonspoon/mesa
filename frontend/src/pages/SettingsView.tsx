@@ -385,14 +385,14 @@ export function SettingsView({ tab }: { tab: SettingsTab }) {
 }
 
 /**
- * Keyboard shortcuts: which chord runs each of mesa's four global keyboard
+ * Keyboard shortcuts: which chord runs each of mesa's five global keyboard
  * listeners (mesa task 1079). Its own section, draft and save button, for the
  * same reason watchers and pricing have theirs — a separate endpoint, so one
  * form's rejection must not strand the other's edits.
  *
  * The draft is the **whole** keymap rather than the overrides, because a
  * conflict is a fact about every binding at once: a chord recorded here has to
- * be judged against the six actions the user never touched as well. Only what
+ * be judged against the seven actions the user never touched as well. Only what
  * actually changed is PUT (`changedKeymap`), and an action drafted back to the
  * shipped chords is PUT as `null` — a default is an absence, never a stored
  * copy of itself.

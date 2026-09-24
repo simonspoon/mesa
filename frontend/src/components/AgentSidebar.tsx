@@ -1231,7 +1231,10 @@ export function AgentSidebar({
   useEffect(() => {
     if (!maximized) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMaximized(false)
+      if (e.key !== 'Escape') return
+      // Marked, so the live conversation's Escape stands down (mesa task 1354).
+      e.preventDefault()
+      setMaximized(false)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)

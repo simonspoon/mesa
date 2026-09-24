@@ -759,8 +759,8 @@ write_config <<EOF
 EOF
 api GET /api/config/keymap
 [ "$CODE" = "200" ] || fail "GET keymap: expected 200, got $CODE: $STDOUT"
-[ "$(jq -r '.actions | length' <<<"$STDOUT")" = "7" ] ||
-  fail "GET keymap: expected the seven global actions, got $STDOUT"
+[ "$(jq -r '.actions | length' <<<"$STDOUT")" = "8" ] ||
+  fail "GET keymap: expected the eight global actions, got $STDOUT"
 [ "$(jq -r '.actions[0].action' <<<"$STDOUT")" = "command-palette" ] ||
   fail "GET keymap: the actions must arrive in the shipped order: $STDOUT"
 [ "$(jq -r '[.actions[].value] | unique | .[0]' <<<"$STDOUT")" = "null" ] ||
@@ -769,7 +769,7 @@ api GET /api/config/keymap
   fail "GET keymap: built-in palette chord wrong: $STDOUT"
 [ "$(jq -r '.actions[] | select(.action == "focus-left") | .default | join(",")' <<<"$STDOUT")" = "h,ArrowLeft" ] ||
   fail "GET keymap: the spatial nav ships a letter AND an arrow: $STDOUT"
-ok "GET /api/config/keymap reports all seven actions with value: null and the chords mesa ships"
+ok "GET /api/config/keymap reports all eight actions with value: null and the chords mesa ships"
 
 api PUT /api/config/keymap '{"create-task": ["Shift+Mod+N"]}'
 [ "$CODE" = "200" ] || fail "PUT keymap: expected 200, got $CODE: $STDOUT"

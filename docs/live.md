@@ -2381,6 +2381,44 @@ conversation") working with no backend change.
     `togglePause`. Unmuting calls the same `reclaim`, which declines, as it
     should: a recognized sentence reaches the conversation with the keyboard
     anywhere.
+
+    **Escape discards and mutes** (mesa task 1354, the `live-cancel` keymap
+    action, rebindable from Settings). For the person interrupted
+    mid-sentence: the switch off *sends* what was heard, Escape *drops* it —
+    `toggleListening(true, true)` clears the held recording and the interim
+    preview, cuts nothing onto the chain and flushes nothing, and mutes. What
+    was still in flight is stopped by a ledger of **stretches**
+    (`liveCancel.ts::DiscardLedger`): each press of the switch off *commits*
+    the stretch of listening it ends and each Escape *discards* it, and each
+    capture run (either engine) remembers the stretch it started in, so an
+    auris segment settling afterwards, the utterance the teardown would have
+    cut (not even posted) and the final the recognizer's `stop()` delivers
+    late all find their stretch discarded and never land — not in this
+    recording, and not in the next one a quick second Escape opens. A
+    committed stretch is immune: speak, switch off with a segment still at
+    auris, switch on, Escape — the drain the switch started still sends what
+    the switch sent, and the held recording it will flush is kept rather than
+    cleared. Turns already sent are untouched, and so is the typed box. Escape again resumes,
+    but **only its own mute** (`liveCancel.ts::liveCancelVerdict`): a
+    microphone shut with the switch stays shut, since Escape is everyone's
+    back-out key and a stray one must never open a microphone the person
+    closed on purpose. It is offered on the switch's own terms (live, joined,
+    capable, not refused) and not while **paused** — a pause keeps the held
+    recording for Resume — and otherwise leaves the key alone; a held key's
+    auto-repeat is ignored, so holding Escape does not flip discard and
+    resume back and forth. A **bare** key,
+    so it goes through `shouldIgnoreShortcut` like any other, with the capture
+    box (`.live-input`) the one text field it is still claimed *from*
+    (`keymap.ts`'s `CLAIMED_FROM`) — dictation usually leaves the caret there
+    and Escape types nothing into it (only for a key that types nothing: a
+    printable rebind is stood down there like anywhere else, or typing it
+    into the box would fire it). Every other Escape keeps precedence:
+    the hub decides one task after the keystroke, once every listener has had
+    it, and stands down when any of them `preventDefault`ed it — which the
+    window-level Escapes of the shared-backdrop modals, the maximised agents
+    panel and the live board panel now do (field-level Escapes are already
+    stood down by `shouldIgnoreShortcut`'s text-control rule, a modal and a
+    diagram by its own rules). An IME composition's Escape is left alone too.
   - **There is no interim preview through `auris`** (mesa task 956) —
     one-shot transcription has nothing to show until a segment is done, so
     the italic "what I'm hearing" line under the capture box is gone on that

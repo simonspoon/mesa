@@ -31,7 +31,9 @@ export function CcNodeTextModal({
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') {
         // Stop here rather than letting it reach a listener behind the modal —
-        // the same thing CreateTaskModal does.
+        // the same thing CreateTaskModal does. Marked too, so the live
+        // conversation's Escape stands down (mesa task 1354).
+        e.preventDefault()
         e.stopPropagation()
         onClose()
       }

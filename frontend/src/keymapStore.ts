@@ -7,10 +7,10 @@ import type { ConfigKeymap } from './types/ConfigKeymap'
  * The one place the page learns what the keyboard is bound to (mesa task
  * 1079).
  *
- * A module-level store rather than a context, because the four listeners that
+ * A module-level store rather than a context, because the five listeners that
  * read it are mounted in four different places — `App`'s palette hook and
  * spatial nav, `ProjectTasksPage`'s create-task hook, `LiveHub`'s listen chord
- * — and two of them are above where any provider `App` rendered would sit. A
+ * and discard key — and two of them are above where any provider `App` rendered would sit. A
  * store also answers the thing a provider would not: there must be exactly one
  * `GET /api/config/keymap` for the page however many listeners ask, since a
  * keymap is one fact about this install, not per-component state.

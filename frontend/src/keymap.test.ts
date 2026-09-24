@@ -57,6 +57,7 @@ describe('the shipped keymap', () => {
       'focus-right': ['l', 'ArrowRight'],
       'create-task': ['a'],
       'live-listen': ['Mod+Shift+L'],
+      'live-cancel': ['Escape'],
     })
   })
 
@@ -318,5 +319,60 @@ describe('formatChord', () => {
   it('shows an unknown key as the browser names it rather than blank', () => {
     expect(formatChord('F13')).toEqual(['F13'])
     expect(formatChord('not a chord')).toEqual(['not a chord'])
+  })
+})
+
+describe('live-cancel (mesa task 1354)', () => {
+  it('fires from the live capture box, where dictation leaves the caret', () => {
+    const box = document.createElement('textarea')
+    box.className = 'live-input'
+    document.body.appendChild(box)
+    expect(matchesShortcut('live-cancel', dispatch('Escape', {}, box))).toBe(true)
+    box.remove()
+  })
+
+  it('stands down in any other text field, like every bare shortcut', () => {
+    const input = document.createElement('input')
+    document.body.appendChild(input)
+    expect(matchesShortcut('live-cancel', dispatch('Escape', {}, input))).toBe(false)
+    input.remove()
+  })
+
+  it('stands down under an open modal, even from the capture box', () => {
+    const box = document.createElement('textarea')
+    box.className = 'live-input'
+    const backdrop = document.createElement('div')
+    backdrop.className = 'create-task-backdrop'
+    document.body.append(box, backdrop)
+    expect(matchesShortcut('live-cancel', dispatch('Escape', {}, box))).toBe(false)
+    box.remove()
+    backdrop.remove()
+  })
+
+  it('lends the capture box to no other bare shortcut', () => {
+    const box = document.createElement('textarea')
+    box.className = 'live-input'
+    document.body.appendChild(box)
+    expect(matchesShortcut('focus-left', dispatch('h', {}, box))).toBe(false)
+    expect(matchesShortcut('focus-left', dispatch('ArrowLeft', {}, box))).toBe(false)
+    box.remove()
+  })
+
+  it('is not claimed from the capture box when rebound to a key that types', () => {
+    const box = document.createElement('textarea')
+    box.className = 'live-input'
+    document.body.appendChild(box)
+    const keymap: Keymap = { ...DEFAULT_KEYMAP, 'live-cancel': ['x', 'Delete'] }
+    expect(matchesShortcut('live-cancel', dispatch('x', {}, box), keymap)).toBe(false)
+    // A rebind to another key that types nothing keeps the box.
+    expect(matchesShortcut('live-cancel', dispatch('Delete', {}, box), keymap)).toBe(true)
+    // On the page itself the printable key still fires.
+    expect(matchesShortcut('live-cancel', dispatch('x'), keymap)).toBe(true)
+    box.remove()
+  })
+
+  it('fires on the page itself', () => {
+    expect(matchesShortcut('live-cancel', dispatch('Escape'))).toBe(true)
+    expect(matchesShortcut('live-cancel', dispatch('Escape', { shift: true }))).toBe(false)
   })
 })

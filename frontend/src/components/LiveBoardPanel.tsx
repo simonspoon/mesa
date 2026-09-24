@@ -547,6 +547,9 @@ export function LiveBoardPanel({
     if (!open || frozen) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
+      // Marked, so the conversation's own Escape (discard and mute, mesa task
+      // 1354) stands down while it is closing the board.
+      e.preventDefault()
       if (maximized) setMaximized(false)
       else onClose()
     }

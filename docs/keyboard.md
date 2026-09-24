@@ -3,7 +3,7 @@
 Global keyboard control of the web UI: a create-task shortcut on any project
 view, and an app-wide spatial focus layer driven by `h/j/k/l` and the arrow
 keys. Frontend-only except for where the bindings are **stored** — since mesa
-task 1079 the four global listeners read a **keymap** the user can rebind from
+task 1079 the five global listeners read a **keymap** the user can rebind from
 Settings, which lives in `~/.mesa/config.json`'s `keymap` section
 (`docs/config.md`). Nothing in Rust *reads* it: the shortcuts are still the
 page's.
@@ -18,6 +18,7 @@ page's.
 | `Enter` | — | global | Activates the focused element (native browser behavior) |
 | `Cmd/Ctrl+Shift+P` | `command-palette` | global | Command palette |
 | `Cmd/Ctrl+Shift+L` | `live-listen` | global | Opens and shuts the microphone during a live conversation (task 887) |
+| `Escape` | `live-cancel` | live conversation, joined | Drops what the microphone heard and has not sent, and mutes it; again to resume its own mute (task 1354, `docs/live.md`) — any other Escape owner wins |
 | `Cmd/Ctrl+F` | — | Files tab, focused pane, findable file | Opens find-in-file, selecting the remembered query (task 809) |
 | `Cmd/Ctrl+Shift+F` | — | Files tab | Opens the project-wide search panel in place of the tree, selecting the remembered query (task 813) |
 | `Cmd/Ctrl+S` | — | Files tab editor | Saves the file, staying in the editor (and swallows Save Page) |
@@ -69,9 +70,9 @@ inline — the palette in `App.tsx`, the spatial nav's `KEY_DIRECTION`, the `a`
 shortcut in `ProjectTasksPage`, the listen chord's `isListenChord` — so there
 was nowhere to *state* what Naru binds and nothing to rebind.
 
-- **Seven actions**, exactly the four global `window` keydown listeners:
-  `command-palette`, the four `focus-*` directions, `create-task` and
-  `live-listen`. Component-local bindings stay hard-coded — the Files tab's
+- **Eight actions**, exactly the five global `window` keydown listeners:
+  `command-palette`, the four `focus-*` directions, `create-task`,
+  `live-listen` and `live-cancel` (task 1354). Component-local bindings stay hard-coded — the Files tab's
   chords, the code editor's Cmd/Ctrl+S and a modal's Escape belong to one panel
   while it is on screen, which is a different thing from a binding the whole
   app answers to. Rebinding those would be rebinding a form.
@@ -123,7 +124,7 @@ without the other fails.
 **`shouldIgnoreShortcut(e: KeyboardEvent): boolean`** in
 `frontend/src/keyboardScope.ts` is the single gate for every global
 single-key shortcut. Since task 1079 its caller is `keymap.ts`'s
-`matchesShortcut`, on behalf of all four global listeners, whenever the matched
+`matchesShortcut`, on behalf of all five global listeners, whenever the matched
 chord carries no modifier — so every bare shortcut still consumes it, through
 one call instead of four.
 
@@ -142,7 +143,14 @@ Returns `true` (suppress) for, in order:
    this rule alone** (mesa task 1268): it produces no text, so the reason for
    standing a bare shortcut down inside a field does not apply, and a shortcut
    rebound to one fires wherever the caret sits — a bare letter is suppressed
-   there exactly as before.
+   there exactly as before. The other exemption is `claimedFrom` (task 1354): a
+   caller may name the **one** text control its shortcut is still claimed
+   from — `keymap.ts`'s `CLAIMED_FROM`, today only `live-cancel`'s Escape in
+   the live capture box (`.live-input`), which holds the keyboard while the
+   person dictates and into which Escape types nothing. `matchesShortcut`
+   passes it only for a key that types nothing (`e.key` longer than one
+   character), so a printable rebind is stood down in the box like anywhere
+   else. Rules 3–5 still apply there.
 3. `e.target.closest('.xterm, .agent-terminal')` — xterm panes read real
    `keydown` events.
 4. A diagram canvas is mounted anywhere on the page (`.diagram`) — it

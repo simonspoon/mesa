@@ -944,10 +944,11 @@ Settings that Naru's own Rust reads nothing from.
 ```
 
 - One entry per **action**, holding a **list** of chords — because the spatial
-  nav has always answered to a letter *and* an arrow. The seven actions are
+  nav has always answered to a letter *and* an arrow. The eight actions are
   `command-palette`, `focus-left`, `focus-down`, `focus-up`, `focus-right`,
-  `create-task` and `live-listen`: exactly the four global `window` keydown
-  listeners the app mounts. The Files tab's chords, the code editor's
+  `create-task`, `live-listen` and `live-cancel` (Escape — discard what the
+  live microphone heard and mute it, mesa task 1354): exactly the five global
+  `window` keydown listeners the app mounts. The Files tab's chords, the code editor's
   Cmd/Ctrl+S and a modal's Escape are deliberately **not** here — each belongs
   to one panel that is on screen and owns the keyboard while it is, which is a
   different thing from a binding the whole app answers to.
@@ -955,8 +956,8 @@ Settings that Naru's own Rust reads nothing from.
   only overrides live in the file, and `PUT null` removes an entry rather than
   storing the default back. The shipped table is
   `config::KEYMAP_ACTIONS` — `Mod+Shift+P`; `h`/`ArrowLeft`, `j`/`ArrowDown`,
-  `k`/`ArrowUp`, `l`/`ArrowRight`; `a`; `Mod+Shift+L` — which is exactly what
-  the app answered to before the section existed.
+  `k`/`ArrowUp`, `l`/`ArrowRight`; `a`; `Mod+Shift+L`; `Escape` — the first
+  seven exactly what the app answered to before the section existed.
 - A **chord** is written modifiers-then-key, `Mod+Alt+Shift+<key>`, and stored
   canonicalized (modifiers in that order, a single-character key lowercased),
   so the file never holds two spellings of one binding. `Mod` is
@@ -1064,7 +1065,7 @@ built-in, every out-of-range and wrong-typed value 422 writing nothing, an
 unknown body key ignored, and **all six** other sections surviving the guard
 section's save.
 
-For keymap it covers the round trip (`GET` reporting all seven actions with a
+For keymap it covers the round trip (`GET` reporting all eight actions with a
 `null` override beside the chords Naru ships, the spatial nav's letter-and-arrow
 pair included), a chord stored **canonicalized** and only the override stored,
 `PUT null` removing an entry, `commands`/`watchers`/`live`/an unknown section

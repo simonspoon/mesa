@@ -259,6 +259,9 @@ export function Sidebar({
         return ps
       }),
     `projects-${version}`,
+    // Polls like the badges below (mesa task 1352): a project created via the
+    // CLI or another instance is otherwise invisible until the window refocuses.
+    { pollMs: 5000 },
   )
   // Partitioned on EFFECTIVE visibility (task 668), not the raw `archived`
   // flag: the server hides a project from unscoped reads iff it or any

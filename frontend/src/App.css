@@ -6800,9 +6800,11 @@ body.live-sidebar-resizing {
 }
 /* Tables fill the document's width and wrap their cells, rather than
    `.markdown-body`'s shrink-wrapped scroller: a board is read in a narrow
-   panel, where a max-content table is either cramped or cut off. A cell too
-   long for any width still wraps (`anywhere`); only the header keeps its
-   words whole. */
+   panel, where a max-content table is either cramped or cut off. Words stay
+   whole (`break-word`, which unlike `anywhere` does not lower a column's
+   min-content width, so auto layout never squeezes a column below its
+   longest word); a token longer than that widens the table instead, and the
+   board sheet's `min-width: min-content` grows with it. */
 .markdown-body.markdown-doc :where(table) {
   display: table;
   width: 100%;
@@ -6817,7 +6819,7 @@ body.live-sidebar-resizing {
   vertical-align: top;
 }
 .markdown-body.markdown-doc :where(td) {
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 .markdown-body.markdown-doc :where(th) {
   background: var(--panel-raised);

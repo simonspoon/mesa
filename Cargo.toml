@@ -1,6 +1,6 @@
 [package]
 name = "naru"
-version = "1.8.0"
+version = "1.9.0"
 edition = "2024"
 description = "Local-first project & task management for humans and agents"
 license = "MIT"

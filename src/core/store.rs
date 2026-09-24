@@ -1627,7 +1627,9 @@ fn row_to_live_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveTurn> {
         target: row.get(5)?,
         notice: notice.map(|n| LiveNotice::parse(&n).expect("invalid live turn notice in db")),
         agent_id: row.get(10)?,
-        image_path: row.get(11)?,
+        image_path: row
+            .get::<_, Option<String>>(11)?
+            .map(|stored| board::resolve_live_ink(&stored)),
         board_id: row.get(12)?,
         created_at: row.get(6)?,
         delivered_at: row.get(7)?,
@@ -1653,6 +1655,12 @@ pub const LIVE_BOARD_BODY_MAX: usize = 2 * 1024 * 1024;
 /// 2s poll bounded — a conversation that pushed a hundred pictures still
 /// answers with twenty pointers.
 pub const LIVE_BOARD_KEEP: i64 = 20;
+
+/// How many days a turn's ink stays on disk (mesa task 1355). Older ink is
+/// purged by [`Store::purge_live_ink`] each time a conversation starts; a
+/// board kept with `mesa live board keep --task` is a copy in the task's
+/// attachments by then, which the purge never reaches.
+pub const LIVE_INK_KEEP_DAYS: i64 = 30;
 
 /// Longest a board's title may be. The [`LIVE_CONTEXT_FIELD_MAX`] shape and
 /// number: a caption is a label in a head row, not a body.
@@ -5377,7 +5385,12 @@ impl Store {
              VALUES (?1, ?2, datetime('now'), datetime('now'))",
             (project_id, LiveStatus::Live.as_str()),
         )?;
-        self.get_live_session(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        // Best-effort (mesa task 1355), here because it is the one call site
+        // both surfaces reach. A purge that fails is retried at the next
+        // start and must never cost the person their conversation.
+        let _ = self.purge_live_ink(LIVE_INK_KEEP_DAYS);
+        self.get_live_session(id)
     }
 
     /// The running conversation, or `None`. Every `mesa live` command but
@@ -5976,13 +5989,65 @@ impl Store {
         std::fs::write(&path, png)?;
         let stored = self.conn.execute(
             "UPDATE live_turns SET image_path = ?1, board_id = ?2 WHERE id = ?3",
-            (path.to_string_lossy(), board_id, turn.id),
+            (
+                board::live_ink_relative(session_id, turn.id),
+                board_id,
+                turn.id,
+            ),
         );
         if let Err(e) = stored {
             let _ = std::fs::remove_file(&path);
             return Err(e.into());
         }
         Ok(turn.id)
+    }
+
+    /// Removes the ink of every turn older than `keep_days` (mesa task 1355,
+    /// [`LIVE_INK_KEEP_DAYS`]), judged on SQLite's own clock: the file is
+    /// deleted (already gone is fine) and only then the turn's `image_path`
+    /// cleared — `board_id` stays — so the db never names a purged file, and
+    /// a session folder that is left empty goes too. Row-driven: a file no
+    /// turn names is never touched. A file that cannot be removed keeps its
+    /// row, to be retried next time, and the first such error is returned
+    /// once every other row has been purged. Answers how many were purged.
+    pub fn purge_live_ink(&mut self, keep_days: i64) -> Result<usize> {
+        let old: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, image_path FROM live_turns \
+                 WHERE image_path IS NOT NULL AND created_at < datetime('now', ?1) \
+                 ORDER BY id",
+            )?;
+            stmt.query_map([format!("-{keep_days} days")], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let mut first_error = None;
+        let mut purged = 0;
+        for (id, stored) in old {
+            let path = PathBuf::from(board::resolve_live_ink(&stored));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    first_error.get_or_insert(Error::Io(e));
+                    continue;
+                }
+            }
+            self.conn.execute(
+                "UPDATE live_turns SET image_path = NULL WHERE id = ?1",
+                [id],
+            )?;
+            purged += 1;
+            // Refused while anything is still in the folder, which is the point.
+            if let Some(folder) = path.parent() {
+                let _ = std::fs::remove_dir(folder);
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(purged),
+        }
     }
 
     /// The newest turn carrying ink drawn on `board_id` — what
@@ -16024,6 +16089,185 @@ mod tests {
         assert_eq!(heard.id, plain.id);
         let heard = store.next_user_turn(session.id).unwrap().unwrap();
         assert_eq!(heard.image_path.as_deref(), Some(path.as_str()));
+    }
+
+    /// What a turn's `image_path` column actually holds.
+    fn raw_image_path(store: &Store, turn_id: i64) -> Option<String> {
+        store
+            .conn
+            .query_row(
+                "SELECT image_path FROM live_turns WHERE id = ?1",
+                [turn_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The column holds `<session>/<turn>.png` relative to the ink dir (mesa
+    /// task 1355), while the turn read back still names the absolute file —
+    /// the path the agent is told to open.
+    #[test]
+    fn ink_is_stored_relative_and_read_back_absolute() {
+        let (mut store, dir, _lock) = ink_test_store();
+        let session = store.start_live_session(None).unwrap();
+        let board = store
+            .add_live_board(session.id, LiveBoardKind::Markdown, None, "body", None)
+            .unwrap();
+        let turn = store
+            .add_live_ink_turn(session.id, "look", board.id, &tiny_png())
+            .unwrap();
+        assert_eq!(
+            raw_image_path(&store, turn.id),
+            Some(format!("{}/{}.png", session.id, turn.id))
+        );
+        let path = PathBuf::from(turn.image_path.unwrap());
+        assert!(path.is_absolute(), "{}", path.display());
+        assert!(path.starts_with(dir.path().join("live-ink")));
+        assert!(path.exists());
+    }
+
+    /// Moving the ink folder (a relocated data dir) and pointing the ink dir
+    /// at it keeps every turn's ink reachable — a new relative row by
+    /// construction, a pre-1355 absolute row naming the old folder by being
+    /// re-anchored to the new one.
+    #[test]
+    fn ink_follows_a_relocated_ink_dir() {
+        let (mut store, dir, _lock) = ink_test_store();
+        let session = store.start_live_session(None).unwrap();
+        let board = store
+            .add_live_board(session.id, LiveBoardKind::Markdown, None, "body", None)
+            .unwrap();
+        let png = tiny_png();
+        let relative = store
+            .add_live_ink_turn(session.id, "new", board.id, &png)
+            .unwrap();
+        let legacy = store
+            .add_live_ink_turn(session.id, "old", board.id, &png)
+            .unwrap();
+        let old_abs = legacy.image_path.clone().unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE live_turns SET image_path = ?1 WHERE id = ?2",
+                (&old_abs, legacy.id),
+            )
+            .unwrap();
+        // Before the move the legacy row reads back exactly as stored.
+        assert_eq!(
+            store.get_live_turn(legacy.id).unwrap().image_path,
+            Some(old_abs.clone())
+        );
+
+        let moved = dir.path().join("elsewhere").join("ink");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::rename(dir.path().join("live-ink"), &moved).unwrap();
+        // SAFETY: the guard gives this test exclusive access to the env vars.
+        unsafe { std::env::set_var("MESA_LIVE_INK_DIR", &moved) };
+
+        for id in [relative.id, legacy.id] {
+            let path = PathBuf::from(store.get_live_turn(id).unwrap().image_path.unwrap());
+            assert!(path.starts_with(&moved), "{}", path.display());
+            assert_eq!(std::fs::read(&path).unwrap(), png);
+        }
+        // The legacy column itself is untouched: the row follows on read.
+        assert_eq!(raw_image_path(&store, legacy.id), Some(old_abs));
+    }
+
+    /// Ink older than [`LIVE_INK_KEEP_DAYS`] is purged — file removed, column
+    /// cleared, board kept, an emptied session folder removed — while fresh
+    /// ink is untouched; `start_live_session` runs the same purge.
+    #[test]
+    fn ink_older_than_the_keep_window_is_purged() {
+        let (mut store, dir, _lock) = ink_test_store();
+        let png = tiny_png();
+        let ink = |store: &mut Store| {
+            let session = store.start_live_session(None).unwrap();
+            let board = store
+                .add_live_board(session.id, LiveBoardKind::Markdown, None, "body", None)
+                .unwrap();
+            let turn = store
+                .add_live_ink_turn(session.id, "ink", board.id, &png)
+                .unwrap();
+            store.end_live_session(session.id).unwrap();
+            (session.id, board.id, turn)
+        };
+        let backdate = |store: &Store, id: i64| {
+            store
+                .conn
+                .execute(
+                    "UPDATE live_turns SET created_at = datetime('now', '-31 days') \
+                     WHERE id = ?1",
+                    [id],
+                )
+                .unwrap();
+        };
+        let ink_root = dir.path().join("live-ink");
+
+        // Once directly…
+        let (old_session, old_board, old) = ink(&mut store);
+        let (_, _, fresh) = ink(&mut store);
+        backdate(&store, old.id);
+        let old_file = PathBuf::from(old.image_path.clone().unwrap());
+        let fresh_file = PathBuf::from(fresh.image_path.clone().unwrap());
+        assert_eq!(store.purge_live_ink(LIVE_INK_KEEP_DAYS).unwrap(), 1);
+        assert!(!old_file.exists());
+        assert!(!ink_root.join(old_session.to_string()).exists());
+        let purged = store.get_live_turn(old.id).unwrap();
+        assert_eq!(purged.image_path, None);
+        assert_eq!(purged.board_id, Some(old_board));
+        assert!(store.latest_live_ink(old_board).unwrap().is_none());
+        assert_eq!(std::fs::read(&fresh_file).unwrap(), png);
+        assert_eq!(
+            store.get_live_turn(fresh.id).unwrap().image_path,
+            fresh.image_path
+        );
+        // Nothing left to purge.
+        assert_eq!(store.purge_live_ink(LIVE_INK_KEEP_DAYS).unwrap(), 0);
+
+        // …and once through a conversation starting.
+        let (second_session, _, second) = ink(&mut store);
+        backdate(&store, second.id);
+        let second_file = PathBuf::from(second.image_path.clone().unwrap());
+        assert!(second_file.exists());
+        store.start_live_session(None).unwrap();
+        assert!(!second_file.exists());
+        assert!(!ink_root.join(second_session.to_string()).exists());
+        assert_eq!(store.get_live_turn(second.id).unwrap().image_path, None);
+        assert_eq!(std::fs::read(&fresh_file).unwrap(), png);
+    }
+
+    /// A board kept on a task (`mesa live board keep --task`) copies its ink
+    /// into the task's attachments, which the purge never reaches.
+    #[test]
+    fn kept_ink_survives_the_purge() {
+        let (mut store, _dir, _lock) = ink_test_store();
+        let p = store.create_project("p", None, None, None, None).unwrap();
+        let t = add_task(&mut store, p.id, "task");
+        let session = store.start_live_session(None).unwrap();
+        let board = store
+            .add_live_board(session.id, LiveBoardKind::Markdown, None, "body", None)
+            .unwrap();
+        let png = tiny_png();
+        store
+            .add_live_ink_turn(session.id, "keep this", board.id, &png)
+            .unwrap();
+        // What `keep --task` does with the ink it finds.
+        let ink = store.latest_live_ink(board.id).unwrap().unwrap();
+        let bytes = std::fs::read(ink.image_path.clone().unwrap()).unwrap();
+        let kept = store
+            .create_attachment(t.id, &board::ink_filename("board.md"), &bytes, None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE live_turns SET created_at = datetime('now', '-31 days') WHERE id = ?1",
+                [ink.id],
+            )
+            .unwrap();
+        assert_eq!(store.purge_live_ink(LIVE_INK_KEEP_DAYS).unwrap(), 1);
+        assert!(!PathBuf::from(ink.image_path.unwrap()).exists());
+        assert_eq!(store.attachment_bytes(kept.id).unwrap().1, png);
+        unsafe { std::env::remove_var("MESA_ATTACHMENTS_DIR") };
     }
 
     /// Every ink rule refuses before anything is written: no turn, no file.

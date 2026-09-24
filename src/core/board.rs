@@ -82,13 +82,43 @@ pub fn live_ink_dir() -> PathBuf {
     path
 }
 
+/// What a turn's `image_path` column holds (mesa task 1355):
+/// `<session>/<turn>.png`, relative to [`live_ink_dir`], so the row follows
+/// the ink folder wherever it moves. Both components are ids, so there is
+/// nothing here a caller could traverse with.
+pub fn live_ink_relative(session_id: i64, turn_id: i64) -> String {
+    format!("{session_id}/{turn_id}.png")
+}
+
 /// Where the PNG one user turn carried is written: `<dir>/<session>/<turn>.png`.
-/// Both components are ids, so there is nothing here a caller could traverse
-/// with.
 pub fn live_ink_path(session_id: i64, turn_id: i64) -> PathBuf {
-    live_ink_dir()
-        .join(session_id.to_string())
-        .join(format!("{turn_id}.png"))
+    live_ink_dir().join(live_ink_relative(session_id, turn_id))
+}
+
+/// The absolute path a stored `image_path` names (mesa task 1355) — the one
+/// place a turn's column becomes the path `LiveTurn.image_path` hands the
+/// agent. A relative value is joined to [`live_ink_dir`]. An absolute one is
+/// a row written before 1355: kept as it is while that file exists, else
+/// re-anchored to `<ink dir>/<its folder>/<its file>` if the ink moved there
+/// with the data dir, else kept as it is, so whoever opens it gets an honest
+/// "missing" rather than a guess.
+pub fn resolve_live_ink(stored: &str) -> String {
+    let path = Path::new(stored);
+    if path.is_relative() {
+        return live_ink_dir().join(path).to_string_lossy().into_owned();
+    }
+    if path.exists() {
+        return stored.to_string();
+    }
+    if let (Some(session), Some(file)) =
+        (path.parent().and_then(|p| p.file_name()), path.file_name())
+    {
+        let moved = live_ink_dir().join(session).join(file);
+        if moved.exists() {
+            return moved.to_string_lossy().into_owned();
+        }
+    }
+    stored.to_string()
 }
 
 /// What `mesa live board keep --task` names the ink it attaches beside the

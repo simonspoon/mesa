@@ -1512,6 +1512,28 @@ board, and seen by the agent only when the person next sends a turn.
   (the gates' seam). `live_turns.image_path`/`board_id` arrive at migration
   index **76**; `board_id` is `ON DELETE SET NULL`, so a board pruned past the
   keep bound leaves the image and loses only the link.
+- **The column is relative, the turn is absolute** (mesa task 1355):
+  `image_path` is stored as `<session>/<turn>.png` (`board::live_ink_relative`)
+  and resolved against the ink dir on every read by one helper,
+  `board::resolve_live_ink`, so `LiveTurn.image_path` is still the absolute
+  path the agent opens, and an ink folder moved with its data dir (and the ink
+  dir pointed at it) takes every row with it and needs no rewrite — which is
+  why `naru migrate` has none. A row written before 1355 holds an absolute path: it reads back as
+  stored while that file exists, else re-anchored to
+  `<ink dir>/<its folder>/<its file>` if the ink is there, else as stored (an
+  honest "missing" rather than a guess). No migration.
+- **Ink is kept 30 days** (`LIVE_INK_KEEP_DAYS`, mesa task 1355).
+  `Store::purge_live_ink`, run best-effort each time a conversation starts
+  (`start_live_session`, the one call site the CLI and the API share; a
+  failure is ignored and retried at the next start), walks the turns whose ink
+  is older than that on SQLite's clock, deletes each file (already gone is
+  fine), **then** clears that turn's `image_path` — `board_id` stays — so the
+  db never names a purged file, and removes a session folder left empty. It is
+  row-driven, never an mtime sweep: a file no turn names is not touched. A
+  board kept with `naru live board keep --task` is untouched by construction —
+  `keep` **copied** the ink into the task's attachments — and a purged turn no
+  longer counts as the board's ink, so a later `keep` of that board keeps it
+  without one.
 - **The agent** sees both on the turn `naru live listen` prints — `--quiet`
   keeps them, bounded pointers — and its definition (rules 1 and 7) tells it
   to open the PNG with its image tool before answering, and that `board_id`

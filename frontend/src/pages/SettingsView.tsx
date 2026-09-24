@@ -1367,9 +1367,10 @@ function AudioSection() {
         </label>
         <p className="muted settings-command-blurb">
           <code>legacy</code> runs the <code>auris</code>/
-          <code>kokoro-rs</code> binaries; <code>naru-audio</code> asks the
-          daemon at <code>{audio.url ?? audio.url_default}</code>. A change
-          applies on the next probe, with no restart.
+          <code>kokoro-rs</code> binaries; <code>naru-audio</code> probes the
+          naru-audio daemon instead (transcription still runs{' '}
+          <code>auris</code> for now). A change applies on the next probe,
+          with no restart.
         </p>
         <div className="settings-voice-row">
           <select
@@ -1492,7 +1493,7 @@ function ListenSection() {
   }
 
   const dirty = isListenDirty(listen, seeded)
-  const savable = isListenSavable(seeded)
+  const savable = isListenSavable(listen, seeded)
   const fieldError = modelError(seeded.model)
 
   return (

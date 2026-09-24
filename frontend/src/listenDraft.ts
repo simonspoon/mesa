@@ -97,9 +97,14 @@ export function isDirty(listen: ConfigListen, draft: ListenDraft): boolean {
   return valueOf(draft) !== (listen.model ?? null) || engineOf(listen, draft) !== undefined
 }
 
-/** True when nothing drafted would be rejected by the server. */
-export function isSavable(draft: ListenDraft): boolean {
-  return valueError(draft.model ?? '') === null
+/**
+ * True when nothing the save would send is rejected by the server. The model
+ * is judged only when the draft changes it: the server validates just the
+ * keys it is sent, so a bad name already in the file (hand-edited) must not
+ * hold back an engine-only save.
+ */
+export function isSavable(listen: ConfigListen, draft: ListenDraft): boolean {
+  return valueOf(draft) === (listen.model ?? null) || valueError(draft.model ?? '') === null
 }
 
 /**
@@ -113,7 +118,7 @@ export function changedListen(
   listen: ConfigListen,
   draft: ListenDraft,
 ): Record<string, string | null> {
-  if (!isDirty(listen, draft) || !isSavable(draft)) return {}
+  if (!isDirty(listen, draft) || !isSavable(listen, draft)) return {}
   const changed: Record<string, string | null> = {}
   if (valueOf(draft) !== (listen.model ?? null)) changed.model = valueOf(draft)
   const engine = engineOf(listen, draft)

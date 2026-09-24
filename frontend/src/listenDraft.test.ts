@@ -51,7 +51,7 @@ describe('valueError', () => {
   it('accepts blank — that is the default, not a mistake', () => {
     expect(valueError('')).toBeNull()
     expect(valueError('   ')).toBeNull()
-    expect(isSavable({ model: '', engine: 'server' })).toBe(true)
+    expect(isSavable(SET, { model: '', engine: 'server' })).toBe(true)
   })
 
   it('accepts a model name, trimmed', () => {
@@ -75,7 +75,7 @@ describe('valueError', () => {
     expect(valueError('whisper/base')).not.toBeNull()
     expect(valueError('whisper-base; rm -rf /')).not.toBeNull()
     expect(valueError('a'.repeat(65))).not.toBeNull()
-    expect(isSavable({ model: '-o', engine: 'server' })).toBe(false)
+    expect(isSavable(SET, { model: '-o', engine: 'server' })).toBe(false)
   })
 })
 
@@ -123,7 +123,14 @@ describe('engine', () => {
     expect(changedListen(SET, { model: '', engine: 'browser' })).toEqual({ model: null, engine: 'browser' })
   })
 
-  it('holds the engine back with a model the server would reject', () => {
+  it('holds the engine back when the user typed a model the server would reject', () => {
     expect(changedListen(SET, { model: '-o', engine: 'browser' })).toEqual({})
+  })
+
+  it('saves the engine alone past a bad model already in the file', () => {
+    const HAND_EDITED: ConfigListen = { ...SET, model: 'whisper/base' }
+    const draft = { ...draftFrom(HAND_EDITED), engine: 'browser' }
+    expect(isSavable(HAND_EDITED, draft)).toBe(true)
+    expect(changedListen(HAND_EDITED, draft)).toEqual({ engine: 'browser' })
   })
 })

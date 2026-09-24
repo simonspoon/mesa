@@ -4452,7 +4452,7 @@ pub(crate) fn fmt_store_ts(epoch: i64) -> String {
 /// Inverse of [`parse_ts`]: format Unix seconds as ISO-8601 UTC
 /// (`YYYY-MM-DDTHH:MM:SSZ`). Fractional seconds are not reconstructed — the
 /// stored integer is the truth, and the loss is cosmetic (see `.scratch/arch.md`).
-fn fmt_ts(epoch: i64) -> String {
+pub(crate) fn fmt_ts(epoch: i64) -> String {
     let tod = epoch.rem_euclid(86_400);
     format!(
         "{}T{:02}:{:02}:{:02}Z",

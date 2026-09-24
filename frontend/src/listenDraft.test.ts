@@ -11,10 +11,10 @@ import {
 import type { ConfigListen } from './types/ConfigListen'
 
 const MODELS = ['parakeet-tdt-0.6b-v2-int8', 'whisper-base', 'whisper-large-v3']
-const DEFAULTED: ConfigListen = { model: null, models: MODELS }
-const SET: ConfigListen = { model: 'whisper-base', models: MODELS }
+const DEFAULTED: ConfigListen = { model: null, models: MODELS, engine: null, engine_default: 'server' }
+const SET: ConfigListen = { model: 'whisper-base', models: MODELS, engine: null, engine_default: 'server' }
 /** What a machine with no `auris` installed reports. */
-const NO_BINARY: ConfigListen = { model: 'whisper-base', models: [] }
+const NO_BINARY: ConfigListen = { model: 'whisper-base', models: [], engine: null, engine_default: 'server' }
 
 describe('draftFrom', () => {
   it('renders an unconfigured model blank and a configured one as text', () => {
@@ -41,7 +41,7 @@ describe('options', () => {
 
   it('keeps a configured model the binary no longer lists', () => {
     // Otherwise opening the list would silently rewrite a value nobody touched.
-    const retired: ConfigListen = { model: 'am-gone', models: MODELS }
+    const retired: ConfigListen = { model: 'am-gone', models: MODELS, engine: null, engine_default: 'server' }
     expect(options(retired)).toEqual([...MODELS, 'am-gone'])
   })
 })

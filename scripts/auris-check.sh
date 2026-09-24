@@ -43,7 +43,8 @@
 #      recording is strictly less; the Content-Type gate still fires first,
 #      in both modes.
 #   8. `GET /api/live/transcribe` (mesa task 957): a missing recognizer is
-#      200 `available: false`, never an error — an empty model list means
+#      200 `available: false` (`state: "error"` with a message since mesa task
+#      1388), never an error — an empty model list means
 #      "mesa could not ask", not "auris says no"; a recognizer that answers
 #      `--no-download --list-models` is `available: true`; the same
 #      `require_agent_access` gate as the POST (403 foreign Origin/Host, 200
@@ -185,6 +186,9 @@ raw GET "/api/live/transcribe"
   fail "GET /api/live/transcribe with a missing auris binary: expected 200, got $STATUS"
 [ "$(jqb .available)" = "false" ] ||
   fail "GET /api/live/transcribe with a missing auris binary: available must be false, not an error — an empty model list means mesa could not ask"
+[ "$(jqb '[.state, .engine, .url] | tostring')" = '["error","legacy",null]' ] &&
+  [ -n "$(jqb '.message // empty')" ] && [ -n "$(jqb '.checked_at // empty')" ] ||
+  fail "GET /api/live/transcribe with a missing auris binary: state error, engine legacy, url null, a message and checked_at (mesa task 1388): $BODY"
 ok "GET /api/live/transcribe: a missing auris binary is 200 available:false, never an error"
 
 kill "$SERVER_PID" 2>/dev/null || true
@@ -224,6 +228,8 @@ raw GET "/api/live/transcribe"
   fail "GET /api/live/transcribe: available must be true when the recognizer lists a model"
 [ "$(cat "$STUB_DIR/last-argv")" = "--no-download --list-models" ] ||
   fail "GET /api/live/transcribe: must ask auris via --no-download --list-models (got $(cat "$STUB_DIR/last-argv"))"
+[ "$(jqb '[.state, .engine, .url, .message] | tostring')" = '["ready","legacy",null,null]' ] ||
+  fail "GET /api/live/transcribe with a working recognizer: state ready, engine legacy, url and message null (mesa task 1388): $BODY"
 ok "GET /api/live/transcribe: 200 available:true when the recognizer lists a model, asked via --no-download --list-models"
 
 # ---- 3. last transcript line wins; an unrecognised type is ignored ----

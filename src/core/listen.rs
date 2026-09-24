@@ -21,10 +21,12 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::time::{Instant, SystemTime};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use crate::core::audio::{self, AudioEngine, AudioState, TtlCache};
+use crate::core::config;
 use crate::core::speech::{drain_capped, list_names};
 
 /// The speech-to-text binary to run. `MESA_AURIS_BIN` overrides it — the same
@@ -52,28 +54,107 @@ const MAX_MODELS: usize = 50;
 /// isn't a list of names: an empty list means "mesa could not ask", never
 /// "there are none". Callers must treat it as advisory.
 ///
-/// Cached for the life of the process: this runs inside a `OnceLock`, so a
-/// call that blocks blocks every later caller for the life of the process —
-/// there is no cheap timeout here, so the fix is not to start anything that
-/// can hang. Unlike `kokoro-rs --list-voices`, this cannot actually be that
-/// call: auris's `--list-models` is a plain directory read that never
-/// touches the network, and exits 0 with empty stdout when no model is
-/// installed yet — it has nothing to download and nothing to hang on
+/// Cached with a TTL ([`audio::TtlCache`], mesa task 1388): 10 s for a
+/// non-empty answer, 2 s for an empty one, keyed on the binary path — so an
+/// `auris` installed (or removed) while `serve` runs is noticed without a
+/// restart, where the old `OnceLock` kept the first answer for the life of
+/// the process. The cache lock is held across the call, so a call that
+/// blocks blocks every concurrent caller — the fix is still not to start
+/// anything that can hang. Unlike `kokoro-rs --list-voices`, this cannot
+/// actually be that call: auris's `--list-models` is a plain directory read
+/// that never touches the network, and exits 0 with empty stdout when no
+/// model is installed yet — it has nothing to download and nothing to hang on
 /// (`auris/README.md` "`--no-download`", which names this function by name).
 /// `--no-download` is passed anyway, matching `speech::voices()`, so listing
 /// names can never become a fetch even if a future auris version changes
 /// that. Both of the child's pipes are bounded (`list_names` →
 /// `speech::spawn_and_drain`), so a `--list-models` that answers with
 /// megabytes of noise costs one capped buffer, never an unbounded one.
-pub fn models() -> &'static [String] {
-    static MODELS: OnceLock<Vec<String>> = OnceLock::new();
-    MODELS.get_or_init(|| {
-        list_names(
-            &auris_bin(),
-            &["--no-download", "--list-models"],
-            is_model_name,
-            MAX_MODELS,
-        )
+pub fn models() -> Vec<String> {
+    models_checked().0
+}
+
+/// [`models`] plus the wall-clock time the cached answer was taken.
+fn models_checked() -> (Vec<String>, SystemTime) {
+    static MODELS: TtlCache<Vec<String>> = TtlCache::new();
+    let bin = auris_bin();
+    MODELS.get(
+        &bin,
+        Instant::now(),
+        |v| audio::list_ttl(v),
+        || {
+            list_names(
+                &bin,
+                &["--no-download", "--list-models"],
+                is_model_name,
+                MAX_MODELS,
+            )
+        },
+    )
+}
+
+/// What `GET /api/live/transcribe` answers (mesa task 1388): whether the
+/// server's speech-to-text engine is ready, and if not, the sentence the
+/// page shows the person. `available` is `state == ready`, kept for clients
+/// that only read it.
+#[derive(Debug, Serialize)]
+pub struct TranscribeStatus {
+    pub available: bool,
+    pub state: AudioState,
+    /// `audio.engine`: `"legacy"` or `"naru-audio"`.
+    pub engine: &'static str,
+    /// The daemon's URL on `naru-audio`; `null` on `legacy`.
+    pub url: Option<String>,
+    /// `null` when ready.
+    pub message: Option<String>,
+    /// When the (cached) answer was taken, RFC 3339 UTC.
+    pub checked_at: String,
+}
+
+/// The engine `audio.engine` names, asked whether it can transcribe. On
+/// `naru-audio` that is [`audio::probe`]; on `legacy` it is ready iff
+/// [`models`] is non-empty — the pre-1388 `available` signal, unchanged.
+/// Blocking. `Err` only for a config file that cannot be read.
+pub fn status() -> Result<TranscribeStatus, String> {
+    let engine = config::audio_engine()?;
+    Ok(match engine {
+        AudioEngine::NaruAudio => {
+            let probe = audio::probe(&config::audio_url()?);
+            TranscribeStatus {
+                available: probe.state == AudioState::Ready,
+                state: probe.state,
+                engine: engine.as_str(),
+                url: Some(probe.url),
+                message: probe.message,
+                checked_at: probe.checked_at,
+            }
+        }
+        AudioEngine::Legacy => {
+            let (models, taken_at) = models_checked();
+            let ready = !models.is_empty();
+            let secs = taken_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            TranscribeStatus {
+                available: ready,
+                state: if ready {
+                    AudioState::Ready
+                } else {
+                    AudioState::Error
+                },
+                engine: engine.as_str(),
+                url: None,
+                message: (!ready).then(|| {
+                    format!(
+                        "Speech isn't available: {} isn't installed or reported no \
+                         models (`--no-download --list-models` answered nothing).",
+                        auris_bin()
+                    )
+                }),
+                checked_at: crate::core::cc::fmt_ts(secs),
+            }
+        }
     })
 }
 
@@ -399,8 +480,8 @@ mod tests {
     /// bounded result. Mirrors
     /// `speech::tests::list_names_stays_bounded_against_a_flooding_stub` —
     /// exercises `list_names` directly rather than `models()`, whose
-    /// `OnceLock` caches for the life of the process and would leak a stub
-    /// answer into every other test that reads real models.
+    /// process-wide cache would leak a stub answer into every other test
+    /// that reads real models.
     #[test]
     fn list_names_stays_bounded_against_a_flooding_stub() {
         let dir = tempfile::tempdir().expect("tempdir");

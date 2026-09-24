@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod attachments;
+pub mod audio;
 pub mod board;
 pub mod cc;
 pub mod config;

@@ -150,7 +150,23 @@
 //! One key, [`MODEL`], read on every request. Absent or blank is **not** a
 //! default mesa names: it means no `-m` is passed at all, so `auris` picks its
 //! own default model and an unconfigured install runs the argv it ran before
-//! this setting existed. See [`listen_model`] and `docs/live.md`.
+//! this setting existed. See [`listen_model`] and `docs/live.md`. A second
+//! key, [`ENGINE`] (`"server"` | `"browser"`, default `"server"`, mesa task
+//! 1388), names what the **page** listens with.
+//!
+//! ## Audio
+//!
+//! A ninth section picks the engine the **server** runs speech through and
+//! where the `naru-audio` daemon listens (mesa task 1388):
+//!
+//! ```json
+//! { "audio": { "engine": "naru-audio", "url": "http://127.0.0.1:7870" } }
+//! ```
+//!
+//! [`ENGINE`] is `"legacy"` (the external `auris`/`kokoro-rs` binaries, the
+//! built-in) or `"naru-audio"`; [`URL`] defaults to [`audio::DEFAULT_URL`] and
+//! `NARU_AUDIO_URL` overrides it. See [`audio_engine`], [`audio_url`] and
+//! `docs/config.md`.
 //!
 //! ## Keymap
 //!
@@ -177,12 +193,13 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
+use crate::core::audio::{self, AudioEngine};
 use crate::core::guard::{GuardAction, GuardThresholds};
 use crate::core::listen;
 use crate::core::speech;
 use crate::core::types::{
-    ConfigCommand, ConfigGuard, ConfigKeymap, ConfigKeymapAction, ConfigListen, ConfigLive,
-    ConfigPrice, ConfigSpeech, ConfigWatchers, ModelRates,
+    ConfigAudio, ConfigCommand, ConfigGuard, ConfigKeymap, ConfigKeymapAction, ConfigListen,
+    ConfigLive, ConfigPrice, ConfigSpeech, ConfigWatchers, ModelRates,
 };
 
 /// The todo-watcher's dispatch command (`docs/todo-watcher.md`).
@@ -2101,7 +2118,7 @@ fn speech_in(path: &Path) -> Result<ConfigSpeech, String> {
             .voice
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty()),
-        voices: speech::voices().to_vec(),
+        voices: speech::voices(),
     })
 }
 
@@ -2115,7 +2132,7 @@ fn speech_in(path: &Path) -> Result<ConfigSpeech, String> {
 ///   read-modify-write over the whole document, so all four sections (and any
 ///   mesa doesn't know) survive each other's edits.
 pub fn save_speech(updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
-    save_speech_in(&config_file(), updates, speech::voices())
+    save_speech_in(&config_file(), updates, &speech::voices())
 }
 
 /// `offered` is the list membership is checked against — a parameter rather
@@ -2216,8 +2233,17 @@ pub fn validate_voice(voice: &str, offered: &[String]) -> Result<(), String> {
 /// `auris` speech-to-text binary with.
 pub const MODEL: &str = "model";
 
+/// The config key naming what the **page** listens with (mesa task 1388):
+/// `"server"` (the server's engine, `audio.engine`) or `"browser"` (the Web
+/// Speech API, a deliberate opt-in, never a fallback). Also the `audio`
+/// section's key for what the **server** runs.
+pub const ENGINE: &str = "engine";
+
+/// The words `listen.engine` accepts; the first is the built-in.
+const LISTEN_ENGINES: &[&str] = &["server", "browser"];
+
 /// Every key the `listen` section understands, for the unknown-key error.
-const LISTEN_KEYS: &[&str] = &[MODEL];
+const LISTEN_KEYS: &[&str] = &[ENGINE, MODEL];
 
 /// The `listen` map, deserialized on its own for the reason every other
 /// section is — the [`SpeechSection`] mirror, on the input side.
@@ -2231,6 +2257,10 @@ struct ListenConfig {
 struct ListenSection {
     #[serde(default)]
     model: Option<String>,
+    /// Raw, like [`GuardSection::action`]: a word Naru does not know is shown
+    /// verbatim so the editor can fix it.
+    #[serde(default)]
+    engine: Option<String>,
 }
 
 fn read_listen(path: &Path) -> Result<ListenSection, String> {
@@ -2273,15 +2303,21 @@ pub fn listen() -> Result<ConfigListen, String> {
 }
 
 fn listen_in(path: &Path) -> Result<ConfigListen, String> {
+    let section = read_listen(path)?;
     Ok(ConfigListen {
         // The **raw** stored value, not the filtered one [`listen_model_in`]
         // hands the recognizer: a hand-edited nonsense model must reach the
         // editor that can fix it, exactly as [`speech_in`] does for a voice.
-        model: read_listen(path)?
+        model: section
             .model
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty()),
-        models: listen::models().to_vec(),
+        models: listen::models(),
+        engine: section
+            .engine
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        engine_default: LISTEN_ENGINES[0].to_string(),
     })
 }
 
@@ -2296,7 +2332,7 @@ fn listen_in(path: &Path) -> Result<ConfigListen, String> {
 ///   over the whole document, so every section (and any mesa doesn't know)
 ///   survives every other's edits.
 pub fn save_listen(updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
-    save_listen_in(&config_file(), updates, listen::models())
+    save_listen_in(&config_file(), updates, &listen::models())
 }
 
 /// `offered` is the list membership is checked against — a parameter rather
@@ -2326,7 +2362,11 @@ fn save_listen_in(
         if let Some(value) = updates[*key].as_deref().map(str::trim)
             && !value.is_empty()
         {
-            validate_model(value, offered).map_err(SaveError::Validation)?;
+            if key.as_str() == ENGINE {
+                validate_word(key, value, LISTEN_ENGINES).map_err(SaveError::Validation)?;
+            } else {
+                validate_model(value, offered).map_err(SaveError::Validation)?;
+            }
         }
     }
 
@@ -2389,6 +2429,208 @@ pub fn validate_model(model: &str, offered: &[String]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// One of a fixed set of words, or a sentence naming the set.
+fn validate_word(key: &str, value: &str, words: &[&str]) -> Result<(), String> {
+    if words.contains(&value) {
+        return Ok(());
+    }
+    let quoted: Vec<String> = words.iter().map(|w| format!("{w:?}")).collect();
+    Err(format!(
+        "{key} must be one of {}, got {value:?}",
+        quoted.join(", ")
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Audio (mesa task 1388)
+// ---------------------------------------------------------------------------
+
+/// The config key holding where the `naru-audio` daemon listens.
+pub const URL: &str = "url";
+
+/// Every key the `audio` section understands, for the unknown-key error.
+const AUDIO_KEYS: &[&str] = &[ENGINE, URL];
+
+/// The engine the server runs speech through when the config says nothing:
+/// the external binaries, exactly as before this section existed.
+pub const DEFAULT_AUDIO_ENGINE: AudioEngine = AudioEngine::Legacy;
+
+/// The longest daemon URL the editor will write — a sanity bound.
+const AUDIO_URL_MAX: usize = 200;
+
+#[derive(Debug, Default, Deserialize)]
+struct AudioConfig {
+    #[serde(default)]
+    audio: AudioSection,
+}
+
+/// Both keys kept raw, like [`GuardSection::action`]: a bad hand-edited value
+/// falls back to the built-in where it is used and is still shown verbatim.
+#[derive(Debug, Default, Deserialize)]
+struct AudioSection {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+}
+
+fn read_audio(path: &Path) -> Result<AudioSection, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AudioSection::default()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let config: AudioConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("malformed mesa config {}: {e}", path.display()))?;
+    Ok(config.audio)
+}
+
+/// The engine the server runs speech through (`audio.engine`), read on every
+/// request so a change needs no restart. Absent or a word Naru does not know
+/// is [`DEFAULT_AUDIO_ENGINE`].
+pub fn audio_engine() -> Result<AudioEngine, String> {
+    audio_engine_in(&config_file())
+}
+
+fn audio_engine_in(path: &Path) -> Result<AudioEngine, String> {
+    Ok(read_audio(path)?
+        .engine
+        .as_deref()
+        .map(str::trim)
+        .and_then(AudioEngine::parse)
+        .unwrap_or(DEFAULT_AUDIO_ENGINE))
+}
+
+/// Where the daemon listens: `NARU_AUDIO_URL` (or `MESA_AUDIO_URL`) when set
+/// and non-empty, else a valid `audio.url`, else [`audio::DEFAULT_URL`].
+pub fn audio_url() -> Result<String, String> {
+    audio_url_in(&config_file())
+}
+
+fn audio_url_in(path: &Path) -> Result<String, String> {
+    if let Some(url) = crate::core::env::var("AUDIO_URL")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return Ok(url);
+    }
+    Ok(read_audio(path)?
+        .url
+        .map(|v| v.trim().to_string())
+        .filter(|v| validate_audio_url(v).is_ok())
+        .unwrap_or_else(|| audio::DEFAULT_URL.to_string()))
+}
+
+/// The audio settings for the Settings page (`GET /api/config/audio`): each
+/// value verbatim (`null` when the file says nothing) beside its built-in —
+/// the `{value, default}` idiom [`ConfigGuard`] uses.
+pub fn audio() -> Result<ConfigAudio, String> {
+    audio_in(&config_file())
+}
+
+fn audio_in(path: &Path) -> Result<ConfigAudio, String> {
+    let section = read_audio(path)?;
+    let raw = |v: Option<String>| v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    Ok(ConfigAudio {
+        url: raw(section.url),
+        url_default: audio::DEFAULT_URL.to_string(),
+        engine: raw(section.engine),
+        engine_default: DEFAULT_AUDIO_ENGINE.as_str().to_string(),
+    })
+}
+
+/// Writes the `audio` entries named in `updates` into the config file.
+///
+/// - `None` (or blank) **removes** the key, restoring the built-in.
+/// - Everything is validated before anything is written, so a rejected save
+///   leaves the file byte-identical.
+/// - Sibling of every other saver: one read-modify-write over the whole
+///   document, so every section (and any Naru doesn't know) survives.
+pub fn save_audio(updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
+    save_audio_in(&config_file(), updates)
+}
+
+fn save_audio_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut keys: Vec<&String> = updates.keys().collect();
+    keys.sort();
+    for key in &keys {
+        if !AUDIO_KEYS.contains(&key.as_str()) {
+            return Err(SaveError::Validation(format!(
+                "unknown audio setting {key:?}; mesa configures {}",
+                AUDIO_KEYS.join(", ")
+            )));
+        }
+        if let Some(value) = updates[*key].as_deref().map(str::trim)
+            && !value.is_empty()
+        {
+            if key.as_str() == ENGINE {
+                validate_word(key, value, &["legacy", "naru-audio"])
+            } else {
+                validate_audio_url(value)
+            }
+            .map_err(SaveError::Validation)?;
+        }
+    }
+
+    let mut root = read_config_document(path)?;
+    let Some(object) = root.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: the file is not a JSON object",
+            path.display()
+        )));
+    };
+    let section = object
+        .entry("audio")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(section) = section.as_object_mut() else {
+        return Err(SaveError::Unavailable(format!(
+            "malformed mesa config {}: \"audio\" is not a JSON object",
+            path.display()
+        )));
+    };
+    for key in keys {
+        match updates[key].as_deref().map(str::trim) {
+            None | Some("") => {
+                section.remove(key);
+            }
+            Some(value) => {
+                section.insert(key.clone(), serde_json::Value::String(value.to_string()));
+            }
+        }
+    }
+
+    let mut body = serde_json::to_string_pretty(&root)
+        .map_err(|e| SaveError::Unavailable(format!("cannot serialize the mesa config: {e}")))?;
+    body.push('\n');
+    write_atomically(path, &body)
+}
+
+/// A daemon URL is plain `http://host[:port]` with at most a trailing `/`:
+/// Naru's client speaks no TLS, and the probe appends its own paths.
+fn validate_audio_url(url: &str) -> Result<(), String> {
+    let authority = url
+        .strip_prefix("http://")
+        .map(|rest| rest.strip_suffix('/').unwrap_or(rest));
+    match authority {
+        Some(a)
+            if !a.is_empty()
+                && url.len() <= AUDIO_URL_MAX
+                && a.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')
+                }) =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "{URL} must be a plain http://host[:port] address of at most \
+             {AUDIO_URL_MAX} characters (no https, path or query), got {url:?}"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5118,6 +5360,7 @@ mod tests {
                  "watchers": {"todo-concurrency": 4},
                  "speech": {"voice": "bm_george"},
                  "listen": {"model": "parakeet-tdt-0.6b-v2-int8"},
+                 "audio": {"engine": "naru-audio"},
                  "future": {"x": 1}
                }"#,
         );
@@ -5134,6 +5377,7 @@ mod tests {
                 root["listen"][MODEL], "parakeet-tdt-0.6b-v2-int8",
                 "{label}"
             );
+            assert_eq!(root["audio"][ENGINE], "naru-audio", "{label}");
             assert_eq!(root["future"]["x"], 1, "{label}");
             root
         };
@@ -5191,6 +5435,24 @@ mod tests {
         let root = survives("keymap");
         assert_eq!(root["watchers"][TODO_CONCURRENCY], 7);
         assert_eq!(root["keymap"]["create-task"][0], "Mod+Shift+n");
+        // And the audio saver is the eighth (mesa task 1388).
+        save_audio_in(
+            &path,
+            &audio_update(&[(URL, Some("http://127.0.0.1:7871"))]),
+        )
+        .unwrap();
+        let root = survives("audio");
+        assert_eq!(root["watchers"][TODO_CONCURRENCY], 7);
+        assert_eq!(root["keymap"]["create-task"][0], "Mod+Shift+n");
+        assert_eq!(root["audio"][URL], "http://127.0.0.1:7871");
+        // The listen saver's new key leaves the model beside it alone.
+        save_listen_in(
+            &path,
+            &model_update(&[(ENGINE, Some("browser"))]),
+            &offered_models(),
+        )
+        .unwrap();
+        assert_eq!(survives("listen engine")["listen"][ENGINE], "browser");
         // …and every other saver leaves the keymap alone in turn.
         save_watchers_in(&path, &watcher(&[(TODO_CONCURRENCY, Some(9))])).unwrap();
         assert_eq!(
@@ -5534,6 +5796,149 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn listen_engine_round_trips_and_refuses_an_unknown_word_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let view = listen_in(&path).unwrap();
+        assert_eq!(view.engine, None);
+        assert_eq!(view.engine_default, "server");
+
+        save_listen_in(&path, &model_update(&[(ENGINE, Some("browser"))]), &[]).unwrap();
+        assert_eq!(listen_in(&path).unwrap().engine.as_deref(), Some("browser"));
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        for bad in ["auris", "Server", "none"] {
+            let err =
+                save_listen_in(&path, &model_update(&[(ENGINE, Some(bad))]), &[]).unwrap_err();
+            assert!(
+                matches!(&err, SaveError::Validation(m) if m.contains("engine")),
+                "{bad}: {err:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+
+        save_listen_in(&path, &model_update(&[(ENGINE, None)]), &[]).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(written["listen"].get(ENGINE).is_none());
+    }
+
+    fn audio_update(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn audio_defaults_to_legacy_on_the_standard_port() {
+        let _env = crate::core::attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: ENV_LOCK serializes every test touching the environment.
+        unsafe {
+            std::env::remove_var("NARU_AUDIO_URL");
+            std::env::remove_var("MESA_AUDIO_URL");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert_eq!(audio_engine_in(&path).unwrap(), AudioEngine::Legacy);
+        assert_eq!(audio_url_in(&path).unwrap(), "http://127.0.0.1:7870");
+        let view = audio_in(&path).unwrap();
+        assert_eq!(view.url, None);
+        assert_eq!(view.url_default, "http://127.0.0.1:7870");
+        assert_eq!(view.engine, None);
+        assert_eq!(view.engine_default, "legacy");
+
+        // A hand-edited unusable value falls back where it is used, and is
+        // still shown verbatim to the editor.
+        let path = write_config(
+            dir.path(),
+            r#"{"audio": {"engine": "auris", "url": "https://x"}}"#,
+        );
+        assert_eq!(audio_engine_in(&path).unwrap(), AudioEngine::Legacy);
+        assert_eq!(audio_url_in(&path).unwrap(), "http://127.0.0.1:7870");
+        assert_eq!(audio_in(&path).unwrap().engine.as_deref(), Some("auris"));
+    }
+
+    #[test]
+    fn audio_url_env_overrides_the_config() {
+        let _env = crate::core::attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), r#"{"audio": {"url": "http://127.0.0.1:9000"}}"#);
+        // SAFETY: ENV_LOCK serializes every test touching the environment.
+        unsafe {
+            std::env::remove_var("NARU_AUDIO_URL");
+            std::env::remove_var("MESA_AUDIO_URL");
+        }
+        assert_eq!(audio_url_in(&path).unwrap(), "http://127.0.0.1:9000");
+        unsafe { std::env::set_var("MESA_AUDIO_URL", "http://127.0.0.1:9001") };
+        assert_eq!(audio_url_in(&path).unwrap(), "http://127.0.0.1:9001");
+        unsafe { std::env::set_var("NARU_AUDIO_URL", "http://127.0.0.1:9002") };
+        assert_eq!(audio_url_in(&path).unwrap(), "http://127.0.0.1:9002");
+        // Empty is unset.
+        unsafe {
+            std::env::set_var("NARU_AUDIO_URL", "");
+            std::env::remove_var("MESA_AUDIO_URL");
+        }
+        assert_eq!(audio_url_in(&path).unwrap(), "http://127.0.0.1:9000");
+        unsafe { std::env::remove_var("NARU_AUDIO_URL") };
+    }
+
+    #[test]
+    fn save_audio_round_trips_and_refuses_bad_values_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        save_audio_in(
+            &path,
+            &audio_update(&[
+                (ENGINE, Some("naru-audio")),
+                (URL, Some("http://localhost:7871/")),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(audio_engine_in(&path).unwrap(), AudioEngine::NaruAudio);
+        let view = audio_in(&path).unwrap();
+        assert_eq!(view.engine.as_deref(), Some("naru-audio"));
+        assert_eq!(view.url.as_deref(), Some("http://localhost:7871/"));
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        for (key, bad) in [
+            (ENGINE, "auris"),
+            (ENGINE, "Legacy"),
+            (URL, "https://127.0.0.1:7870"),
+            (URL, "127.0.0.1:7870"),
+            (URL, "http://"),
+            (URL, "http://127.0.0.1:7870/health"),
+            (URL, "http://a b"),
+            ("voice", "x"),
+        ] {
+            let err = save_audio_in(&path, &audio_update(&[(key, Some(bad))])).unwrap_err();
+            assert!(matches!(err, SaveError::Validation(_)), "{key}={bad}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                before,
+                "{key}={bad}"
+            );
+        }
+
+        // null and blank both restore the built-in by removing the key.
+        save_audio_in(&path, &audio_update(&[(ENGINE, None), (URL, Some(" "))])).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(written["audio"].get(ENGINE).is_none());
+        assert!(written["audio"].get(URL).is_none());
+        assert_eq!(audio_engine_in(&path).unwrap(), AudioEngine::Legacy);
+
+        // Nothing named writes nothing.
+        let empty = dir.path().join("empty.json");
+        save_audio_in(&empty, &HashMap::new()).unwrap();
+        assert!(!empty.exists());
     }
 
     fn live_update(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<serde_json::Value>> {

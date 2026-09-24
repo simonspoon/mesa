@@ -37,16 +37,39 @@ a Firefox user gets a microphone here — `getUserMedia` is everywhere
 
 The page's one ask, at the moment it joins a conversation, of whether
 `auris` is worth trying at all (mesa task 957, `transcribe_available` in
-`src/api.rs`). Answers `{"available": !listen::models().is_empty()}`.
+`src/api.rs`, `listen::status`). Since mesa task 1388 it answers:
 
-An empty model list is [`listen::models`]'s **"Naru could not ask"**
-signal — the binary missing, failing, or answering with something that
-isn't a list of names — never "auris says it has no models installed";
-there is no way to tell those apart from here, and the caller only needs to
-know whether decoding a recording has anywhere to go. `models()` is cached
-in a `OnceLock` for the life of the process, the same cache
-`GET /api/config/listen` reads (`docs/config.md`), so this route adds no new
-probing mechanism.
+```json
+{"available":false,"state":"daemon_down","engine":"naru-audio",
+ "url":"http://127.0.0.1:7870",
+ "message":"Speech isn't available: naru-audio isn't running at http://127.0.0.1:7870. Start it with `brew services start naru-audio`.",
+ "checked_at":"2026-09-24T12:00:03Z"}
+```
+
+`available` keeps its meaning (`state == "ready"`) — it is still all the
+page reads. `state` is `ready | daemon_down | model_missing | incompatible |
+error`; `message` is the sentence to show (`null` when ready); `checked_at`
+is when the cached answer was taken (RFC 3339 UTC). A config file that
+cannot be read is **502 `unavailable`**.
+
+- **`audio.engine = "legacy"`** (the default, `docs/config.md`): `ready` iff
+  `listen::models()` is non-empty, else `error` with a message naming the
+  binary; `url` is `null`. An empty model list is **"Naru could not ask"** —
+  the binary missing, failing, or answering with something that isn't a list
+  of names — never "auris says it has no models installed". `models()` is
+  cached with a TTL (10 s for a list, 2 s for an empty answer), the same
+  cache `GET /api/config/listen` reads, so installing `auris` is seen within
+  seconds, no restart.
+- **`audio.engine = "naru-audio"`**: `core::audio::probe()` — `GET
+  {audio.url}/health` with a 500 ms timeout, cached 10 s when `ready` and 2 s
+  otherwise, so a daemon that stops is reported `daemon_down` within ten
+  seconds and one that comes back `ready` within two, no restart. `ready`
+  needs health `ok`, `api: 1` and `stt.ready`; `stt.problem.code ==
+  "model_not_pulled"` is `model_missing`, any other `api` is `incompatible`,
+  and anything else — a `/health` with no `stt` block included — is `error`
+  quoting what the daemon reported. Every **change** of state is logged to
+  the server's stderr, e.g. `warn audio state ready -> daemon_down
+  url=http://127.0.0.1:7870` (`info` when the new state is `ready`).
 
 The GET is registered on the **same** route entry as the POST below — both
 folded into the main route chain in `router()`, with no route-specific

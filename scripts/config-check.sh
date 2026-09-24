@@ -1323,6 +1323,61 @@ CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -X PUT -H 'Host: evil.example' \
 [ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a refused listen PUT must not touch the file"
 ok "both listen verbs sit behind the config routes' gate — a request that isn't from this machine's own page is refused, writing nothing"
 
+# ---- listen.engine and the audio section (mesa task 1388) ----
+#
+# `listen.engine` is what the page listens with; the `audio` section is what
+# the server runs speech through and where the naru-audio daemon listens.
+api PUT /api/config/listen '{"engine": "browser"}'
+[ "$CODE" = "200" ] || fail "PUT listen engine: expected 200, got $CODE: $STDOUT"
+[ "$(jq -r '.engine' <<<"$STDOUT")" = "browser" ] && [ "$(jq -r '.engine_default' <<<"$STDOUT")" = "server" ] ||
+  fail "PUT listen engine must echo engine browser beside default server: $STDOUT"
+BEFORE=$(cat "$CONFIG")
+api PUT /api/config/listen '{"engine": "auris"}'
+[ "$CODE" = "422" ] || fail "listen engine auris: expected 422, got $CODE: $STDOUT"
+[ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a rejected listen engine must write nothing"
+ok "listen.engine takes server|browser (default server), 422 writing nothing for anything else"
+
+api GET /api/config/audio
+[ "$CODE" = "200" ] || fail "GET audio: expected 200, got $CODE: $STDOUT"
+[ "$(jq -c '[.url, .url_default, .engine, .engine_default]' <<<"$STDOUT")" = '[null,"http://127.0.0.1:7870",null,"legacy"]' ] ||
+  fail "GET audio on an unconfigured section: $STDOUT"
+api PUT /api/config/audio '{"engine": "naru-audio", "url": "http://127.0.0.1:7871"}'
+[ "$CODE" = "200" ] || fail "PUT audio: expected 200, got $CODE: $STDOUT"
+[ "$(jq -c '.audio' < "$CONFIG")" = '{"engine":"naru-audio","url":"http://127.0.0.1:7871"}' ] ||
+  fail "PUT audio did not write the section: $(cat "$CONFIG")"
+[ "$(jq -r '.listen.engine' < "$CONFIG")" = "browser" ] ||
+  fail "an audio write clobbered the listen section: $(cat "$CONFIG")"
+[ "$(jq -r '.speech.voice' < "$CONFIG")" = "af_bella" ] ||
+  fail "an audio write clobbered the speech section: $(cat "$CONFIG")"
+[ "$(jq -r '.commands["inbox-watcher"]' < "$CONFIG")" = "mytool triage {id}" ] ||
+  fail "an audio write clobbered the commands section: $(cat "$CONFIG")"
+[ "$(jq -r '.other.x' < "$CONFIG")" = "1" ] ||
+  fail "an audio write dropped a section it doesn't own: $(cat "$CONFIG")"
+api PUT /api/config/live '{"auto_send_ms": 2600}'
+[ "$CODE" = "200" ] || fail "PUT live after audio: expected 200, got $CODE: $STDOUT"
+api PUT /api/config/listen '{"model": null}'
+[ "$CODE" = "200" ] || fail "PUT listen after audio: expected 200, got $CODE: $STDOUT"
+[ "$(jq -c '.audio' < "$CONFIG")" = '{"engine":"naru-audio","url":"http://127.0.0.1:7871"}' ] ||
+  fail "a live or listen write clobbered the audio section: $(cat "$CONFIG")"
+ok "PUT /api/config/audio writes engine+url and leaves every other section alone, and they leave it alone"
+
+BEFORE=$(cat "$CONFIG")
+for BODY in '{"engine": "auris"}' '{"url": "https://127.0.0.1:7870"}' '{"url": "127.0.0.1:7870"}' '{"url": "http://127.0.0.1:7870/health"}'; do
+  api PUT /api/config/audio "$BODY"
+  [ "$CODE" = "422" ] || fail "audio $BODY: expected 422, got $CODE: $STDOUT"
+  [ "$(jq -r .error.code <<<"$STDOUT")" = "validation" ] || fail "audio $BODY: expected validation, got $STDOUT"
+done
+[ "$(cat "$CONFIG")" = "$BEFORE" ] || fail "a rejected audio PUT must not touch the file: $(cat "$CONFIG")"
+api PUT /api/config/audio '{"engine": null, "url": ""}'
+[ "$CODE" = "200" ] || fail "PUT audio reset: expected 200, got $CODE: $STDOUT"
+[ "$(jq -c '.audio' < "$CONFIG")" = '{}' ] || fail "null and blank must remove the keys: $(cat "$CONFIG")"
+ok "PUT /api/config/audio: a bad engine or URL is 422 writing nothing; null and blank restore the built-ins"
+
+CODE=$(curl -s -o "$TMP/body" -w '%{http_code}' -H 'Host: evil.example' \
+  "http://127.0.0.1:$PORT/api/config/audio")
+[ "$CODE" = "403" ] || fail "GET audio with a foreign Host: expected 403, got $CODE: $(cat "$TMP/body")"
+ok "the audio verbs sit behind the config routes' gate"
+
 printf '{ not json' > "$CONFIG"
 api GET /api/config
 [ "$CODE" = "502" ] || fail "malformed config GET: expected 502, got $CODE: $STDOUT"

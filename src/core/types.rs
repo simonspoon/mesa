@@ -409,6 +409,29 @@ pub struct ConfigListen {
     /// or uncooperative binary — never "there are no models", so an empty
     /// list is a reason to accept a typed name, not to refuse one.
     pub models: Vec<String>,
+    /// What the **page** listens with (mesa task 1388), verbatim: `"server"`,
+    /// `"browser"`, or `null` when the config says nothing.
+    pub engine: Option<String>,
+    /// The built-in page engine (`"server"`).
+    pub engine_default: String,
+}
+
+/// The `naru-audio` settings as the Settings page sees them (`core::config`,
+/// `docs/config.md`, mesa task 1388): which engine the **server** runs speech
+/// through and where the daemon listens, each verbatim (`null` when the
+/// config says nothing) beside its built-in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
+pub struct ConfigAudio {
+    /// The configured daemon URL, or `null`. `NARU_AUDIO_URL` overrides it
+    /// where it is used, not here.
+    pub url: Option<String>,
+    /// The built-in daemon URL (`http://127.0.0.1:7870`).
+    pub url_default: String,
+    /// `"legacy"`, `"naru-audio"`, or `null`.
+    pub engine: Option<String>,
+    /// The built-in engine (`"legacy"`).
+    pub engine_default: String,
 }
 
 /// The live-conversation settings as the Settings page sees them

@@ -35,10 +35,12 @@
 
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::OnceLock;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
+
+use crate::core::audio::{self, TtlCache};
 
 /// Bytes read from the synthesiser per chunk. Chunks are the unit the response
 /// body is written in, so this trades syscalls against how promptly the first
@@ -184,24 +186,34 @@ const MAX_VOICES: usize = 500;
 /// here", never "there are no voices". Callers must treat it as advisory —
 /// [`start`] passes whatever voice it is given.
 ///
-/// Cached for the life of the process: the call costs ~1s, the answer changes
-/// only when the binary does, and it is read on every Settings page load.
-/// `--no-download`: listing names must never become a model fetch. This runs
-/// inside a `OnceLock`, so a call that blocks blocks every later caller for
-/// the life of the process — there is no cheap timeout here, so the fix is
-/// not to start anything that can hang. Both of the child's pipes are bounded
+/// Cached with a TTL ([`audio::TtlCache`], mesa task 1388): 10 s for a
+/// non-empty answer, 2 s for an empty one, keyed on the binary path — the
+/// call costs ~1s and is read on every Settings page load, but a synthesiser
+/// installed while `serve` runs is now noticed without a restart.
+/// `--no-download`: listing names must never become a model fetch. The cache
+/// lock is held across the call, so a call that blocks blocks every
+/// concurrent caller — there is no cheap timeout here, so the fix is not to
+/// start anything that can hang. Both of the child's pipes are bounded
 /// (`list_names` → `spawn_and_drain`), so a `--list-voices` that answers with
 /// megabytes of noise costs one capped buffer, never an unbounded one.
-pub fn voices() -> &'static [String] {
-    static VOICES: OnceLock<Vec<String>> = OnceLock::new();
-    VOICES.get_or_init(|| {
-        list_names(
-            &kokoro_bin(),
-            &["--no-download", "--list-voices"],
-            is_voice_name,
-            MAX_VOICES,
+pub fn voices() -> Vec<String> {
+    static VOICES: TtlCache<Vec<String>> = TtlCache::new();
+    let bin = kokoro_bin();
+    VOICES
+        .get(
+            &bin,
+            Instant::now(),
+            |v| audio::list_ttl(v),
+            || {
+                list_names(
+                    &bin,
+                    &["--no-download", "--list-voices"],
+                    is_voice_name,
+                    MAX_VOICES,
+                )
+            },
         )
-    })
+        .0
 }
 
 /// Whether `name` is shaped like a voice: a bounded identifier that cannot be
@@ -691,8 +703,8 @@ mod tests {
     /// rejects the one giant "line" `list_names` sees) must still return
     /// promptly with a bounded result rather than growing without bound.
     /// Exercises `list_names` directly rather than `voices()`, whose
-    /// `OnceLock` caches for the life of the process and would leak a stub
-    /// answer into every other test that reads real voices.
+    /// process-wide cache would leak a stub answer into every other test
+    /// that reads real voices.
     #[test]
     fn list_names_stays_bounded_against_a_flooding_stub() {
         let dir = tempfile::tempdir().expect("tempdir");

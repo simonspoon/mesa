@@ -19,4 +19,13 @@ model: string | null,
  * or uncooperative binary — never "there are no models", so an empty
  * list is a reason to accept a typed name, not to refuse one.
  */
-models: Array<string>, };
+models: Array<string>, 
+/**
+ * What the **page** listens with (mesa task 1388), verbatim: `"server"`,
+ * `"browser"`, or `null` when the config says nothing.
+ */
+engine: string | null, 
+/**
+ * The built-in page engine (`"server"`).
+ */
+engine_default: string, };

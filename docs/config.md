@@ -637,18 +637,17 @@ reads an item in (mesa task 822, `docs/inbox.md`).
   twin to `todo_concurrency_default` — there is no mesa-side default to
   report.
 - **The list of voices comes from the binary**, not from Naru:
-  `kokoro-rs --list-voices`, filtered to bounded identifiers and cached for
-  the life of the process (`core::speech::voices`). An **empty list means Naru
-  could not ask** — no binary, or an answer that wasn't a list of names —
-  never "there are no voices", so the editor falls back to a plain text box
-  and the save-time membership check is skipped. Naru never ships a voice list
-  a model update could silently make wrong. The cache is per process, so
-  installing the synthesiser (or a model that adds a voice) while `mesa serve`
-  is already running needs a **Restart server** before the picker sees it —
-  the button is in the Settings page's own title row. `--list-voices` runs with
-  `--no-download`: listing names must never turn into a model fetch, because
-  the call sits behind a `OnceLock` where one hang would wedge every later
-  reader.
+  `kokoro-rs --list-voices`, filtered to bounded identifiers and cached with
+  a TTL (`core::speech::voices`, mesa task 1388: 10 s for a list, 2 s for an
+  empty answer). An **empty list means Naru could not ask** — no binary, or
+  an answer that wasn't a list of names — never "there are no voices", so the
+  editor falls back to a plain text box and the save-time membership check is
+  skipped. Naru never ships a voice list a model update could silently make
+  wrong. Installing the synthesiser (or a model that adds a voice) while
+  `naru serve` is running is seen within seconds, no restart. `--list-voices`
+  runs with `--no-download`: listing names must never turn into a model
+  fetch, because the call holds the cache lock and one hang would wedge every
+  concurrent reader.
 - **A voice is a bounded identifier** (`core::speech::is_voice_name`: up to 64
   ASCII letters/digits/`_`/`-`, starting with a letter or digit) — one
   `Command::arg` after `-v`, so a value can never be read as an option or
@@ -811,14 +810,13 @@ mirror of Speech, above.
   either: it is derived per request, not stored here.
 - **The list of models comes from the binary**, not from Naru:
   `auris --no-download --list-models`, filtered to bounded identifiers and
-  cached for the life of the process (`core::listen::models`). An **empty
-  list means Naru could not ask** — no binary, or an answer that wasn't a
-  list of names — never "there are no models", so the editor falls back to a
-  plain text box and the save-time membership check is skipped. The cache is
-  per process, so installing `auris` (or a model that adds one) while `mesa
-  serve` is already running needs a **Restart server** before the picker sees
-  it. `--list-models` runs with `--no-download`: listing names must never
-  turn into a model fetch.
+  cached with a TTL (`core::listen::models`, mesa task 1388: 10 s for a list,
+  2 s for an empty answer). An **empty list means Naru could not ask** — no
+  binary, or an answer that wasn't a list of names — never "there are no
+  models", so the editor falls back to a plain text box and the save-time
+  membership check is skipped. Installing `auris` (or a model) while `naru
+  serve` is running is seen within seconds, no restart. `--list-models` runs
+  with `--no-download`: listing names must never turn into a model fetch.
 - **A model is a bounded identifier** (`core::listen::is_model_name`: up to
   64 ASCII letters/digits/`_`/`-`/`.`, starting with a letter or digit — the
   one deliberate difference from a voice's shape rule, since `auris`'s only
@@ -835,21 +833,60 @@ mirror of Speech, above.
   and the next transcription uses it, no restart. A malformed config file is
   `unavailable` on the transcribe route too (503) rather than a guessed
   default.
+- **`engine`** (mesa task 1388) names what the **page** listens with:
+  `"server"` (the server's engine, below) or `"browser"` (the Web Speech API
+  — a deliberate opt-in, never a fallback). Absent/`null`/blank = `"server"`;
+  any other word is **422**. Nothing reads it yet — the page's switch is a
+  later task.
 
 ### Routes
 
-- `GET /api/config/listen` → `ConfigListen`: `{model, models}`, `model` being
-  the override (`null` when unset) and `models` what the installed binary
-  offers (`[]` when Naru couldn't ask — **not** an error, since the setting
-  must stay visible on a machine where `auris` isn't installed yet). Gated
-  like the other config getters (`require_agent_access`); a malformed config
-  is **502 `unavailable`**.
-- `PUT /api/config/listen`, body `{"model": "<name>" | null}` → echoes the
-  getter. `null` **and** blank both remove the key, restoring the binary's own
-  model. A name that isn't a model — or, when Naru has a list, isn't on it —
-  is **422 `validation`**, writing nothing. Gated with
-  `require_agent_access`, the same posture as every other config write (mesa
-  task 1021).
+- `GET /api/config/listen` → `ConfigListen`: `{model, models, engine,
+  engine_default}`, `model` being the override (`null` when unset) and
+  `models` what the installed binary offers (`[]` when Naru couldn't ask —
+  **not** an error, since the setting must stay visible on a machine where
+  `auris` isn't installed yet); `engine` verbatim or `null`, beside
+  `engine_default` (`"server"`). Gated like the other config getters
+  (`require_agent_access`); a malformed config is **502 `unavailable`**.
+- `PUT /api/config/listen`, body `{"model": "<name>" | null, "engine":
+  "server" | "browser" | null}` → echoes the getter. `null` **and** blank
+  both remove the key. A name that isn't a model — or, when Naru has a list,
+  isn't on it — or an unknown engine is **422 `validation`**, writing
+  nothing. Gated with `require_agent_access`, the same posture as every other
+  config write (mesa task 1021).
+
+## Audio
+
+A ninth, independent section picks the engine the **server** runs speech
+through and where the `naru-audio` daemon listens (mesa task 1388):
+
+```json
+{
+  "audio": {
+    "engine": "naru-audio",
+    "url": "http://127.0.0.1:7870"
+  }
+}
+```
+
+- **`engine`**: `"legacy"` (the external `auris`/`kokoro-rs` binaries — the
+  built-in) or `"naru-audio"` (the daemon). Neither is a fallback for the
+  other. Today it changes only what `GET /api/live/transcribe` reports
+  (`docs/listen.md`); transcription and speech still run the binaries.
+- **`url`**: a plain `http://host[:port]` (no TLS, path or query), default
+  `http://127.0.0.1:7870`. **`NARU_AUDIO_URL`** (or `MESA_AUDIO_URL`), when
+  set and non-empty, overrides the file.
+- Read on every request. A hand-edited unusable value falls back to the
+  built-in where it is used and is shown verbatim by the getter.
+
+### Routes
+
+- `GET /api/config/audio` → `ConfigAudio`: `{url, url_default, engine,
+  engine_default}`, each value verbatim or `null` beside its built-in.
+- `PUT /api/config/audio`, body `{"url": … | null, "engine": … | null}` →
+  echoes the getter. `null` and blank remove the key; a bad value is **422
+  `validation`**, writing nothing. Both verbs carry `require_agent_access`,
+  like every other config route.
 
 ## Guard
 

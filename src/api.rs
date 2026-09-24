@@ -2496,6 +2496,13 @@ fn router(state: AppState) -> Router {
             "/api/config/listen",
             get(get_config_listen).put(update_config_listen),
         )
+        // The same file's `audio` section — which engine the server runs
+        // speech through and where the `naru-audio` daemon listens (mesa task
+        // 1388). A ninth route for the same reason as the others.
+        .route(
+            "/api/config/audio",
+            get(get_config_audio).put(update_config_audio),
+        )
         // The same file's `guard` section — the cost-guard's thresholds
         // (mesa task 1018). A seventh route for the same reason as the other
         // five.
@@ -4891,18 +4898,17 @@ async fn transcribe_live(
     Ok(Json(LiveTranscript { text }).into_response())
 }
 
-/// `GET /api/live/transcribe` — whether a recognizer is the way in, for the
-/// live page to ask once per load before it decides whether to fall back to
-/// the browser's own `SpeechRecognition` (mesa task 957).
+/// `GET /api/live/transcribe` — whether the server's speech-to-text engine
+/// is the way in, for the live page to ask once per load before it decides
+/// whether to fall back to the browser's own `SpeechRecognition` (mesa task
+/// 957).
 ///
-/// Answers `{"available": !listen::models().is_empty()}`. An empty list is
-/// [`listen::models`]'s "mesa could not ask" signal — the binary missing,
-/// failing, or answering with something that isn't a list of names — **never**
-/// "auris says it has no models installed"; there is no way to tell those
-/// apart from here, and the caller only needs to know whether decoding a
-/// recording has anywhere to go. `models()` is `OnceLock`-cached for the life
-/// of the process, exactly as `get_config_listen` already relies on, so this
-/// route adds no new probing mechanism — it just reads the same signal.
+/// Answers `{available, state, engine, url, message, checked_at}` (mesa task
+/// 1388, [`listen::status`], `docs/listen.md`): on `audio.engine =
+/// naru-audio` the daemon's TTL-cached `/health` probe, on `legacy` ready iff
+/// [`listen::models`] is non-empty. `available` keeps its old meaning
+/// (`state == "ready"`) for clients that read nothing else. A config file
+/// that cannot be read is 502 `unavailable`, as on the config routes.
 ///
 /// Registered on the **same** `.route("/api/live/transcribe", ...)` entry as
 /// [`transcribe_live`] rather than its own line, so the two verbs share one
@@ -4922,14 +4928,16 @@ async fn transcribe_available(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     require_agent_access(&state, &addr, &headers)?;
-    let available = tokio::task::spawn_blocking(|| !listen::models().is_empty())
-        .await
-        .map_err(|e| ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
+    // A subprocess (legacy) or a blocking HTTP probe (naru-audio): off the
+    // async workers either way.
+    let status = blocking(listen::status)
+        .await?
+        .map_err(|message| ApiError {
+            status: StatusCode::BAD_GATEWAY,
             code: "unavailable",
-            message: format!("checking auris availability failed: {e}"),
+            message,
         })?;
-    Ok(Json(json!({ "available": available })).into_response())
+    Ok(Json(status).into_response())
 }
 
 // ---- scripts (user-authored shell) ----
@@ -8428,6 +8436,9 @@ struct ListenUpdate {
     /// the recognizer's own default.
     #[serde(default, deserialize_with = "deserialize_some")]
     model: Option<Option<String>>,
+    /// `"server"` or `"browser"`; `null` (or blank) restores `"server"`.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    engine: Option<Option<String>>,
 }
 
 /// `PUT /api/config/listen` — writes the model and echoes the settings.
@@ -8446,6 +8457,9 @@ async fn update_config_listen(
     if let Some(value) = body.model {
         updates.insert(config::MODEL.to_string(), value);
     }
+    if let Some(value) = body.engine {
+        updates.insert(config::ENGINE.to_string(), value);
+    }
     // Validating a model consults the same (possibly uncached) model list the
     // getter does, so the save is a blocking call too.
     blocking(move || config::save_listen(&updates))
@@ -8463,6 +8477,66 @@ async fn update_config_listen(
             },
         })?;
     get_config_listen(State(state), ConnectInfo(addr), headers).await
+}
+
+/// `GET /api/config/audio` — which engine the server runs speech through
+/// and where the `naru-audio` daemon listens (`docs/config.md`, mesa task
+/// 1388). Gated like `get_config_listen`; a malformed config is the same 502.
+async fn get_config_audio(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    match config::audio() {
+        Ok(audio) => Ok(Json(audio).into_response()),
+        Err(message) => Err(ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct AudioUpdate {
+    /// Absent leaves the URL alone; `null` (or blank) restores the built-in.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    url: Option<Option<String>>,
+    /// `"legacy"` or `"naru-audio"`; `null` (or blank) restores `"legacy"`.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    engine: Option<Option<String>>,
+}
+
+/// `PUT /api/config/audio` — writes the section and echoes it. A bad value is
+/// 422 writing nothing; gated like every other config write.
+async fn update_config_audio(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<AudioUpdate>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let mut updates = HashMap::new();
+    if let Some(value) = body.url {
+        updates.insert(config::URL.to_string(), value);
+    }
+    if let Some(value) = body.engine {
+        updates.insert(config::ENGINE.to_string(), value);
+    }
+    config::save_audio(&updates).map_err(|e| match e {
+        config::SaveError::Validation(message) => ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation",
+            message,
+        },
+        config::SaveError::Unavailable(message) => ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "unavailable",
+            message,
+        },
+    })?;
+    get_config_audio(State(state), ConnectInfo(addr), headers).await
 }
 
 #[derive(Deserialize)]
@@ -11157,9 +11231,9 @@ mod tests {
         let cfg = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("MESA_CONFIG_FILE", cfg.path().join("config.json")) };
 
-        /// Puts a no-op body through all eight config writes and asserts each
+        /// Puts a no-op body through all nine config writes and asserts each
         /// one landed on `$ok` (`true` = the gate let it through).
-        macro_rules! all_eight {
+        macro_rules! all_nine {
             ($state:expr, $peer:expr, $headers:expr, $ok:expr, $label:expr) => {{
                 let mut got: Vec<(&str, bool)> = Vec::new();
                 got.push((
@@ -11248,7 +11322,24 @@ mod tests {
                         State($state.clone()),
                         ConnectInfo($peer),
                         $headers.clone(),
-                        Json(ListenUpdate { model: None }),
+                        Json(ListenUpdate {
+                            model: None,
+                            engine: None,
+                        }),
+                    )
+                    .await
+                    .is_ok(),
+                ));
+                got.push((
+                    "/audio",
+                    update_config_audio(
+                        State($state.clone()),
+                        ConnectInfo($peer),
+                        $headers.clone(),
+                        Json(AudioUpdate {
+                            url: None,
+                            engine: None,
+                        }),
                     )
                     .await
                     .is_ok(),
@@ -11274,20 +11365,20 @@ mod tests {
         let (_dir, mut state) = test_state();
         state.lan = true;
         let legit = hdrs(Some("192.168.1.50:0"), Some("http://192.168.1.50:0"));
-        all_eight!(state, lan_peer(), legit, true, "legit LAN page");
+        all_nine!(state, lan_peer(), legit, true, "legit LAN page");
 
         // The same LAN peer, rebound: a DNS-name Host is the only shape a
         // rebinding page can send, and a foreign Origin is the cross-site
         // fetch. Both defenses stay shut.
         let rebound = hdrs(Some("evil.example:0"), Some("http://192.168.1.50:0"));
-        all_eight!(state, lan_peer(), rebound, false, "rebound Host");
+        all_nine!(state, lan_peer(), rebound, false, "rebound Host");
         let cross_site = hdrs(Some("192.168.1.50:0"), Some("https://evil.example"));
-        all_eight!(state, lan_peer(), cross_site, false, "foreign Origin");
+        all_nine!(state, lan_peer(), cross_site, false, "foreign Origin");
 
         // DEFAULT mode: the non-loopback peer is still refused outright, so
         // nothing about the single-machine posture loosened.
         state.lan = false;
-        all_eight!(state, lan_peer(), legit, false, "default mode, LAN peer");
+        all_nine!(state, lan_peer(), legit, false, "default mode, LAN peer");
     }
 
     // The pricing verbs share the config gates exactly — same file, same
@@ -11306,12 +11397,27 @@ mod tests {
     }
 
     // The keymap verbs are the eighth of the same pair (mesa task 1079); the
-    // write half rides `all_eight!` above, so this is its read half.
+    // write half rides `all_nine!` above, so this is its read half.
 
     #[tokio::test]
     async fn get_config_keymap_rejects_non_loopback_peer_in_default_mode() {
         let (_dir, state) = test_state();
         let resp = get_config_keymap(
+            State(state),
+            ConnectInfo(lan_peer()),
+            loopback_agent_headers(),
+        )
+        .await;
+        assert!(resp.unwrap_err().status.is_client_error());
+    }
+
+    // The audio verbs are the ninth (mesa task 1388); the write half rides
+    // `all_nine!` above, so this is its read half.
+
+    #[tokio::test]
+    async fn get_config_audio_rejects_non_loopback_peer_in_default_mode() {
+        let (_dir, state) = test_state();
+        let resp = get_config_audio(
             State(state),
             ConnectInfo(lan_peer()),
             loopback_agent_headers(),
@@ -15706,7 +15812,16 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = json_body(resp).await;
-        assert!(body.get("available").is_some(), "{body}");
+        for key in [
+            "available",
+            "state",
+            "engine",
+            "url",
+            "message",
+            "checked_at",
+        ] {
+            assert!(body.get(key).is_some(), "{key}: {body}");
+        }
 
         let forged_origin_headers = hdrs(Some("192.168.1.50:7770"), Some("https://evil.example"));
         let rejected =

@@ -1,4 +1,4 @@
-<img src="frontend/public/favicon.svg" width="72" height="72" alt="Naru logo" />
+<img src="docs/naru-icon.svg" width="72" height="72" alt="Naru logo" />
 
 # Naru
 

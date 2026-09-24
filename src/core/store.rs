@@ -1201,6 +1201,17 @@ const MIGRATIONS: &[&str] = &[
     // is followed without being touched, so it is least-recently-used by
     // construction. NULL = not kept.
     "ALTER TABLE live_notebook ADD COLUMN kept_at TEXT;",
+    // Task 1339: the automatic project dream's dedup — at most one row per
+    // project, the last dream spawned for its notebook: `agent_id` its
+    // `claude --bg` receipt (NULL while a claim is spawning, or when the
+    // template printed none), `started_at` when it was claimed or spawned.
+    // A sibling table rather than a `projects` column, so `Project`'s wire
+    // shape is untouched; destroyed with its project.
+    "CREATE TABLE project_dreams (
+         project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+         agent_id   TEXT,
+         started_at TEXT NOT NULL
+     );",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1670,6 +1681,22 @@ fn row_to_retro_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetroRun> {
 /// in-flight claim still stops a concurrent one; short enough that a row
 /// stranded by a process dying mid-spawn stops holding the interval soon.
 pub const RETRO_CLAIM_GRACE_MINUTES: u32 = 10;
+
+/// How long a project dream with no receipt still counts as running (mesa
+/// task 1339): a claim still spawning, or a spawn whose template printed no
+/// `backgrounded · <id>` line, so nothing can be asked whether it finished.
+pub const PROJECT_DREAM_GRACE_MINUTES: u32 = 30;
+
+/// The last dream spawned for a project's notebook ([`Store::project_dream`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectDream {
+    /// Its spawn receipt, `None` while claimed or when there was none.
+    pub agent_id: Option<String>,
+    pub started_at: String,
+    /// Whether `started_at` is within [`PROJECT_DREAM_GRACE_MINUTES`], on
+    /// the store's clock.
+    pub recent: bool,
+}
 
 const RETRO_FINDING_COLUMNS: &str = "id, fingerprint, subject, kind, summary, count, evidence, \
                                      first_seen_at, last_seen_at, inbox_item_id";
@@ -6701,6 +6728,76 @@ impl Store {
     ) -> Result<LiveNotebookEntry> {
         Self::check_notebook_scope(&self.get_notebook_entry(id)?, scope)?;
         self.get_active_notebook_entry(id)
+    }
+
+    /// The last dream spawned for `project_id`'s notebook, or `None` when
+    /// none was (mesa task 1339).
+    pub fn project_dream(&self, project_id: i64) -> Result<Option<ProjectDream>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT agent_id, started_at, started_at > datetime('now', ?2) \
+                 FROM project_dreams WHERE project_id = ?1",
+                (
+                    project_id,
+                    format!("-{PROJECT_DREAM_GRACE_MINUTES} minutes"),
+                ),
+                |r| {
+                    Ok(ProjectDream {
+                        agent_id: r.get(0)?,
+                        started_at: r.get(1)?,
+                        recent: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Claims `project_id`'s next automatic dream: a row with no receipt,
+    /// stamped now, written only if the row is still `seen` (`None` = no row
+    /// at all) — a compare-and-swap, so of two closes that both judged the
+    /// last dream finished exactly one claims. Answers whether this one did.
+    pub fn claim_project_dream(
+        &mut self,
+        project_id: i64,
+        seen: Option<&ProjectDream>,
+    ) -> Result<bool> {
+        let n = match seen {
+            None => self.conn.execute(
+                "INSERT OR IGNORE INTO project_dreams (project_id, agent_id, started_at) \
+                 VALUES (?1, NULL, datetime('now'))",
+                [project_id],
+            )?,
+            Some(seen) => self.conn.execute(
+                "UPDATE project_dreams SET agent_id = NULL, started_at = datetime('now') \
+                 WHERE project_id = ?1 AND agent_id IS ?2 AND started_at = ?3",
+                (project_id, &seen.agent_id, &seen.started_at),
+            )?,
+        };
+        Ok(n == 1)
+    }
+
+    /// Records a dream spawned for `project_id` with its receipt, stamped now,
+    /// replacing whatever row was there.
+    pub fn record_project_dream(&mut self, project_id: i64, agent_id: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO project_dreams (project_id, agent_id, started_at) \
+             VALUES (?1, ?2, datetime('now')) \
+             ON CONFLICT(project_id) DO UPDATE SET \
+               agent_id = excluded.agent_id, started_at = excluded.started_at",
+            (project_id, agent_id),
+        )?;
+        Ok(())
+    }
+
+    /// Drops `project_id`'s dream row — the rollback for a claim whose spawn
+    /// failed, so the next close tries again. A missing row is not an error.
+    pub fn delete_project_dream(&mut self, project_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM project_dreams WHERE project_id = ?1",
+            [project_id],
+        )?;
+        Ok(())
     }
 
     /// The live notebook — [`Self::list_notebook_in`] at the live scope.
@@ -13948,15 +14045,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            74,
-            "a fresh db should report user_version 74"
+            75,
+            "a fresh db should report user_version 75"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 74);
+        assert_eq!(version, 75);
     }
 
     /// Pins the project-notebook columns (mesa task 1333) at index 72
@@ -13986,6 +14083,62 @@ mod tests {
             "migration {KEPT_AT} is no longer the notebook kept_at migration — a \
              shipped migration was edited or reordered, which is never allowed"
         );
+    }
+
+    /// Pins the `project_dreams` table (mesa task 1339) at index 74
+    /// (`user_version` 75), for the reason
+    /// [`the_live_summaries_table_arrives_at_migration_49`] gives.
+    #[test]
+    fn the_project_dreams_table_arrives_at_migration_74() {
+        const PROJECT_DREAMS: usize = 74;
+        assert!(
+            MIGRATIONS[PROJECT_DREAMS].contains("CREATE TABLE project_dreams"),
+            "migration {PROJECT_DREAMS} is no longer the project dreams migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+    }
+
+    #[test]
+    fn a_project_dream_claim_is_a_compare_and_swap_on_the_row_seen() {
+        let (mut store, _dir) = temp_store();
+        let p = store
+            .create_project("P", None, None, None, None)
+            .unwrap()
+            .id;
+        assert!(store.project_dream(p).unwrap().is_none());
+        // No row: the first claim wins, a second claim of "no row" loses.
+        assert!(store.claim_project_dream(p, None).unwrap());
+        assert!(!store.claim_project_dream(p, None).unwrap());
+        let claimed = store.project_dream(p).unwrap().unwrap();
+        assert_eq!(claimed.agent_id, None);
+        assert!(claimed.recent);
+        store.record_project_dream(p, Some("cafe01")).unwrap();
+        let spawned = store.project_dream(p).unwrap().unwrap();
+        assert_eq!(spawned.agent_id.as_deref(), Some("cafe01"));
+        // A stale view of the row (the claim, since replaced) loses; the
+        // current one wins once.
+        assert!(!store.claim_project_dream(p, Some(&claimed)).unwrap());
+        assert!(store.claim_project_dream(p, Some(&spawned)).unwrap());
+        assert!(!store.claim_project_dream(p, Some(&spawned)).unwrap());
+        // An old row is not recent.
+        store
+            .conn
+            .execute(
+                "UPDATE project_dreams SET started_at = datetime('now', '-31 minutes')",
+                [],
+            )
+            .unwrap();
+        assert!(!store.project_dream(p).unwrap().unwrap().recent);
+        store.delete_project_dream(p).unwrap();
+        assert!(store.project_dream(p).unwrap().is_none());
+        // Destroyed with its project.
+        store.record_project_dream(p, None).unwrap();
+        store.delete_project(p).unwrap();
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM project_dreams", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     // ---- the session retrospective (mesa task 1158) ----

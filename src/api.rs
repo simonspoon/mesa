@@ -49,8 +49,8 @@ use crate::core::{
     ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, STALE_CLAIM_MINUTES, Script,
     ScriptArg, ScriptPatch, ScriptRunEvent, Status, Store, SystemInfo, Task, TaskPatch,
     TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard, hooks,
-    inbox_triage, library, listen, live, receipt, retro, script_runs, scripts, speech, supervisor,
-    system, validate_live_client, version,
+    inbox_triage, library, listen, live, project_memory, receipt, retro, script_runs, scripts,
+    speech, supervisor, system, validate_live_client, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -2940,13 +2940,36 @@ async fn update_task(
         // its replace-only semantics.
         append: false,
     };
-    let mut store = state.store.lock().unwrap();
-    // Chokepoint (spec D3, task 920): goes through `core::receipt::update_task`
-    // rather than `store.update_task` directly, so this route and `mesa task
-    // update` can never diverge on when a work receipt gets generated — the
-    // same "one chokepoint, several call sites" shape `agents::spawn_bg` gives
-    // every agent spawn.
-    Ok(Json(receipt::update_task(&mut store, id, &patch)?).into_response())
+    let (task, closed) = {
+        let mut store = state.store.lock().unwrap();
+        let was_done = store.get_task(id)?.status == Status::Done;
+        // Chokepoint (spec D3, task 920): goes through `core::receipt::update_task`
+        // rather than `store.update_task` directly, so this route and `mesa task
+        // update` can never diverge on when a work receipt gets generated — the
+        // same "one chokepoint, several call sites" shape `agents::spawn_bg` gives
+        // every agent spawn.
+        let task = receipt::update_task(&mut store, id, &patch)?;
+        let closed = !was_done && task.status == Status::Done;
+        (task, closed)
+    };
+    if closed {
+        dream_after_close(&state, task.project_id);
+    }
+    Ok(Json(task).into_response())
+}
+
+/// The automatic project dream after a close (mesa task 1339), the twin of
+/// `naru task update`'s: `project_memory::dream_after_close` on a blocking
+/// thread, which takes the store lock only for its reads and writes, never
+/// across the `claude` shell-outs. Best-effort — a log line, never the
+/// route's answer, and not awaited.
+fn dream_after_close(state: &AppState, project_id: i64) {
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = project_memory::dream_after_close(&store, project_id) {
+            eprintln!("project {project_id}: no automatic dream pass: {e}");
+        }
+    });
 }
 
 async fn delete_task(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
@@ -15662,6 +15685,72 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             assert_eq!(err.code, "conflict");
             assert_eq!(std::fs::read_to_string(&log_path).unwrap(), logged);
         });
+    }
+
+    /// mesa task 1339: a PATCH closing a task in a project whose notebook is
+    /// over its budget answers the closed task and then spawns that project's
+    /// dream off the store lock, recording its receipt in `project_dreams`.
+    #[test]
+    fn closing_a_task_over_the_notebook_budget_spawns_the_project_dream() {
+        // SAFETY: ENV_LOCK gives this test exclusive access to
+        // MESA_CLAUDE_BIN/MESA_CONFIG_FILE for its duration.
+        let _env = attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stub_dir = tempfile::tempdir().unwrap();
+        let log_path = stub_dir.path().join("bg.log");
+        let bin = stub_claude_bg(stub_dir.path(), &log_path);
+        unsafe { std::env::set_var("MESA_CLAUDE_BIN", &bin) };
+
+        let (_dir, state) = test_state();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let root = proj_dir.path().canonicalize().unwrap();
+        let pid = new_project(&state, Some(root.to_str().unwrap()));
+        {
+            let mut store = state.store.lock().unwrap();
+            let words = |n: usize| vec!["w"; n].join(" ");
+            store.add_notebook_entry_in(Some(pid), &words(251)).unwrap();
+            store.add_notebook_entry_in(Some(pid), &words(250)).unwrap();
+        }
+        let id = new_task(&state, pid);
+
+        // One blocking thread, so the blocking pool runs its queue in order:
+        // the no-op submitted after the PATCH returns only once the dream
+        // job the PATCH queued has finished — no sleep, no poll.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let body = rt.block_on(async {
+            let body = patch_task(&state, id, r#"{"status":"done"}"#).await;
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            body
+        });
+        assert_eq!(body["status"], "done");
+        assert_eq!(body["id"], id);
+
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        // The prompt spans lines; the stub's `|<name>|` marks each spawn.
+        assert_eq!(
+            logged.matches("|project memory dream|").count(),
+            1,
+            "one dream spawned: {logged}"
+        );
+        let head = format!("{}|project memory dream|", root.display());
+        assert!(logged.starts_with(&head), "{logged}");
+        assert!(
+            logged.contains(&format!("naru memory merge --project {pid} --ids")),
+            "the project's own dream prompt: {logged}"
+        );
+        let dream = state
+            .store
+            .lock()
+            .unwrap()
+            .project_dream(pid)
+            .unwrap()
+            .expect("the spawn is recorded");
+        assert_eq!(dream.agent_id.as_deref(), Some("deadbeef"));
     }
 
     /// A spawn that fails must not strand a live session: nothing is listening

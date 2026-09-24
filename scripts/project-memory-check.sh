@@ -27,6 +27,11 @@
 #   * dream: under two entries nothing spawns; with two it spawns through
 #     the live-dream template (stub claude) in the project's folder with a
 #     prompt naming `naru memory merge --project <id>`.
+#   * the automatic dream (mesa task 1339): a task closing in a project whose
+#     notebook is over its 500 words spawns that dream, `task update`'s
+#     stdout unchanged; not again while its job runs or, with no receipt,
+#     inside the grace window; not for a within-budget notebook; a failing
+#     spawn still closes the task with exit 0 and the next close retries.
 set -euo pipefail
 # Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
 unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
@@ -304,8 +309,10 @@ case "\$1" in
     for a in "\$@"; do PROMPT=\$a; done
     printf '%s' "\$PROMPT" >"$STUB/last-prompt"
     pwd -P >"$STUB/last-cwd"
-    echo "backgrounded · cafe01 (idle)"
+    echo spawn >>"$STUB/spawns"
+    [ -e "$STUB/no-receipt" ] || echo "backgrounded · cafe01 (idle)"
     ;;
+  agents) [ -e "$STUB/agents.json" ] && cat "$STUB/agents.json" || exit 2 ;;
   *) exit 2 ;;
 esac
 EOF
@@ -326,6 +333,71 @@ grep -q "of its 500 words. Entries are listed least recently used first." "$STUB
   fail "dream prompt opens its listing with the word count against the budget"
 grep -q "naru memory replace --project $P <entry id>" "$STUB/last-prompt" || fail "dream prompt names the project shorten command"
 ok "memory dream: nothing under two entries; otherwise the live-dream template in the project folder, prompt naming naru memory --project $P"
+
+# ---- the automatic dream after a task closes (mesa task 1339) ----
+spawns() { [ -e "$STUB/spawns" ] && wc -l <"$STUB/spawns" | tr -d ' ' || echo 0; }
+words() { printf 'w%.0s ' $(seq "$1"); }
+over_budget() { # <name> — a project whose notebook holds 501 words in two entries
+  run 0 "$NARU" project create "$1" --no-git
+  OB=$(jqs .id)
+  mkdir -p "$TMP/$1"
+  run 0 "$NARU" project update "$OB" --path "$TMP/$1"
+  run 0 "$NARU" memory add --project "$OB" "$(words 251)"
+  run 0 "$NARU" memory add --project "$OB" "$(words 250)"
+}
+close_task() { # <project> — creates a task and closes it, STDOUT the update's
+  run 0 "$NARU" task create "$1" "a task in project $1"
+  local t
+  t=$(jqs .id)
+  run 0 "$NARU" task update "$t" --status done
+  CLOSED=$t
+}
+over_budget Dreamy
+D=$OB
+BEFORE=$(spawns)
+close_task "$D"
+UPDATE_OUT=$STDOUT
+[ "$(jqs .status)" = "done" ] || fail "the close still closes (got $STDOUT)"
+run 0 "$NARU" task show "$CLOSED"
+[ "$UPDATE_OUT" = "$STDOUT" ] || fail "task update stdout is the plain task JSON (got $UPDATE_OUT vs $STDOUT)"
+[ "$(spawns)" = "$((BEFORE + 1))" ] || fail "closing a task in an over-budget project spawns one dream"
+[ "$(cat "$STUB/last-cwd")" = "$TMP/Dreamy" ] || fail "the automatic dream runs in the project's folder"
+grep -q "naru memory merge --project $D --ids" "$STUB/last-prompt" || fail "the automatic dream is this project's dream"
+grep -q "The notebook holds 501 of its 500 words." "$STUB/last-prompt" || fail "the automatic dream prompt carries the word count"
+# The receipt's job still running: a second close spawns nothing.
+echo '[{"id": "cafe01", "state": "working"}]' >"$STUB/agents.json"
+close_task "$D"
+[ "$(spawns)" = "$((BEFORE + 1))" ] || fail "no second dream while the first one's job is running"
+# The job finished. Re-closing a done task is no close, so even now it
+# spawns nothing; the next real close spawns again — this time with no
+# receipt.
+echo '[{"id": "cafe01", "state": "done"}]' >"$STUB/agents.json"
+run 0 "$NARU" task update "$CLOSED" --status done
+[ "$(spawns)" = "$((BEFORE + 1))" ] || fail "re-closing a done task spawns no dream"
+touch "$STUB/no-receipt"
+close_task "$D"
+[ "$(spawns)" = "$((BEFORE + 2))" ] || fail "a close after the dream finished spawns the next one"
+# No receipt to ask about: a close inside the grace window spawns nothing.
+rm "$STUB/agents.json" "$STUB/no-receipt"
+close_task "$D"
+[ "$(spawns)" = "$((BEFORE + 2))" ] || fail "no second dream inside the grace window of one with no receipt"
+# Within budget (500 words exactly): a close spawns nothing.
+run 0 "$NARU" memory add --project "$R" "$(words 249)"
+run 0 "$NARU" memory add --project "$R" "$(words 248)"
+close_task "$R"
+[ "$(spawns)" = "$((BEFORE + 2))" ] || fail "a close in a within-budget project spawns nothing"
+# A spawn that fails: the close still exits 0 closed, stdout the task, the
+# failure on stderr; the claim is dropped, so the next close retries.
+over_budget Broken
+run 0 env MESA_CLAUDE_BIN="$TMP/no-such-claude" "$NARU" task create "$OB" "doomed dream"
+T=$(jqs .id)
+run 0 env MESA_CLAUDE_BIN="$TMP/no-such-claude" "$NARU" task update "$T" --status done
+[ "$(jqs .status)" = "done" ] && [ "$(jqs .id)" = "$T" ] || fail "a failed dream spawn leaves the close intact (got $STDOUT)"
+grep -q "no automatic dream pass" <<<"$STDERR" || fail "a failed dream spawn is reported on stderr (got $STDERR)"
+[ "$(spawns)" = "$((BEFORE + 2))" ] || fail "a failed spawn spawned nothing"
+close_task "$OB"
+[ "$(spawns)" = "$((BEFORE + 3))" ] || fail "after a failed spawn the next close retries"
+ok "task close: an over-budget notebook's dream spawned once, stdout unchanged; none while its job runs or inside the grace window of one with no receipt; none within budget; a failed spawn exit 0 and retried"
 
 # ---- the hook is a library built-in, enabled on SessionStart ----
 run 0 "$NARU" library hook enable project-memory.sh --event SessionStart --matcher 'startup|resume|clear|compact'

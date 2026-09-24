@@ -37,7 +37,7 @@ live-notebook methods are the `None` scope):
 | --- | --- | --- |
 | Entry bound | 600 characters | same |
 | Word budget | 500 words | 500 words **of its own** |
-| Past the budget | never refused or trimmed at write time (mesa task 1337); the dream brings it back within 500, and lists entries least recently used first by `COALESCE(last_used_session_id, source_session_id, 0), id` | same, by `COALESCE(last_used_at, created_at), id`; only a manual `naru memory dream` does it |
+| Past the budget | never refused or trimmed at write time (mesa task 1337); the dream brings it back within 500, and lists entries least recently used first by `COALESCE(last_used_session_id, source_session_id, 0), id` | same, by `COALESCE(last_used_at, created_at), id`; `naru memory dream` does it, run by hand or after a task closes (mesa task 1339) |
 | Removal guard | 30% once it holds 100 words | same, on its own words |
 | Provenance | `source_session_id`, `last_used_session_id` | none (both `NULL`) |
 | `touch` | needs a live session | stamps `last_used_at`, no session needed |
@@ -148,9 +148,42 @@ never deleting a standing norm to make room), minus the clauses about
 `local_path` when that folder exists, else the workspace, with no session
 `{id}`. Fewer than two active entries prints `{"spawned": false, "reason"}`
 and spawns nothing; a failed spawn is `unavailable`. There is no
-live-conversation `conflict` and no automatic trigger — so a project
-notebook, which nothing trims at write time, grows past its budget until
-someone runs `naru memory dream`.
+live-conversation `conflict`. A spawn is recorded as the project's last
+dream (below), so an automatic one waits for it.
+
+### The automatic dream after a task closes (mesa task 1339)
+
+Nothing trims a project notebook at write time, so the dream also runs on
+its own, from **one** trigger: a task closing into `done` (from any other
+status, claimed or not) through `naru task update` or `PATCH
+/api/tasks/{id}`. `core::project_memory::dream_after_close` spawns the same
+dream — one `DreamSpawn`, shared with `naru memory dream` — when:
+
+- **the notebook is over its budget**: `project_memory::dream_wanted`, more
+  than 500 active words (500 exactly is within it) across at least two
+  entries. The budget only — not the live notebook's 300-word or lookalike
+  rules, which exist to keep a live prompt small; and
+- **no earlier dream for the project is still running**: the
+  `project_dreams` table (migration index 74, one row per project, `ON
+  DELETE CASCADE`) holds the last dream's receipt and when it started. A
+  receipt that `claude agents --json --all` still lists as running, or no
+  receipt (a claim still spawning, or a template that printed none) younger
+  than 30 minutes on the store's clock, skips this close.
+
+The claim is a compare-and-swap on the row judged finished, so two closes
+racing each other spawn one dream; a failed spawn drops the claim, so the
+next close retries. It is **best-effort**: `task update` prints the task
+first and reports any failure on stderr only — stdout and the exit code are
+what they were — and the route answers before the dream is spawned, on a
+blocking thread that takes the store lock only for its reads and writes,
+never across a `claude` shell-out.
+
+Why a task close and not SessionStart: `agents::spawn_bg` waits on its
+`claude --bg` shell-out, which would delay every session start; it would
+judge on every session; and the dream agent's own session would re-trigger
+its SessionStart hook before its receipt is recorded. A close is rarer,
+follows the work that grows a notebook, and the dream agent closes no
+tasks.
 
 ## The SessionStart hook
 
@@ -189,8 +222,8 @@ learnings — and sends a fact about one project to that project's notebook
 
 ## Not built
 
-No HTTP route or web UI for project notebooks, no automatic dream trigger,
-and no settings file is written by anything but `library hook enable`.
+No HTTP route or web UI for project notebooks, no dream trigger but a task
+close, and no settings file is written by anything but `library hook enable`.
 
 ## Gate
 
@@ -198,4 +231,7 @@ and no settings file is written by anything but `library hook enable`.
 mixing, `context` from a repo subfolder, the hook body extracted from the
 library and fed SessionStart payloads (known folder, unknown folder, garbage
 and empty stdin, no `jq`, no `naru`, a failing `naru`), import and re-import,
-dream through a stub `claude`, and `hook enable` under a throwaway `HOME`.
+dream through a stub `claude`, the automatic dream after a task close (once
+over the budget, stdout unchanged, not while one runs or inside the grace
+window, not within budget, a failed spawn still closing with exit 0 and
+retried), and `hook enable` under a throwaway `HOME`.

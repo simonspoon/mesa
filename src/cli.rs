@@ -4447,7 +4447,21 @@ fn run_task(cmd: TaskCmd) -> Result<()> {
             // directly — mirroring `agents::spawn_bg` being the one chokepoint
             // every agent spawn goes through instead of four separate
             // `Command::new("claude")` call sites.
-            print_task(&receipt::update_task(&mut store, id, &patch)?, quiet);
+            let was_done = store.get_task(id)?.status == Status::Done;
+            let task = receipt::update_task(&mut store, id, &patch)?;
+            print_task(&task, quiet);
+            // mesa task 1339: a close is when an over-budget project notebook
+            // gets its dream — best-effort, after the task is printed, and
+            // never on stdout or in the exit code.
+            if !was_done
+                && task.status == Status::Done
+                && let Err(e) = project_memory::dream_after_close(
+                    &std::sync::Mutex::new(&mut store),
+                    task.project_id,
+                )
+            {
+                eprintln!("project {}: no automatic dream pass: {e}", task.project_id);
+            }
         }
         TaskCmd::Delete { id, quiet } => print_tasks(&store.delete_task(id)?, quiet),
         TaskCmd::Receipt {
@@ -5882,12 +5896,12 @@ fn memory_project(store: &Store, arg: Option<&str>) -> Result<i64> {
 }
 
 /// `naru memory dream`: the live dream's spawn, for one project's notebook —
-/// the same `live-dream` template through `agents::spawn_bg`, the prompt
-/// `project_memory::dream_prompt`, in the project's `local_path` when that
-/// folder exists and the workspace otherwise, with no session `{id}`. There
-/// is no live-conversation `conflict`: a project notebook is not a live
-/// prompt's input. A failed spawn is `unavailable`, as the live verb's is.
-fn spawn_memory_dream(store: &Store, project_id: i64) -> Result<()> {
+/// `project_memory::DreamSpawn`, the one spawn the automatic dream after a
+/// task close makes too (mesa task 1339), recorded as that project's last
+/// dream so an automatic one waits for it. There is no live-conversation
+/// `conflict`: a project notebook is not a live prompt's input. A failed
+/// spawn is `unavailable`, as the live verb's is.
+fn spawn_memory_dream(store: &mut Store, project_id: i64) -> Result<()> {
     let entries = store.list_notebook_in(Some(project_id), false)?;
     if entries.len() < 2 {
         let active = entries.len();
@@ -5900,25 +5914,10 @@ fn spawn_memory_dream(store: &Store, project_id: i64) -> Result<()> {
         }));
         return Ok(());
     }
-    let dir = store
-        .get_project(project_id)?
-        .local_path
-        .filter(|dir| Path::new(dir).is_dir())
-        .unwrap_or_else(|| config::workspace_dir().to_string_lossy().into_owned());
-    let prompt = project_memory::dream_prompt(project_id, &entries);
-    let receipt = library::prompts(store)
-        .map_err(|e| e.to_string())
-        .and_then(|prompts| {
-            agents::spawn_bg(
-                config::LIVE_DREAM,
-                &dir,
-                None,
-                Some("project memory dream"),
-                Some(&prompt),
-                &prompts,
-            )
-        })
-        .map_err(|e| Error::Unavailable(format!("could not spawn the dream pass: {e}")))?;
+    let receipt = project_memory::DreamSpawn::prepare(store, project_id, &entries)?.run()?;
+    // Best-effort: the dream is already running, and this only spares it a
+    // twin from the next task close.
+    let _ = store.record_project_dream(project_id, receipt.as_deref());
     print_json(&serde_json::json!({ "spawned": true, "receipt": receipt }));
     Ok(())
 }

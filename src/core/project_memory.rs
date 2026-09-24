@@ -9,12 +9,18 @@
 //! notebook needs: which project a folder belongs to
 //! ([`resolve_project_for_path`]), the text the SessionStart hook prints
 //! ([`context_text`]), the import from Claude Code's memory folder
-//! ([`import_body`]), the dream pass's prompt ([`dream_prompt`]), and the
-//! hook itself ([`PROJECT_MEMORY_HOOK`], a library built-in).
+//! ([`import_body`]), the dream pass's prompt ([`dream_prompt`]) and spawn
+//! ([`DreamSpawn`]), the automatic dream after a task closes
+//! ([`dream_after_close`], mesa task 1339), and the hook itself
+//! ([`PROJECT_MEMORY_HOOK`], a library built-in).
 
+use std::borrow::BorrowMut;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use crate::core::{Error, LiveNotebookEntry, Project, Result, Store, git, live};
+use crate::core::{
+    Error, LiveNotebookEntry, Project, Result, Store, agents, config, git, library, live,
+};
 
 /// The library built-in holding [`PROJECT_MEMORY_HOOK`] — the bare id, while
 /// the row's name carries the extension (the `task-stop-guard` shape).
@@ -338,6 +344,130 @@ pub fn dream_prompt(project_id: i64, notebook: &[LiveNotebookEntry]) -> String {
     prompt
 }
 
+/// Whether a project notebook wants an automatic dream (mesa task 1339):
+/// `Some(reason)` iff its active `entries` hold **more** than
+/// [`live::LIVE_NOTEBOOK_BUDGET_WORDS`] words across at least two entries
+/// (a dream pass needs two, as `naru memory dream` says). The budget alone
+/// — not [`live::dream_wanted`]'s lower word mark or its lookalike rule,
+/// which exist to keep the live prompt small.
+pub fn dream_wanted(entries: &[LiveNotebookEntry]) -> Option<String> {
+    let words: usize = entries.iter().map(|e| live::word_count(&e.body)).sum();
+    (entries.len() >= 2 && words > live::LIVE_NOTEBOOK_BUDGET_WORDS).then(|| {
+        format!(
+            "the notebook holds {words} of its {} words",
+            live::LIVE_NOTEBOOK_BUDGET_WORDS
+        )
+    })
+}
+
+/// One project dream's spawn, read off the store by [`DreamSpawn::prepare`]
+/// and run by [`DreamSpawn::run`] — split so a caller holding the store
+/// behind a lock can let go of it for the shell-out. The one spawn both
+/// `naru memory dream` and [`dream_after_close`] make: the `live-dream`
+/// template through `agents::spawn_bg`, [`dream_prompt`], in the project's
+/// `local_path` when that folder exists and the workspace otherwise, with no
+/// session `{id}`.
+pub struct DreamSpawn {
+    dir: String,
+    prompt: String,
+    prompts: std::result::Result<config::Prompts, String>,
+}
+
+impl DreamSpawn {
+    pub fn prepare(store: &Store, project_id: i64, entries: &[LiveNotebookEntry]) -> Result<Self> {
+        let dir = store
+            .get_project(project_id)?
+            .local_path
+            .filter(|dir| Path::new(dir).is_dir())
+            .unwrap_or_else(|| config::workspace_dir().to_string_lossy().into_owned());
+        Ok(Self {
+            dir,
+            prompt: dream_prompt(project_id, entries),
+            prompts: library::prompts(store).map_err(|e| e.to_string()),
+        })
+    }
+
+    /// Spawns it and answers the receipt; a failure (including the library
+    /// prompts `prepare` could not read) is `unavailable`.
+    pub fn run(&self) -> Result<Option<String>> {
+        self.prompts
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|prompts| {
+                agents::spawn_bg(
+                    config::LIVE_DREAM,
+                    &self.dir,
+                    None,
+                    Some("project memory dream"),
+                    Some(&self.prompt),
+                    prompts,
+                )
+            })
+            .map_err(|e| Error::Unavailable(format!("could not spawn the dream pass: {e}")))
+    }
+}
+
+/// The automatic project dream (mesa task 1339), called once a task in
+/// `project_id` has closed into `done`: spawns a [`DreamSpawn`] when
+/// [`dream_wanted`] says the notebook is over its budget and no earlier dream
+/// for it is still running — a `project_dreams` row whose receipt `claude
+/// agents` still lists as running, or one with no receipt younger than
+/// `store::PROJECT_DREAM_GRACE_MINUTES`. Answers whether it spawned.
+///
+/// The store is taken behind a lock that is held only for the reads and
+/// writes — never across the `claude agents` probe or the spawn — so the API
+/// can call it with its own shared store. The claim is a compare-and-swap on
+/// the row that was judged finished (`Store::claim_project_dream`), so two
+/// closes racing each other spawn one dream; a failed spawn drops the claim
+/// again, so the next close retries.
+pub fn dream_after_close<S: BorrowMut<Store>>(store: &Mutex<S>, project_id: i64) -> Result<bool> {
+    let (entries, seen) = {
+        let guard = store.lock().unwrap();
+        let s: &Store = (*guard).borrow();
+        let entries = s.list_notebook_in(Some(project_id), false)?;
+        if dream_wanted(&entries).is_none() {
+            return Ok(false);
+        }
+        (entries, s.project_dream(project_id)?)
+    };
+    if let Some(seen) = &seen {
+        let running = match &seen.agent_id {
+            Some(id) => agents::job_running(id),
+            None => seen.recent,
+        };
+        if running {
+            return Ok(false);
+        }
+    }
+    let spawn = {
+        let mut guard = store.lock().unwrap();
+        let s: &mut Store = (*guard).borrow_mut();
+        if !s.claim_project_dream(project_id, seen.as_ref())? {
+            return Ok(false);
+        }
+        match DreamSpawn::prepare(s, project_id, &entries) {
+            Ok(spawn) => spawn,
+            Err(e) => {
+                let _ = s.delete_project_dream(project_id);
+                return Err(e);
+            }
+        }
+    };
+    let result = spawn.run();
+    let mut guard = store.lock().unwrap();
+    let s: &mut Store = (*guard).borrow_mut();
+    match result {
+        Ok(receipt) => {
+            s.record_project_dream(project_id, receipt.as_deref())?;
+            Ok(true)
+        }
+        Err(e) => {
+            let _ = s.delete_project_dream(project_id);
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +667,27 @@ mod tests {
         assert!(text.contains("more entries not shown"), "{text}");
         assert!(text.contains("[#1,"));
         assert!(!text.contains("[#40,"));
+    }
+
+    /// mesa task 1339: the automatic dream fires strictly past the budget,
+    /// and never for a single entry.
+    #[test]
+    fn dream_wanted_fires_only_strictly_over_the_budget_with_two_entries() {
+        let words = |n: usize| vec!["w"; n].join(" ");
+        assert_eq!(
+            dream_wanted(&[entry(1, &words(250)), entry(2, &words(251))]).as_deref(),
+            Some("the notebook holds 501 of its 500 words")
+        );
+        assert_eq!(
+            dream_wanted(&[entry(1, &words(250)), entry(2, &words(250))]),
+            None
+        );
+        assert_eq!(
+            dream_wanted(&[entry(1, &words(100)), entry(2, &words(100))]),
+            None
+        );
+        assert_eq!(dream_wanted(&[entry(1, &words(900))]), None);
+        assert_eq!(dream_wanted(&[]), None);
     }
 
     #[test]

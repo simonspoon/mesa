@@ -1958,17 +1958,19 @@ EXAMPLES
     /// The default wait is DELIBERATELY long (mesa task 871). Waiting inside
     /// this process costs nothing; waiting in the agent's loop costs a whole
     /// model turn per `null`, so a short default burns tokens for every quiet
-    /// minute of a conversation. 570s sits just inside the 10-minute ceiling a
-    /// Claude Code session puts on one command, so the wait ends by printing
-    /// `null` rather than by being killed.
+    /// minute of a conversation. 3000s (mesa task 1347) wakes an idle agent
+    /// once inside each hour of the prompt cache's 1-hour TTL, so every wake
+    /// is a cache read, and stays under the one-hour command timeout the
+    /// Claude Code settings allow, so the wait ends by printing `null` rather
+    /// than by being killed.
     #[command(after_help = "\
 EXAMPLES
-  mesa live listen                # wait up to 570s (the quiet-is-free default)
+  mesa live listen                # wait up to 3000s (the quiet-is-free default)
   mesa live listen --wait 5
   mesa live listen --wait 0       # poll once and return")]
     Listen {
         /// Seconds to wait for an utterance; 0 polls once and returns
-        #[arg(long, value_name = "SECONDS", default_value_t = 570)]
+        #[arg(long, value_name = "SECONDS", default_value_t = 3000)]
         wait: u64,
         /// The lease from the first line of your prompt (mesa task 1150)
         ///

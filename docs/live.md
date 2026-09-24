@@ -86,7 +86,7 @@ A live session is a loop the **agent** runs, not one Naru drives:
    person said, and since mesa task 1156 it runs the command **in the
    background** (the Bash tool's `run_in_background`) and ends its turn: the
    harness wakes it the moment the command exits, with a turn or with `null`
-   when nobody spoke for the whole wait (570s by default, and long on purpose:
+   when nobody spoke for the whole wait (3000s by default, and long on purpose:
    see *quiet time is spent inside `listen`* below). At most **one** listen is
    pending per lease — a new one is started only in the turn in which the
    previous one's output arrived (or at the very start of the conversation),
@@ -1659,7 +1659,7 @@ flag is an unknown argument, exit 2, exactly as on `turns`.
 | `live start [PROJECT]` | `--project P` (id **or** name), `--no-agent` to skip the spawn | the started `LiveSession` |
 | `live stop` | — | the ended `LiveSession` |
 | `live status` (alias `get`, `show`) | — | the live `LiveSession`, or `null` |
-| `live listen` | `--wait <SECONDS>` (default 570, `0` = poll once), `--lease <N>` (a stale lease is `conflict`; a matching one also stops the predecessor, once) | the next undelivered user `LiveTurn`, or `null` |
+| `live listen` | `--wait <SECONDS>` (default 3000, `0` = poll once), `--lease <N>` (a stale lease is `conflict`; a matching one also stops the predecessor, once) | the next undelivered user `LiveTurn`, or `null` |
 | `live say <TEXT>…` | trailing var arg, like `inbox add` — put every flag **before** the message; `--lease <N>` | the `LiveTurn` |
 | `live navigate <ROUTE>` | `--say <TEXT>`; without it the turn is a pure action and says nothing; `--lease <N>` | the `LiveTurn` |
 | `live sidebars <collapse\|expand>` | `--say <TEXT>`, same rule; takes no route; `--lease <N>` | the `LiveTurn` |
@@ -1713,12 +1713,15 @@ takes exactly one value.
   the agent sees costs a whole model turn carrying the conversation so far. A
   session left idle at the old 60s default spent ten turns an hour saying
   nothing (and, prompted to check `mesa live status` each time round, more than
-  that). So the default wait is **570s** and `AGENT_PROMPT` names no `--wait` at
+  that). So the default wait is **3000s** and `AGENT_PROMPT` names no `--wait` at
   all: it tells the agent to run the command in the background, end its turn
   (mesa task 1156) and run *nothing else* while it is quiet — no status
-  check, no "still quiet" narration. 570
-  rather than 600 because a Claude Code session caps one command at ten
-  minutes: the wait must end by printing `null`, not by being killed. The
+  check, no "still quiet" narration. 3000s (mesa task 1347, up from 570s,
+  which sat under Claude Code's old ten-minute cap on one command) because
+  the prompt cache lives an hour: one wake per cache hour keeps every wake a
+  cache read, while the Claude Code settings' one-hour command timeout
+  (`BASH_MAX_TIMEOUT_MS`/`BASH_DEFAULT_TIMEOUT_MS` = 3600000) still leaves
+  the wait ending by printing `null`, not by being killed. The
   session's end is still noticed promptly — `listen` returns early on it, and
   every later `live` command reports there is no live session, which is the
   stop signal the routine `status` poll used to be.

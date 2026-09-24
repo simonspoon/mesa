@@ -29,6 +29,8 @@ import type { ConfigKeymap } from './types/ConfigKeymap'
 import type { ConfigPrice } from './types/ConfigPrice'
 import type { ConfigSpeech } from './types/ConfigSpeech'
 import type { ConfigListen } from './types/ConfigListen'
+import type { ConfigAudio } from './types/ConfigAudio'
+import type { TranscribeStatus } from './types/TranscribeStatus'
 import type { ConfigLive } from './types/ConfigLive'
 import type { LiveNotebookEntry } from './types/LiveNotebookEntry'
 import type { ConfigWatchers } from './types/ConfigWatchers'
@@ -1050,6 +1052,18 @@ export async function transcribeAvailable(): Promise<boolean> {
 }
 
 /**
+ * The whole answer of `GET /api/live/transcribe` (mesa task 1388): the
+ * engine `audio.engine` names, its probe `state`, the sentence to show when
+ * it is not ready and when the (cached) answer was taken. For the Settings
+ * page's read-only probe line (mesa task 1391); errors propagate, unlike
+ * `transcribeAvailable`, because a page showing the state must say it could
+ * not ask rather than read that as "not ready".
+ */
+export function transcribeStatus(): Promise<TranscribeStatus> {
+  return request('/api/live/transcribe')
+}
+
+/**
  * The page reporting where the browser is, so the agent knows what the person
  * is looking at. Ambient, like the inbox's read mark: sent on arrival and on
  * every hash change, and a failure is forgotten rather than shown.
@@ -1374,6 +1388,29 @@ export function updateListen(
   listen: Record<string, string | null>,
 ): Promise<ConfigListen> {
   return request('/api/config/listen', jsonInit('PUT', listen))
+}
+
+/**
+ * The audio settings in `~/.mesa/config.json` (mesa task 1388): which engine
+ * the server runs speech through (`legacy` | `naru-audio`) and the daemon's
+ * URL, each verbatim or `null` beside its built-in. 502 `unavailable` means
+ * the config file itself is unreadable, exactly as for `getConfig`.
+ */
+export function getAudio(): Promise<ConfigAudio> {
+  return request('/api/config/audio')
+}
+
+/**
+ * Writes audio settings and echoes them as re-read from disk. Only the keys
+ * passed are touched; `null` removes one, restoring the built-in. 422
+ * `validation` is an unknown engine or a malformed URL, and nothing is
+ * written in that case. A save drops the server's cached probe, so the next
+ * `transcribeStatus()` asks the engine just saved.
+ */
+export function updateAudio(
+  audio: Record<string, string | null>,
+): Promise<ConfigAudio> {
+  return request('/api/config/audio', jsonInit('PUT', audio))
 }
 
 /**

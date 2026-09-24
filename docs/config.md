@@ -836,8 +836,8 @@ mirror of Speech, above.
 - **`engine`** (mesa task 1388) names what the **page** listens with:
   `"server"` (the server's engine, below) or `"browser"` (the Web Speech API
   — a deliberate opt-in, never a fallback). Absent/`null`/blank = `"server"`;
-  any other word is **422**. Nothing reads it yet — the page's switch is a
-  later task.
+  any other word is **422**. The Settings page's Listen section edits it
+  (mesa task 1391), but nothing on the page acts on it yet (task 18).
 
 ### Routes
 
@@ -878,6 +878,11 @@ through and where the `naru-audio` daemon listens (mesa task 1388):
   set and non-empty, overrides the file.
 - Read on every request. A hand-edited unusable value falls back to the
   built-in where it is used and is shown verbatim by the getter.
+- Edited from the Settings page's **Audio** section (mesa task 1391): an
+  engine `<select>` (the URL is file-only) beside the live probe line from
+  `GET /api/live/transcribe`. A successful save drops the cached daemon
+  probe (`audio::invalidate`), so the next probe asks the engine and URL
+  just saved.
 
 ### Routes
 

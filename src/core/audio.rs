@@ -24,6 +24,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// Where the daemon listens when neither the config nor `NARU_AUDIO_URL`
 /// says otherwise (`naru-audio serve`'s own default bind).
@@ -76,8 +77,9 @@ impl AudioEngine {
 
 /// What the probe found (design §4.4). Serialized snake_case — the exact
 /// strings `GET /api/live/transcribe` answers with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../frontend/src/types/")]
 pub enum AudioState {
     /// Health ok, API 1, and the speech-to-text model loadable.
     Ready,

@@ -66,7 +66,9 @@ cannot be read is **502 `unavailable`**.
 - **`audio.engine = "naru-audio"`**: `core::audio::probe()` — `GET
   {audio.url}/health` with a 500 ms timeout, cached 10 s when `ready` and 2 s
   otherwise, so a daemon that stops is reported `daemon_down` within ten
-  seconds and one that comes back `ready` within two, no restart. `ready`
+  seconds and one that comes back `ready` within two, no restart. Saving
+  the `audio` config section drops the cached probe (mesa task 1391), so an
+  engine or URL change is asked about on the next GET. `ready`
   needs health `ok`, `api: 1` and `stt.ready`; `stt.problem.code ==
   "model_not_pulled"` is `model_missing`, any other `api` is `incompatible`,
   and anything else — a `/health` with no `stt` block included — is `error`

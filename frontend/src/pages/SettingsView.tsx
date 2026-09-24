@@ -4,6 +4,7 @@ import {
   deleteLiveMemory,
   getConfig,
   getKeymap,
+  getAudio,
   getListen,
   getLiveConfig,
   getPricing,
@@ -18,6 +19,8 @@ import {
   speechPreviewUrl,
   updateConfig,
   updateKeymap,
+  transcribeStatus,
+  updateAudio,
   updateListen,
   updateLiveConfig,
   updateLiveMemory,
@@ -111,12 +114,21 @@ import {
   canPick as canPickModel,
   changedListen,
   draftFrom as listenDraftFrom,
+  engineOptions as listenEngineOptions,
   isDirty as isListenDirty,
   isSavable as isListenSavable,
   options as modelOptions,
   valueError as modelError,
   type ListenDraft,
 } from '../listenDraft'
+import {
+  changedAudio,
+  draftFrom as audioDraftFrom,
+  isDirty as isAudioDirty,
+  options as audioEngineOptions,
+  probeLine,
+  type AudioDraft,
+} from '../audioDraft'
 import {
   changedLive,
   draftFrom as liveDraftFrom,
@@ -369,6 +381,7 @@ export function SettingsView({ tab }: { tab: SettingsTab }) {
       <div hidden={tab !== 'voice'}>
         <LivePromptSection />
         <SpeechSection />
+        <AudioSection />
         <ListenSection />
       </div>
       <div hidden={tab !== 'memory'}>
@@ -1288,6 +1301,124 @@ function SpeechSection() {
 }
 
 /**
+ * Audio: which engine the **server** runs speech through (`audio.engine`,
+ * mesa task 1391) — `legacy` (the `auris`/`kokoro-rs` binaries) or
+ * `naru-audio` (the daemon) — with the live probe of that engine beside it,
+ * from `GET /api/live/transcribe`. The save drops the server's cached probe,
+ * and the line is refetched after it, so the new engine's state shows with no
+ * reload. The daemon URL is not edited here.
+ */
+function AudioSection() {
+  const { data: audio, error, refetch } = useFetch(() => getAudio(), 'audio')
+  const probe = useFetch(() => transcribeStatus(), 'transcribe-status')
+  const [draft, setDraft] = useState<AudioDraft | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const seeded: AudioDraft =
+    draft ?? (audio ? audioDraftFrom(audio) : { engine: 'legacy' })
+
+  function save() {
+    if (!audio) return
+    setSaving(true)
+    setSaveError(null)
+    updateAudio(changedAudio(audio, seeded)).then(
+      (fresh) => {
+        setDraft(audioDraftFrom(fresh))
+        setSaving(false)
+        setSaved(true)
+        refetch()
+        probe.refetch()
+      },
+      (e: unknown) => {
+        setSaving(false)
+        setSaveError(e instanceof Error ? e.message : String(e))
+      },
+    )
+  }
+
+  if (error) {
+    return (
+      <>
+        <h2>Audio</h2>
+        <p className="error">{error}</p>
+      </>
+    )
+  }
+  if (!audio) {
+    return (
+      <>
+        <h2>Audio</h2>
+        <p className="muted">Loading…</p>
+      </>
+    )
+  }
+
+  const dirty = isAudioDirty(audio, seeded)
+
+  return (
+    <>
+      <h2>Audio</h2>
+      <section className="settings-command">
+        <label htmlFor="audio-engine">
+          <span className="settings-command-title">Server speech engine</span>
+          <code className="settings-command-key">engine</code>
+        </label>
+        <p className="muted settings-command-blurb">
+          <code>legacy</code> runs the <code>auris</code>/
+          <code>kokoro-rs</code> binaries; <code>naru-audio</code> asks the
+          daemon at <code>{audio.url ?? audio.url_default}</code>. A change
+          applies on the next probe, with no restart.
+        </p>
+        <div className="settings-voice-row">
+          <select
+            id="audio-engine"
+            className="settings-voice-input"
+            value={seeded.engine}
+            onChange={(e) => {
+              setDraft({ engine: e.target.value })
+              setSaved(false)
+            }}
+          >
+            {audioEngineOptions(audio).map((e) => (
+              <option key={e} value={e}>
+                {e}
+              </option>
+            ))}
+          </select>
+        </div>
+        {probe.error ? (
+          <p className="error">{probe.error}</p>
+        ) : probe.data ? (
+          <>
+            <p className="muted settings-command-blurb">
+              {probeLine(probe.data)}
+            </p>
+            {probe.data.message && (
+              <p className="muted settings-command-blurb">
+                {probe.data.message}
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="muted settings-command-blurb">Probing…</p>
+        )}
+      </section>
+
+      <div className="settings-actions">
+        <button type="button" disabled={!dirty || saving} onClick={save}>
+          {saving ? 'saving…' : 'save audio'}
+        </button>
+        {dirty && !saving && <span className="muted">unsaved changes</span>}
+        {saved && !dirty && <span className="settings-saved">saved</span>}
+      </div>
+      {saveError && <p className="error">{saveError}</p>}
+    </>
+  )
+}
+
+/**
  * Listen: the model `live transcribe` runs the external `auris` speech-to-text
  * binary with (mesa task 955). Its own section, draft and save button, for
  * the same reason speech has one — a separate endpoint, so one form's
@@ -1312,10 +1443,15 @@ function ListenSection() {
   const [saving, setSaving] = useState(false)
 
   const seeded: ListenDraft =
-    draft ?? (listen ? listenDraftFrom(listen) : { model: '' })
+    draft ?? (listen ? listenDraftFrom(listen) : { model: '', engine: 'server' })
 
   function edit(value: string) {
-    setDraft({ model: value })
+    setDraft({ ...seeded, model: value })
+    setSaved(false)
+  }
+
+  function editEngine(value: string) {
+    setDraft({ ...seeded, engine: value })
     setSaved(false)
   }
 
@@ -1411,6 +1547,31 @@ function ListenSection() {
           </p>
         )}
         {fieldError && <p className="error">{fieldError}</p>}
+      </section>
+      <section className="settings-command">
+        <label htmlFor="listen-engine">
+          <span className="settings-command-title">Page listening engine</span>
+          <code className="settings-command-key">engine</code>
+        </label>
+        <p className="muted settings-command-blurb">
+          What the page listens with: <code>server</code> (the engine above)
+          or <code>browser</code> (the browser's own recognizer, a deliberate
+          opt-in). Saved to the config; the page does not act on it yet.
+        </p>
+        <div className="settings-voice-row">
+          <select
+            id="listen-engine"
+            className="settings-voice-input"
+            value={seeded.engine}
+            onChange={(e) => editEngine(e.target.value)}
+          >
+            {listenEngineOptions(listen).map((e) => (
+              <option key={e} value={e}>
+                {e}
+              </option>
+            ))}
+          </select>
+        </div>
       </section>
 
       <div className="settings-actions">

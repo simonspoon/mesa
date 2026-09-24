@@ -24,6 +24,7 @@ use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use crate::core::audio::{self, AudioEngine, AudioState, TtlCache};
 use crate::core::config;
@@ -95,9 +96,11 @@ fn models_checked() -> (Vec<String>, SystemTime) {
 
 /// What `GET /api/live/transcribe` answers (mesa task 1388): whether the
 /// server's speech-to-text engine is ready, and if not, the sentence the
-/// page shows the person. `available` is `state == ready`, kept for clients
-/// that only read it.
-#[derive(Debug, Serialize)]
+/// page shows the person. `available` is whether the POST can decode
+/// (`!models().is_empty()`, on both engines until design task 17), kept for
+/// clients that only read it.
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../frontend/src/types/")]
 pub struct TranscribeStatus {
     pub available: bool,
     pub state: AudioState,

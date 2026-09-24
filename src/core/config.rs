@@ -2571,8 +2571,14 @@ fn audio_in(path: &Path) -> Result<ConfigAudio, String> {
 ///   leaves the file byte-identical.
 /// - Sibling of every other saver: one read-modify-write over the whole
 ///   document, so every section (and any Naru doesn't know) survives.
+///
+/// A successful save drops the cached daemon probe (`audio::invalidate`), so
+/// the next `GET /api/live/transcribe` asks the engine or URL just saved
+/// rather than serving an answer taken before the switch (mesa task 1391).
 pub fn save_audio(updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {
-    save_audio_in(&config_file(), updates)
+    save_audio_in(&config_file(), updates)?;
+    audio::invalidate();
+    Ok(())
 }
 
 fn save_audio_in(path: &Path, updates: &HashMap<String, Option<String>>) -> Result<(), SaveError> {

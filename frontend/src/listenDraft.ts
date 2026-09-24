@@ -1,3 +1,4 @@
+import { engineChange, engineChoices } from './audioDraft'
 import type { ConfigListen } from './types/ConfigListen'
 
 /**
@@ -14,14 +15,34 @@ import type { ConfigListen } from './types/ConfigListen'
  * - **The model is edited as text**, even when the box is a `<select>`: an
  *   installed binary mesa could not ask has no list to pick from, and the
  *   value already in the file has to survive that.
+ * - **The engine** (`listen.engine`, mesa task 1391) is picked from a fixed
+ *   list and drafted as the engine in force; picking the built-in sends
+ *   `null` (`audioDraft.ts::engineChange`).
  */
 
-/** The section's boxes as typed — today, exactly one. */
-export type ListenDraft = { model: string }
+/** The section's boxes as typed. */
+export type ListenDraft = { model: string; engine: string }
 
-/** The editable text as loaded: an unconfigured model is blank. */
+/** The engines `PUT /api/config/listen` accepts, built-in first. */
+export const LISTEN_ENGINES = ['server', 'browser']
+
+/**
+ * The editable values as loaded: an unconfigured model is blank, and the
+ * engine is the one in force.
+ */
 export function draftFrom(listen: ConfigListen): ListenDraft {
-  return { model: listen.model ?? '' }
+  const engine = (listen.engine ?? '').trim()
+  return { model: listen.model ?? '', engine: engine === '' ? listen.engine_default : engine }
+}
+
+/** The engines to offer, keeping a hand-edited unknown one visible. */
+export function engineOptions(listen: ConfigListen): string[] {
+  return engineChoices(listen.engine, LISTEN_ENGINES)
+}
+
+/** What the engine select means for a save: see `audioDraft.ts::engineChange`. */
+function engineOf(listen: ConfigListen, draft: ListenDraft): string | null | undefined {
+  return engineChange(listen.engine, listen.engine_default, draft.engine)
 }
 
 /**
@@ -71,9 +92,9 @@ function valueOf(draft: ListenDraft): string | null {
   return trimmed === '' ? null : trimmed
 }
 
-/** True when the box differs from what the server last reported. */
+/** True when either value differs from what the server last reported. */
 export function isDirty(listen: ConfigListen, draft: ListenDraft): boolean {
-  return valueOf(draft) !== (listen.model ?? null)
+  return valueOf(draft) !== (listen.model ?? null) || engineOf(listen, draft) !== undefined
 }
 
 /** True when nothing drafted would be rejected by the server. */
@@ -82,15 +103,20 @@ export function isSavable(draft: ListenDraft): boolean {
 }
 
 /**
- * The subset to PUT: the key only when it actually changed, so the API's
+ * The subset to PUT: each key only when it actually changed, so the API's
  * "only the keys present are touched" rule keeps two editors from clobbering
  * each other. A box cleared to blank sends `null` — the server's "remove this
- * key", which is the reset to the binary's own model.
+ * key", which is the reset to the binary's own model; the engine's built-in
+ * likewise sends `null`.
  */
 export function changedListen(
   listen: ConfigListen,
   draft: ListenDraft,
 ): Record<string, string | null> {
   if (!isDirty(listen, draft) || !isSavable(draft)) return {}
-  return { model: valueOf(draft) }
+  const changed: Record<string, string | null> = {}
+  if (valueOf(draft) !== (listen.model ?? null)) changed.model = valueOf(draft)
+  const engine = engineOf(listen, draft)
+  if (engine !== undefined) changed.engine = engine
+  return changed
 }

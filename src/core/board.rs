@@ -101,10 +101,18 @@ pub fn live_ink_path(session_id: i64, turn_id: i64) -> PathBuf {
 /// a row written before 1355: kept as it is while that file exists, else
 /// re-anchored to `<ink dir>/<its folder>/<its file>` if the ink moved there
 /// with the data dir, else kept as it is, so whoever opens it gets an honest
-/// "missing" rather than a guess.
+/// "missing" rather than a guess. A relative value holding anything but plain
+/// names (`..`, say) is never joined — it is returned as it is, which
+/// `Store::purge_live_ink` then refuses to delete.
 pub fn resolve_live_ink(stored: &str) -> String {
     let path = Path::new(stored);
     if path.is_relative() {
+        if !path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return stored.to_string();
+        }
         return live_ink_dir().join(path).to_string_lossy().into_owned();
     }
     if path.exists() {

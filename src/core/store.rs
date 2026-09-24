@@ -6005,9 +6005,11 @@ impl Store {
     /// Removes the ink of every turn older than `keep_days` (mesa task 1355,
     /// [`LIVE_INK_KEEP_DAYS`]), judged on SQLite's own clock: the file is
     /// deleted (already gone is fine) and only then the turn's `image_path`
-    /// cleared — `board_id` stays — so the db never names a purged file, and
-    /// a session folder that is left empty goes too. Row-driven: a file no
-    /// turn names is never touched. A file that cannot be removed keeps its
+    /// cleared — `board_id` stays — and a session folder that is left empty
+    /// goes too. Row-driven: a file no turn names is never touched, and
+    /// neither is one whose row resolves outside [`board::live_ink_dir`] (a
+    /// legacy absolute row in a db copied beside another ink dir) — that row
+    /// only has its column cleared. A file that cannot be removed keeps its
     /// row, to be retried next time, and the first such error is returned
     /// once every other row has been purged. Answers how many were purged.
     pub fn purge_live_ink(&mut self, keep_days: i64) -> Result<usize> {
@@ -6026,7 +6028,12 @@ impl Store {
         let mut purged = 0;
         for (id, stored) in old {
             let path = PathBuf::from(board::resolve_live_ink(&stored));
-            match std::fs::remove_file(&path) {
+            let inside = path.is_absolute() && path.starts_with(board::live_ink_dir());
+            match if inside {
+                std::fs::remove_file(&path)
+            } else {
+                Ok(())
+            } {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
@@ -6040,7 +6047,7 @@ impl Store {
             )?;
             purged += 1;
             // Refused while anything is still in the folder, which is the point.
-            if let Some(folder) = path.parent() {
+            if let Some(folder) = path.parent().filter(|_| inside) {
                 let _ = std::fs::remove_dir(folder);
             }
         }
@@ -16171,6 +16178,8 @@ mod tests {
         }
         // The legacy column itself is untouched: the row follows on read.
         assert_eq!(raw_image_path(&store, legacy.id), Some(old_abs));
+        unsafe { std::env::remove_var("MESA_LIVE_INK_DIR") };
+        unsafe { std::env::remove_var("MESA_ATTACHMENTS_DIR") };
     }
 
     /// Ink older than [`LIVE_INK_KEEP_DAYS`] is purged — file removed, column
@@ -16234,6 +16243,51 @@ mod tests {
         assert!(!ink_root.join(second_session.to_string()).exists());
         assert_eq!(store.get_live_turn(second.id).unwrap().image_path, None);
         assert_eq!(std::fs::read(&fresh_file).unwrap(), png);
+        unsafe { std::env::remove_var("MESA_LIVE_INK_DIR") };
+        unsafe { std::env::remove_var("MESA_ATTACHMENTS_DIR") };
+    }
+
+    /// The purge deletes only inside the ink dir: an old row naming a file
+    /// anywhere else (a legacy absolute row, a `..` smuggle) has its column
+    /// cleared and its file left alone.
+    #[test]
+    fn ink_purge_never_deletes_outside_the_ink_dir() {
+        let (mut store, dir, _lock) = ink_test_store();
+        let session = store.start_live_session(None).unwrap();
+        let board = store
+            .add_live_board(session.id, LiveBoardKind::Markdown, None, "body", None)
+            .unwrap();
+        let outside = dir.path().join("outside").join("1.png");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, tiny_png()).unwrap();
+        let escape = dir.path().join("escape.png");
+        std::fs::write(&escape, tiny_png()).unwrap();
+        let mut ids = Vec::new();
+        for stored in [
+            outside.to_string_lossy().into_owned(),
+            "../escape.png".into(),
+        ] {
+            let turn = store
+                .add_live_ink_turn(session.id, "ink", board.id, &tiny_png())
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE live_turns SET image_path = ?1, \
+                     created_at = datetime('now', '-31 days') WHERE id = ?2",
+                    (&stored, turn.id),
+                )
+                .unwrap();
+            ids.push(turn.id);
+        }
+        assert_eq!(store.purge_live_ink(LIVE_INK_KEEP_DAYS).unwrap(), 2);
+        for id in ids {
+            assert_eq!(raw_image_path(&store, id), None);
+        }
+        assert!(outside.exists());
+        assert!(escape.exists());
+        unsafe { std::env::remove_var("MESA_LIVE_INK_DIR") };
+        unsafe { std::env::remove_var("MESA_ATTACHMENTS_DIR") };
     }
 
     /// A board kept on a task (`mesa live board keep --task`) copies its ink

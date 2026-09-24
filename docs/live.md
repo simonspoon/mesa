@@ -1516,9 +1516,12 @@ board, and seen by the agent only when the person next sends a turn.
   `image_path` is stored as `<session>/<turn>.png` (`board::live_ink_relative`)
   and resolved against the ink dir on every read by one helper,
   `board::resolve_live_ink`, so `LiveTurn.image_path` is still the absolute
-  path the agent opens, and an ink folder moved with its data dir (and the ink
-  dir pointed at it) takes every row with it and needs no rewrite — which is
-  why `naru migrate` has none. A row written before 1355 holds an absolute path: it reads back as
+  path the agent opens, and an ink folder moved or copied (and the ink dir
+  pointed at it) takes every row with it and needs no rewrite. `naru migrate`
+  does **not** carry `live-ink/` (nor attachments): after a migrate the rows
+  resolve to the new machine's ink dir and a missing file is tolerated —
+  `keep --task` reports it `not_found`, and the purge clears the row once it
+  is 30 days old. A row written before 1355 holds an absolute path: it reads back as
   stored while that file exists, else re-anchored to
   `<ink dir>/<its folder>/<its file>` if the ink is there, else as stored (an
   honest "missing" rather than a guess). No migration.
@@ -1527,9 +1530,13 @@ board, and seen by the agent only when the person next sends a turn.
   (`start_live_session`, the one call site the CLI and the API share; a
   failure is ignored and retried at the next start), walks the turns whose ink
   is older than that on SQLite's clock, deletes each file (already gone is
-  fine), **then** clears that turn's `image_path` — `board_id` stays — so the
-  db never names a purged file, and removes a session folder left empty. It is
-  row-driven, never an mtime sweep: a file no turn names is not touched. A
+  fine), **then** clears that turn's `image_path` — `board_id` stays — and
+  removes a session folder left empty. An `UPDATE` failing after the file is
+  gone leaves the row naming a missing file until the next start's purge
+  clears it. It is row-driven, never an mtime sweep: a file no turn names is
+  not touched, and neither is one a row resolves to outside the ink dir (a
+  legacy absolute row in a db copied beside another ink dir, or a relative
+  value with `..` in it) — that row only has its column cleared. A
   board kept with `naru live board keep --task` is untouched by construction —
   `keep` **copied** the ink into the task's attachments — and a purged turn no
   longer counts as the board's ink, so a later `keep` of that board keeps it

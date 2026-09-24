@@ -14,8 +14,8 @@
 #      delete (echoes the full destroyed record), and the domain errors
 #      (duplicate name -> conflict, unknown id/name -> not_found);
 #   2. the --quiet contract: accepted on create/update/delete/show/get,
-#      dropping exactly body+synced_body and keeping name; rejected (exit 2,
-#      empty stdout) on list, versions and both sync subcommands; `update`
+#      dropping exactly body+synced_body+builtin_body and keeping name;
+#      rejected (exit 2, empty stdout) on list, versions and both sync subcommands; `update`
 #      with no field flag is exit 2 usage with empty stdout;
 #   3. the name rule — ../evil, a/b, .., ., and an empty name are each
 #      `validation` on both surfaces, the traversal chokepoint a synced row
@@ -92,6 +92,17 @@
 #      `sync status`, and drops out of `orphans`; `--quiet` rejected on
 #      both; and the two routes serving over the API (both sweeps in
 #      section 8 now cover sixteen routes).
+#  14. a built-in changing under a fork (mesa task 1349): a fresh fork of
+#      `inbox-triage` is not flagged; a legacy NULL base and a simulated
+#      upgrade (`builtin_base` set to an older body in sqlite) flag it in
+#      `list`, `show` (and `--quiet`, which keeps the flag and drops
+#      `builtin_body`) and `sync status`; `library builtin keep|take|merge`
+#      each clear it (keep leaving the body, take writing the built-in and a
+#      version, merge writing the given body), with the usage/validation
+#      refusals; and `POST /api/library/{id}/builtin` doing the same with its
+#      404/422/415 shapes; and a fork exported and imported into a fresh db
+#      arriving with no base, flagged. Both gate sweeps in section 8 now
+#      cover all eighteen library routes, the import preview included.
 set -euo pipefail
 # Drop inherited NARU_* vars: Naru reads them before MESA_*, so one would escape this script's isolation.
 unset $(env | sed -n 's/^\(NARU_[A-Za-z0-9_]*\)=.*/\1/p')
@@ -304,16 +315,18 @@ ok "CLI library delete: the record is gone, and deleting an unknown id is not_fo
 
 # ================= 2. --quiet contract =================
 
-# The quiet shape is the record minus exactly body+synced_body, keeping name.
+# The quiet shape is the record minus exactly body+synced_body+builtin_body
+# (the last a copy of the current built-in's body, mesa task 1349), keeping
+# name.
 quiet_parity() { # quiet_parity <label> <full-json> <quiet-json>
   local label=$1 full=$2 quiet=$3
   local dropped
   dropped=$(jq -r --argjson q "$quiet" \
     '[keys_unsorted[] as $k | select($q | has($k) | not) | $k] | sort | join(",")' <<<"$full")
-  [ "$dropped" = "body,synced_body" ] ||
-    fail "$label: --quiet must drop exactly body,synced_body — dropped: [$dropped]"
+  [ "$dropped" = "body,builtin_body,synced_body" ] ||
+    fail "$label: --quiet must drop exactly body,builtin_body,synced_body — dropped: [$dropped]"
   [ "$(jq -r '.name != null' <<<"$quiet")" = "true" ] || fail "$label: --quiet must keep name"
-  [ "$(jq -S 'del(.body, .synced_body)' <<<"$full")" = "$(jq -S . <<<"$quiet")" ] ||
+  [ "$(jq -S 'del(.body, .synced_body, .builtin_body)' <<<"$full")" = "$(jq -S . <<<"$quiet")" ] ||
     fail "$label: --quiet changed a value, not just the key set"
 }
 
@@ -321,7 +334,7 @@ run 0 "$MESA" library show "$LIB_REVIEWER"
 FULL=$STDOUT
 run 0 "$MESA" library show "$LIB_REVIEWER" --quiet
 quiet_parity "library show" "$FULL" "$STDOUT"
-ok "--quiet on library show: drops exactly body+synced_body, keeps name, every other key/value identical"
+ok "--quiet on library show: drops exactly body+synced_body+builtin_body, keeps name, every other key/value identical"
 
 run 0 "$MESA" library create prompt quiettest 'q' --quiet
 QUIET=$STDOUT
@@ -329,7 +342,7 @@ QID=$(jq -r .id <<<"$QUIET")
 run 0 "$MESA" library show "$QID"
 quiet_parity "library create" "$STDOUT" "$QUIET"
 [ "$(jqs .body)" = "q" ] || fail "quiet create: the record was still stored in full"
-ok "--quiet on library create: prints the record minus body+synced_body, storing it in full"
+ok "--quiet on library create: prints the record minus body+synced_body+builtin_body, storing it in full"
 
 run 0 "$MESA" library update "$QID" --body 'q2'
 FULL=$STDOUT
@@ -337,7 +350,7 @@ run 0 "$MESA" library update "$QID" --body 'q3' --quiet
 QUIET=$STDOUT
 run 0 "$MESA" library show "$QID"
 quiet_parity "library update" "$STDOUT" "$QUIET"
-ok "--quiet on library update: drops exactly body+synced_body"
+ok "--quiet on library update: drops exactly body+synced_body+builtin_body"
 
 run 0 "$MESA" library show "$QID"
 FULL=$STDOUT
@@ -345,7 +358,7 @@ run 0 "$MESA" library delete "$QID" --quiet
 quiet_parity "library delete" "$FULL" "$STDOUT"
 run 1 "$MESA" library show "$QID"
 [ "$(jqe .error.code)" = "not_found" ] || fail "quiet delete: the record is actually gone"
-ok "--quiet on library delete: drops exactly body+synced_body and the record is gone"
+ok "--quiet on library delete: drops exactly body+synced_body+builtin_body and the record is gone"
 
 run 2 "$MESA" library list --quiet
 [ "$(jqe .error.code)" = "usage" ] || fail "--quiet on list: code=usage"
@@ -805,6 +818,9 @@ NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
 NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/api/library/sync")
 [ "$NO_CT" = "415" ] || fail "POST /api/library/sync without Content-Type: expected 415, got $NO_CT"
 NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -d '{"action":"keep"}' "http://127.0.0.1:$PORT/api/library/999999/builtin")
+[ "$NO_CT" = "415" ] || fail "POST /api/library/{id}/builtin without Content-Type: expected 415, got $NO_CT"
+NO_CT=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
   -d '{"bundle":{"version":1,"exported_at":"x","items":[]}}' "http://127.0.0.1:$PORT/api/library/import")
 [ "$NO_CT" = "415" ] || fail "POST /api/library/import without Content-Type: expected 415, got $NO_CT"
 ok "every mutating /api/library route (incl. fork, sync apply and import) without a JSON Content-Type is 415"
@@ -913,6 +929,12 @@ raw GET "/api/library/hooks/orphans?scope=user" -H "Host: evil.example"
 raw POST /api/library/hooks/adopt -H "Host: evil.example" -H 'Content-Type: application/json' \
   -d '{"scope":"user","path":"/nope"}'
 [ "$STATUS" = "403" ] || fail "default: POST /api/library/hooks/adopt with a foreign Host must be 403"
+raw POST "/api/library/$GATE_ID/builtin" -H "Host: evil.example" -H 'Content-Type: application/json' \
+  -d '{"action":"keep"}'
+[ "$STATUS" = "403" ] || fail "default: POST /api/library/{id}/builtin with a foreign Host must be 403"
+raw POST /api/library/import/preview -H "Host: evil.example" -H 'Content-Type: application/json' \
+  -d '{"bundle":{"version":1,"exported_at":"x","items":[]}}'
+[ "$STATUS" = "403" ] || fail "default: POST /api/library/import/preview with a foreign Host must be 403"
 api 200 GET "/api/library/$GATE_ID"
 [ "$(jqb .body)" = "x" ] || fail "default: a refused authoring request must write nothing"
 ok "default mode: every mutating route AND both sync routes reject a foreign Host, writing nothing"
@@ -995,7 +1017,7 @@ LIS=$(lan_req POST /api/library/import "127.0.0.1:$LAN_PORT" '' '{"bundle":{"ver
   fail "--lan: importing from this machine's own local Host must still work (the flag never locks the owner out)"
 ok "--lan: authoring (incl. import) from a loopback peer with a local Host still works (the flag never locks the owner out)"
 
-# All SIXTEEN routes: a DNS-name Host (rebinding) and a foreign Origin
+# All EIGHTEEN routes: a DNS-name Host (rebinding) and a foreign Origin
 # (cross-site) are each refused — reads exactly as strictly as mutations, the
 # two sync routes and the two bundle routes, since every one of them shares
 # `require_agent_access`.
@@ -1016,6 +1038,8 @@ for CASE in \
   "DELETE|/api/library/$GATE_ID/hook|{}" \
   "GET|/api/library/hooks/orphans?scope=user|" \
   "POST|/api/library/hooks/adopt|{\"scope\":\"user\",\"path\":\"/nope\"}" \
+  "POST|/api/library/$GATE_ID/builtin|{\"action\":\"keep\"}" \
+  "POST|/api/library/import/preview|{\"bundle\":{\"version\":1,\"exported_at\":\"x\",\"items\":[]}}" \
 ; do
   IFS='|' read -r METHOD PATH_ BODY_ <<<"$CASE"
   S=$(lan_req "$METHOD" "$PATH_" "evil.example:$LAN_PORT" '' "$BODY_")
@@ -1025,7 +1049,7 @@ for CASE in \
   [ "$S" = "403" ] ||
     fail "--lan: $METHOD $PATH_ from a foreign Origin must be 403, got $S"
 done
-ok "--lan: all sixteen library routes (reads included) reject a DNS-name Host (rebinding) and a foreign Origin (cross-site)"
+ok "--lan: all eighteen library routes (reads included) reject a DNS-name Host (rebinding) and a foreign Origin (cross-site)"
 
 api2() { # api2 <expected-status> <method> <path> [json-body] — against LAN_PORT, local Host
   local expected=$1 method=$2 path=$3 body=${4:-}
@@ -1930,6 +1954,145 @@ kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
 ok "API: GET /api/library/hooks/orphans lists, POST /api/library/hooks/adopt answers 404 for a missing script and 415 without JSON"
 
 echo "== library-check: section 13 (hooks wired from outside .claude/hooks) passed ($CHECKS checks so far) =="
+
+# ================= 14. a built-in changing under a fork (mesa task 1349) =================
+#
+# A Naru upgrade is simulated in the db: `builtin_base` — the built-in body
+# the fork last agreed with — is set to an older body (or NULL, a pre-1349
+# fork), which is exactly the state a real upgrade leaves behind.
+command -v sqlite3 >/dev/null || fail "sqlite3 is required for section 14"
+set_base() { # set_base <item id> <sql value>
+  sqlite3 "$MESA_DB" "UPDATE library_items SET builtin_base = $2 WHERE id = $1"
+}
+
+run 0 "$MESA" library show inbox-triage
+[ "$(jqs .id)" = "null" ] || fail "fixture: inbox-triage must start unshadowed for this section"
+[ "$(jqs .builtin_updated)" = "false" ] || fail "an unshadowed built-in is never flagged, got $STDOUT"
+[ "$(jqs .builtin_body)" = "null" ] || fail "an unshadowed built-in carries no builtin_body, got $STDOUT"
+TRIAGE_BUILTIN=$(jqs .body)
+run 0 "$MESA" library update inbox-triage --body 'my triage fork'
+FID=$(jqs .id)
+[ "$FID" != "null" ] || fail "updating inbox-triage must fork it"
+[ "$(jqs .builtin_updated)" = "false" ] || fail "a fresh fork is not flagged, got $STDOUT"
+[ "$(jqs .builtin_body)" = "$TRIAGE_BUILTIN" ] || fail "a fork carries the current built-in body"
+[ "$(sqlite3 "$MESA_DB" "SELECT builtin_base = body FROM library_items WHERE id = $FID")" = "0" ] ||
+  fail "fixture: the fork's body must differ from its base"
+[ "$(sqlite3 "$MESA_DB" "SELECT builtin_base IS NOT NULL FROM library_items WHERE id = $FID")" = "1" ] ||
+  fail "a fork must be stamped with the built-in body it forked from"
+ok "a fresh fork is stamped with its built-in's body and reads builtin_updated: false"
+
+# A legacy fork (NULL base) whose body differs is flagged everywhere.
+set_base "$FID" NULL
+run 0 "$MESA" library show inbox-triage
+[ "$(jqs .builtin_updated)" = "true" ] || fail "show: a legacy fork must be flagged, got $STDOUT"
+run 0 "$MESA" library show inbox-triage --quiet
+[ "$(jqs .builtin_updated)" = "true" ] || fail "show --quiet keeps builtin_updated, got $STDOUT"
+[ "$(jqs 'has("builtin_body")')" = "false" ] || fail "show --quiet drops builtin_body, got $STDOUT"
+run 0 "$MESA" library list
+[ "$(jqs ".[] | select(.id == $FID) | .builtin_updated")" = "true" ] ||
+  fail "list: the legacy fork must be flagged"
+run 0 "$MESA" library sync status
+[ "$(jqs '.[] | select(.path == ".claude/agents/inbox-triage.md") | .builtin_updated')" = "true" ] ||
+  fail "sync status: the legacy fork's row must be flagged, got $STDOUT"
+ok "a legacy fork (NULL base) whose body differs is flagged in show, show --quiet (builtin_body dropped), list and sync status"
+
+# keep: the flag clears, the body and history stay.
+set_base "$FID" "'an older built-in'"
+run 0 "$MESA" library versions inbox-triage
+VERSIONS_BEFORE=$(jqs length)
+run 0 "$MESA" library builtin keep inbox-triage
+[ "$(jqs .builtin_updated)" = "false" ] || fail "keep: the flag must clear, got $STDOUT"
+[ "$(jqs .body)" = "my triage fork" ] || fail "keep: the body must be untouched"
+run 0 "$MESA" library versions inbox-triage
+[ "$(jqs length)" = "$VERSIONS_BEFORE" ] || fail "keep: no version may be written"
+ok "library builtin keep: the flag clears, the body and history are untouched"
+
+# take: the body becomes the built-in, history keeps the fork.
+set_base "$FID" "'an older built-in'"
+run 0 "$MESA" library builtin take inbox-triage --quiet
+[ "$(jqs .builtin_updated)" = "false" ] || fail "take --quiet: the flag must clear, got $STDOUT"
+[ "$(jqs 'has("body")')" = "false" ] || fail "take --quiet: body dropped"
+run 0 "$MESA" library show inbox-triage
+[ "$(jqs .body)" = "$TRIAGE_BUILTIN" ] || fail "take: the body must become the built-in"
+run 0 "$MESA" library versions inbox-triage
+[ "$(jqs length)" = "$((VERSIONS_BEFORE + 1))" ] || fail "take: one version must be appended"
+[ "$(jqs '.[1].body')" = "my triage fork" ] || fail "take: history keeps the fork's old body"
+ok "library builtin take: the body becomes the built-in, one version appended, the old body kept in history"
+
+# merge: the given body, from a file.
+set_base "$FID" "'an older built-in'"
+printf 'merged by hand\n' > "$TMP/merged.md"
+run 0 "$MESA" library builtin merge inbox-triage --body-file "$TMP/merged.md"
+[ "$(jqs .builtin_updated)" = "false" ] || fail "merge: the flag must clear, got $STDOUT"
+[ "$(jqs .body)" = "merged by hand" ] || fail "merge: the body must be the merged text, got $(jqs .body)"
+ok "library builtin merge --body-file: the merged body is stored and the flag clears"
+
+run 2 "$MESA" library builtin merge inbox-triage
+[ -z "$STDOUT" ] || fail "merge with no body: stdout must be empty"
+run 1 "$MESA" library builtin keep task-stop-guard
+[ "$(jqe .error.code)" = "validation" ] || fail "keep on an unshadowed built-in: validation, got $STDERR"
+run 0 "$MESA" library create prompt not-a-fork 'x'
+run 1 "$MESA" library builtin take not-a-fork
+[ "$(jqe .error.code)" = "validation" ] || fail "take on a plain row: validation, got $STDERR"
+run 1 "$MESA" library builtin keep no-such-item
+[ "$(jqe .error.code)" = "not_found" ] || fail "keep on an unknown item: not_found, got $STDERR"
+ok "library builtin: merge without a body is usage (exit 2); an unshadowed built-in or a plain row is validation; an unknown item not_found"
+
+# ---- over the API ----
+"$MESA" serve --port 17799 >"$TMP/serve14.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  curl -sf "http://127.0.0.1:17799/api/projects" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+PORT=17799
+set_base "$FID" "'an older built-in'"
+api 200 GET "/api/library/$FID"
+[ "$(jqb .builtin_updated)" = "true" ] || fail "API show: the fork must be flagged"
+[ "$(jqb .builtin_body)" = "$TRIAGE_BUILTIN" ] || fail "API show: builtin_body is the current built-in"
+api 200 POST "/api/library/$FID/builtin" '{"action":"keep"}'
+[ "$(jqb .builtin_updated)" = "false" ] || fail "API keep: the flag must clear"
+[ "$(jqb .body)" = "merged by hand" ] || fail "API keep: the body is untouched"
+set_base "$FID" "'an older built-in'"
+api 200 POST "/api/library/$FID/builtin" '{"action":"take"}'
+[ "$(jqb .body)" = "$TRIAGE_BUILTIN" ] || fail "API take: the body becomes the built-in"
+[ "$(jqb .builtin_updated)" = "false" ] || fail "API take: the flag must clear"
+set_base "$FID" "'an older built-in'"
+api 200 POST "/api/library/$FID/builtin" '{"action":"merge","body":"merged over http"}'
+[ "$(jqb .body)" = "merged over http" ] || fail "API merge: the body is the given text"
+[ "$(jqb .builtin_updated)" = "false" ] || fail "API merge: the flag must clear"
+ok "POST /api/library/{id}/builtin: keep, take and merge each answer 200 with the updated, unflagged item"
+
+api 404 POST /api/library/999999/builtin '{"action":"keep"}'
+[ "$(jqb .error.code)" = "not_found" ] || fail "API builtin unknown id: error.code"
+api 422 POST "/api/library/$FID/builtin" '{"action":"merge"}'
+[ "$(jqb .error.code)" = "validation" ] || fail "API merge without body: error.code"
+api 422 POST "/api/library/$FID/builtin" '{"action":"keep","body":"x"}'
+[ "$(jqb .error.code)" = "validation" ] || fail "API keep with a body: error.code"
+api 422 POST "/api/library/$FID/builtin" '{"action":"bogus"}'
+[ "$(jqb .error.code)" = "validation" ] || fail "API unknown action: error.code"
+run 0 "$MESA" library show not-a-fork
+api 422 POST "/api/library/$(jqs .id)/builtin" '{"action":"keep"}'
+[ "$(jqb .error.code)" = "validation" ] || fail "API builtin on a plain row: error.code"
+api 422 POST "/api/library/$FID/builtin" '{not json'
+api 200 GET "/api/library/$FID"
+[ "$(jqb .body)" = "merged over http" ] || fail "API: a refused request must write nothing"
+ok "POST /api/library/{id}/builtin: 404 unknown id; 422 merge without a body, a body on keep, an unknown action, a plain row and malformed JSON — writing nothing"
+kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null || true; SERVER_PID=""
+
+# An imported fork arrives with no base: a bundle carries none, so it reads
+# like a legacy fork — flagged, since its body differs from this built-in.
+run 0 "$MESA" library export --output "$TMP/fork-bundle.json"
+run 0 env MESA_DB="$TMP/import14.db" "$MESA" library import "$TMP/fork-bundle.json"
+[ "$(jqs '.[] | select(.name == "inbox-triage") | .status')" = "created" ] ||
+  fail "import: the inbox-triage fork must be created in a fresh db, got $STDOUT"
+run 0 env MESA_DB="$TMP/import14.db" "$MESA" library show inbox-triage
+[ "$(jqs .builtin_updated)" = "true" ] || fail "import: an imported fork must be flagged, got $STDOUT"
+[ "$(sqlite3 "$TMP/import14.db" "SELECT builtin_base IS NULL FROM library_items WHERE builtin_id = 'inbox-triage'")" = "1" ] ||
+  fail "import: an imported fork's base must be NULL"
+ok "an imported fork arrives with no base (a bundle carries none) and is flagged because its body differs"
+
+echo "== library-check: section 14 (a built-in changing under a fork) passed ($CHECKS checks so far) =="
 
 echo
 echo "library-check: $CHECKS checks passed"

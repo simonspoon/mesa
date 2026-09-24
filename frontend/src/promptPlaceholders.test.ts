@@ -18,6 +18,8 @@ function item(overrides: Partial<LibraryItem> = {}): LibraryItem {
     synced_at: null,
     created_at: null,
     updated_at: null,
+    builtin_updated: false,
+    builtin_body: null,
     ...overrides,
   }
 }

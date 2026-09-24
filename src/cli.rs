@@ -27,12 +27,13 @@ use serde_json::json;
 use crate::core::{
     ArchiveOutcome, Artifact, ArtifactPatch, Diagram, DiagramPatch, DiagramType, DiagramView,
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch,
-    FrameShape, ImportDoc, InboxItem, InboxKind, LIVE_TEXT_MAX, LibraryBundle, LibraryItem,
-    LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus, LiveAction, LiveBoard,
-    LiveBoardKind, LiveNotebookEntry, LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary,
-    LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg,
-    ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, TaskReceipt, agents, board, cc,
-    config, files, git, library, live, look, migrate, project_memory, receipt, retro, system,
+    FrameShape, ImportDoc, InboxItem, InboxKind, LIVE_TEXT_MAX, LibraryBuiltinAction,
+    LibraryBundle, LibraryItem, LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus,
+    LiveAction, LiveBoard, LiveBoardKind, LiveNotebookEntry, LiveNotice, LiveRole, LiveSession,
+    LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch,
+    Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch,
+    TaskReceipt, agents, board, cc, config, files, git, library, live, look, migrate,
+    project_memory, receipt, retro, system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -1491,6 +1492,10 @@ EXAMPLES
         /// Library item id or name
         item: String,
     },
+    /// Answer a built-in that changed under a fork: keep the fork, take the
+    /// new built-in, or save a hand-merged body
+    #[command(subcommand)]
+    Builtin(LibraryBuiltinCmd),
     /// Register a hook item in `.claude/settings.json`, or ask where it is
     #[command(subcommand)]
     Hook(LibraryHookCmd),
@@ -1538,6 +1543,51 @@ EXAMPLES
         /// nothing. The per-item pick itself is the web flow.
         #[arg(long, conflicts_with = "on_conflict")]
         preview: bool,
+    },
+}
+
+/// `naru library builtin keep|take|merge` — mesa task 1349. A fork whose
+/// built-in changed under it reads `builtin_updated: true` (and carries the
+/// current `builtin_body` to diff against); each subcommand records the
+/// user's decision and clears the flag, printing the updated item like
+/// `update` does. None of them is a no-op refusal on an unflagged fork — the
+/// decision is simply re-recorded against the current built-in.
+#[derive(Subcommand)]
+enum LibraryBuiltinCmd {
+    /// Keep the fork's body as it is; the flag clears
+    Keep {
+        /// Library item id or name; must be a fork of a built-in
+        item: String,
+        /// Print the item without `body`/`synced_body`/`builtin_body`
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Replace the fork's body with the current built-in body (history keeps
+    /// the old one); the flag clears
+    Take {
+        /// Library item id or name; must be a fork of a built-in
+        item: String,
+        /// Print the item without `body`/`synced_body`/`builtin_body`
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Replace the fork's body with a hand-merged text; the flag clears
+    #[command(after_help = "\
+EXAMPLES
+  naru library builtin merge naru-live --body-file merged.md")]
+    #[command(group(ArgGroup::new("merged").required(true)))]
+    Merge {
+        /// Library item id or name; must be a fork of a built-in
+        item: String,
+        /// The merged body
+        #[arg(long, allow_hyphen_values = true, group = "merged")]
+        body: Option<String>,
+        /// Read the merged body from a file (`-` = stdin)
+        #[arg(long, value_name = "PATH", group = "merged")]
+        body_file: Option<String>,
+        /// Print the item without `body`/`synced_body`/`builtin_body`
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -3812,8 +3862,10 @@ const QUIET_DROP_ARTIFACT: &[&str] = &["body"];
 /// Keys dropped from a `LibraryItem` under `--quiet`: its own unbounded body,
 /// and the sync baseline — a second copy of a body, unbounded the same way.
 /// `name`/`kind`/`scope`/`path` all stay, which is what makes a compact row
-/// identifiable at all.
-const QUIET_DROP_LIBRARY: &[&str] = &["body", "synced_body"];
+/// identifiable at all. `builtin_body` (mesa task 1349) is a third copy of a
+/// body, the current built-in's, and goes too; the bounded `builtin_updated`
+/// flag beside it stays.
+const QUIET_DROP_LIBRARY: &[&str] = &["body", "synced_body", "builtin_body"];
 /// A `FrameEdge` has no unbounded field: quiet output equals full output.
 /// The flag is still accepted on edge subcommands, for uniformity.
 const QUIET_DROP_FRAME_EDGE: &[&str] = &[];
@@ -6772,6 +6824,36 @@ fn run_library_cmd(cmd: LibraryCmd) -> Result<()> {
                 None => print_json(&Vec::<crate::core::LibraryVersion>::new()),
             }
         }
+        LibraryCmd::Builtin(builtin_cmd) => {
+            let (item, action, body, quiet) = match builtin_cmd {
+                LibraryBuiltinCmd::Keep { item, quiet } => {
+                    (item, LibraryBuiltinAction::Keep, None, quiet)
+                }
+                LibraryBuiltinCmd::Take { item, quiet } => {
+                    (item, LibraryBuiltinAction::Take, None, quiet)
+                }
+                LibraryBuiltinCmd::Merge {
+                    item,
+                    body,
+                    body_file,
+                    quiet,
+                } => {
+                    let mut stdin_used = false;
+                    let body = resolve_field(body, body_file, &mut stdin_used)?;
+                    (item, LibraryBuiltinAction::Merge, body, quiet)
+                }
+            };
+            let current = resolve_library(&store, &item)?;
+            let Some(id) = current.id else {
+                return Err(Error::Validation(format!(
+                    "{item:?} is an unshadowed built-in, not a fork; there is nothing to review"
+                )));
+            };
+            print_library_item(
+                &store.resolve_library_builtin_update(id, action, body.as_deref())?,
+                quiet,
+            );
+        }
         LibraryCmd::Hook(hook_cmd) => run_library_hook_cmd(&mut store, hook_cmd)?,
         LibraryCmd::Sync(sync_cmd) => run_library_sync_cmd(&mut store, sync_cmd)?,
         LibraryCmd::Export {
@@ -7153,6 +7235,8 @@ mod tests {
             synced_at: Some("2026-01-02 00:00:00".into()),
             created_at: Some("2026-01-01 00:00:00".into()),
             updated_at: Some("2026-01-02 00:00:00".into()),
+            builtin_updated: true,
+            builtin_body: Some("# naru-live\n".into()),
         }
     }
 
@@ -7523,7 +7607,7 @@ mod tests {
     }
 
     #[test]
-    fn library_item_quiet_drops_body_and_synced_body() {
+    fn library_item_quiet_drops_body_synced_body_and_builtin_body() {
         let full = keys(&sample_library_item());
         assert_eq!(
             sorted_owned(full.clone()),
@@ -7544,6 +7628,10 @@ mod tests {
                 "synced_at",
                 "created_at",
                 "updated_at",
+                // Mesa task 1349: the bounded flag stays in the quiet shape,
+                // the current built-in body beside it is dropped.
+                "builtin_updated",
+                "builtin_body",
             ]),
             "LibraryItem gained/lost a field: decide whether it belongs in the \
              --quiet shape before updating this list",

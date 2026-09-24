@@ -47,6 +47,7 @@ function row(overrides: Partial<LibrarySyncRow> = {}): LibrarySyncRow {
     disk_mtime: null,
     mesa_updated_at: null,
     diff: null,
+    builtin_updated: false,
     ...overrides,
   }
 }

@@ -601,6 +601,8 @@ pub fn effective_items(store: &Store, project: Option<i64>) -> StoreResult<Vec<L
             synced_at: None,
             created_at: None,
             updated_at: None,
+            builtin_updated: false,
+            builtin_body: None,
         });
     }
     items.sort_by(|a, b| {
@@ -792,6 +794,7 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
             disk_mtime,
             mesa_updated_at,
             diff,
+            builtin_updated: item.builtin_updated,
         });
     }
 
@@ -836,6 +839,7 @@ pub fn sync_status(store: &Store, project: Option<i64>) -> StoreResult<Vec<Libra
                 disk_mtime,
                 mesa_updated_at: None,
                 diff: None,
+                builtin_updated: false,
             });
         }
     }
@@ -1452,15 +1456,25 @@ fn import_one(
     };
 
     match existing {
-        None => match store.create_library_item(
-            item.kind,
-            item.scope,
-            project_id,
-            &item.name,
-            &item.body,
-            item.builtin_id.as_deref(),
-            item.export_command,
-        ) {
+        None => match store
+            .create_library_item(
+                item.kind,
+                item.scope,
+                project_id,
+                &item.name,
+                &item.body,
+                item.builtin_id.as_deref(),
+                item.export_command,
+            )
+            // A bundle carries no base (mesa task 1349): the fork was written
+            // against whatever built-in its source machine shipped, which need
+            // not be this one's. Stamping this machine's body would hide exactly
+            // that difference, so an imported fork's base is forgotten and it
+            // reads like a legacy fork — flagged once if its body differs.
+            .and_then(|created| match (created.id, &item.builtin_id) {
+                (Some(id), Some(_)) => store.forget_library_builtin_base(id),
+                _ => Ok(created),
+            }) {
             Ok(created) => LibraryImportResult {
                 name: item.name.clone(),
                 kind: item.kind,
@@ -4902,6 +4916,57 @@ mod tests {
         assert_eq!(results[0].status, "replaced");
         assert_eq!(results[0].item_id, Some(id));
         assert_eq!(store.get_library_item(id).unwrap().body, "new body");
+    }
+
+    /// A bundle carries no base (mesa task 1349), so an imported fork reads
+    /// like a legacy one: flagged when its body differs from this machine's
+    /// built-in, not when it equals it — and an import `replace` onto a fork
+    /// whose decision was already recorded leaves that decision alone.
+    #[test]
+    fn an_imported_fork_has_no_base_and_is_flagged_only_when_its_body_differs() {
+        let (mut store, _dir) = temp_store();
+        let summary = crate::core::live::SUMMARY_PROMPT;
+        let fork = |body: &str| LibraryBundleItem {
+            name: "live-summary-prompt".to_string(),
+            kind: LibraryKind::Prompt,
+            scope: LibraryScope::User,
+            project: None,
+            body: body.to_string(),
+            builtin_id: Some("live-summary-prompt".to_string()),
+            export_command: false,
+        };
+
+        let results = import(&mut store, &bundle_of(vec![fork(summary)]), "skip", &[]).unwrap();
+        assert_eq!(results[0].status, "created", "{results:?}");
+        let id = results[0].item_id.unwrap();
+        assert!(!store.get_library_item(id).unwrap().builtin_updated);
+        store.delete_library_item(id).unwrap();
+
+        let results = import(
+            &mut store,
+            &bundle_of(vec![fork("written against an older built-in")]),
+            "skip",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(results[0].status, "created", "{results:?}");
+        let id = results[0].item_id.unwrap();
+        assert!(store.get_library_item(id).unwrap().builtin_updated);
+
+        store
+            .resolve_library_builtin_update(id, crate::core::LibraryBuiltinAction::Keep, None)
+            .unwrap();
+        let results = import(
+            &mut store,
+            &bundle_of(vec![fork("replaced again")]),
+            "replace",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(results[0].status, "replaced", "{results:?}");
+        let replaced = store.get_library_item(id).unwrap();
+        assert_eq!(replaced.body, "replaced again");
+        assert!(!replaced.builtin_updated);
     }
 
     #[test]

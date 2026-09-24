@@ -42,15 +42,15 @@ use crate::core::{
     ArtifactSummary, CcDashboard, CcLiveSession, CcUsage, DiagramPatch, DiagramType, EdgeMarker,
     EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch, FrameShape,
     GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree, InboxItem,
-    InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP, LibraryBundle, LibraryImportResult, LibraryKind,
-    LibraryPatch, LibraryScope, LiveBoardKind, LiveContext, LiveNotebookEntry, LiveNotice,
-    LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, ModelRates, NaruVersion,
-    NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
-    ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, STALE_CLAIM_MINUTES, Script,
-    ScriptArg, ScriptPatch, ScriptRunEvent, Status, Store, SystemInfo, Task, TaskPatch,
-    TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard, hooks,
-    inbox_triage, library, listen, live, project_memory, receipt, retro, script_runs, scripts,
-    speech, supervisor, system, validate_live_client, version,
+    InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP, LibraryBuiltinAction, LibraryBundle,
+    LibraryImportResult, LibraryKind, LibraryPatch, LibraryScope, LiveBoardKind, LiveContext,
+    LiveNotebookEntry, LiveNotice, LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow,
+    ModelRates, NaruVersion, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
+    ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch,
+    STALE_CLAIM_MINUTES, Script, ScriptArg, ScriptPatch, ScriptRunEvent, Status, Store, SystemInfo,
+    Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard,
+    hooks, inbox_triage, library, listen, live, project_memory, receipt, retro, script_runs,
+    scripts, speech, supervisor, system, validate_live_client, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -2246,6 +2246,7 @@ fn router(state: AppState) -> Router {
                 .delete(delete_library),
         )
         .route("/api/library/{id}/versions", get(list_library_versions))
+        .route("/api/library/{id}/builtin", post(resolve_library_builtin))
         .route(
             "/api/library/{id}/hook",
             get(library_hook_status)
@@ -5400,6 +5401,15 @@ struct LibraryForkBody {
     export_command: bool,
 }
 
+/// `POST /api/library/{id}/builtin` (mesa task 1349): how a fork answers a
+/// built-in that changed under it. `body` only with `merge`.
+#[derive(Deserialize)]
+struct LibraryBuiltinBody {
+    action: String,
+    #[serde(default)]
+    body: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct LibrarySyncResolutionBody {
     path: String,
@@ -5707,6 +5717,33 @@ async fn adopt_library_hook(
         &body.path,
     )?)
     .into_response())
+}
+
+/// Records the user's answer to a built-in that changed under a fork (mesa
+/// task 1349): `keep` the fork, `take` the new built-in, or `merge` with a
+/// hand-merged `body`. Answers the updated item; an unknown id is 404, a row
+/// that is not a fork, an unknown action or a body on the wrong action 422.
+/// Same [`require_agent_access`] gate as `list_library`.
+async fn resolve_library_builtin(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: Result<Json<LibraryBuiltinBody>, JsonRejection>,
+) -> ApiResult<Response> {
+    require_agent_access(&state, &addr, &headers)?;
+    let Json(body) = body?;
+    let action = LibraryBuiltinAction::parse(&body.action).ok_or_else(|| {
+        Error::Validation(format!(
+            "action {:?} is not one of keep|take|merge",
+            body.action
+        ))
+    })?;
+    let mut store = state.store.lock().unwrap();
+    Ok(
+        Json(store.resolve_library_builtin_update(id, action, body.body.as_deref())?)
+            .into_response(),
+    )
 }
 
 /// Editing a built-in forks it: the id must name a real built-in (404
@@ -15238,6 +15275,20 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
         .await
         .unwrap();
         assert_eq!(forked.status(), StatusCode::CREATED);
+        let forked_id = json_body(forked).await["id"].as_i64().unwrap();
+        // The built-in-changed review (mesa task 1349) rides the same gate.
+        resolve_library_builtin(
+            State(state.clone()),
+            ConnectInfo(lan_peer()),
+            headers.clone(),
+            Path(forked_id),
+            Ok(Json(LibraryBuiltinBody {
+                action: "keep".to_string(),
+                body: None,
+            })),
+        )
+        .await
+        .unwrap();
         delete_library(
             State(state.clone()),
             ConnectInfo(lan_peer()),
@@ -15384,6 +15435,20 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
                 )
                 .await,
                 &format!("fork ({label})"),
+            );
+            refused(
+                resolve_library_builtin(
+                    State(state.clone()),
+                    ConnectInfo(lan_peer()),
+                    h.clone(),
+                    Path(forked_id),
+                    Ok(Json(LibraryBuiltinBody {
+                        action: "take".to_string(),
+                        body: None,
+                    })),
+                )
+                .await,
+                &format!("builtin review ({label})"),
             );
             refused(
                 library_sync_status(

@@ -15,12 +15,14 @@ import {
   listProjects,
   previewLibraryImport,
   registerLibraryHook,
+  resolveLibraryBuiltin,
   unregisterLibraryHook,
   updateLibraryItem,
 } from '../api'
 import { CodeEditor } from '../components/CodeEditor'
 import { ConfirmDelete } from '../components/ConfirmDelete'
 import { bundleFilename, parseBundle, summarizeImport } from '../libraryBundle'
+import { builtinReview } from '../libraryBuiltinUpdate'
 import { historyEntries } from '../libraryHistory'
 import {
   IMPORT_CHOICES,
@@ -160,8 +162,9 @@ function LibraryForm({
       </h2>
       {item?.builtin && (
         <p className="muted">
-          Editing a built-in forks it into your own copy — Naru never touches
-          this row again, even if a future built-in body changes.
+          Editing a built-in forks it into your own copy — Naru never changes
+          it for you. If a later Naru ships a different built-in body, the
+          fork is flagged for review, and you choose what to do.
         </p>
       )}
 
@@ -280,6 +283,124 @@ function LibraryForm({
       {invalid !== null && <span className="error">{invalid}</span>}
       {error !== null && <span className="error">{error}</span>}
     </form>
+  )
+}
+
+/**
+ * The review under a fork whose built-in changed (mesa task 1349): the fork
+ * diffed against the current built-in, and the three answers — keep the fork,
+ * take the built-in, or merge by hand. Every answer is one
+ * `POST /api/library/{id}/builtin` and clears the flag; the page refetches.
+ * Taking the built-in replaces the fork's body, so it asks first (the history
+ * still keeps the old body). Merge opens an editor seeded with the fork, the
+ * built-in read-only beside it.
+ */
+function LibraryBuiltinReview({
+  itemId,
+  kind,
+  fork,
+  builtin,
+  onResolved,
+}: {
+  itemId: number
+  kind: LibraryItem['kind']
+  fork: string
+  builtin: string
+  onResolved: () => void
+}) {
+  const [confirmingTake, setConfirmingTake] = useState(false)
+  const [merging, setMerging] = useState(false)
+  const [merged, setMerged] = useState(fork)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  function resolve(action: 'keep' | 'take' | 'merge', body?: string) {
+    setSaving(true)
+    setError(null)
+    resolveLibraryBuiltin(itemId, action, body).then(
+      () => {
+        setSaving(false)
+        onResolved()
+      },
+      (err: unknown) => {
+        setSaving(false)
+        setError(err instanceof Error ? err.message : String(err))
+      },
+    )
+  }
+
+  return (
+    <div className="library-override-diff library-builtin-review">
+      <p className="muted">
+        A newer Naru ships a different body for this built-in.{' '}
+        <span className="library-diff-removed">-</span> your fork{' · '}
+        <span className="library-diff-added">+</span> the new built-in
+      </p>
+      <pre className="library-sync-difflines">
+        {diffLines(fork, builtin).map((line, i) => (
+          <div key={i} className={diffLineClass(line)}>
+            <span className="library-diff-mark">{diffMark(line)}</span>
+            {line.text}
+          </div>
+        ))}
+      </pre>
+      <div className="inline-edit-actions">
+        <button type="button" disabled={saving} onClick={() => resolve('keep')}>
+          Keep my fork
+        </button>
+        {confirmingTake ? (
+          <span className="confirm-delete">
+            <span className="confirm-message">
+              Replace your fork's body with the built-in? History keeps the old one.
+            </span>
+            <button
+              type="button"
+              className="danger"
+              disabled={saving}
+              onClick={() => resolve('take')}
+            >
+              confirm
+            </button>
+            <button type="button" disabled={saving} onClick={() => setConfirmingTake(false)}>
+              cancel
+            </button>
+          </span>
+        ) : (
+          <button type="button" disabled={saving} onClick={() => setConfirmingTake(true)}>
+            Take the built-in
+          </button>
+        )}
+        <button type="button" disabled={saving} onClick={() => setMerging(!merging)}>
+          {merging ? 'Close merge' : 'Merge…'}
+        </button>
+      </div>
+      {merging && (
+        <>
+          <div className="library-builtin-merge">
+            <div className="library-body-editor">
+              <p className="muted">your merge (starts as your fork)</p>
+              <CodeEditor
+                value={merged}
+                language={bodyLanguage(kind)}
+                autoFocus={false}
+                wrap
+                onChange={setMerged}
+              />
+            </div>
+            <div>
+              <p className="muted">the new built-in (read-only)</p>
+              <pre className="library-sync-difflines library-builtin-readonly">{builtin}</pre>
+            </div>
+          </div>
+          <div className="inline-edit-actions">
+            <button type="button" disabled={saving} onClick={() => resolve('merge', merged)}>
+              {saving ? 'saving…' : 'Save merge'}
+            </button>
+          </div>
+        </>
+      )}
+      {error !== null && <p className="error">{error}</p>}
+    </div>
   )
 }
 
@@ -1122,6 +1243,8 @@ export function LibraryView() {
   const [showingVersions, setShowingVersions] = useState<string | null>(null)
   const [showingDiff, setShowingDiff] = useState<string | null>(null)
   const [showingHooks, setShowingHooks] = useState<string | null>(null)
+  // The "built-in updated" review under a flagged fork (mesa task 1349).
+  const [showingReview, setShowingReview] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
 
   // Hook registrations (mesa task 1115) — one read per stored hook row, in a
@@ -1253,9 +1376,13 @@ export function LibraryView() {
   // reaches anyway. `editing === 'new'` opens the create form above the list,
   // not a card, so it opens nothing here.
   const openKeys = new Set(
-    [editing === 'new' ? null : editing, showingVersions, showingDiff, showingHooks].filter(
-      (k): k is string => k !== null,
-    ),
+    [
+      editing === 'new' ? null : editing,
+      showingVersions,
+      showingDiff,
+      showingHooks,
+      showingReview,
+    ].filter((k): k is string => k !== null),
   )
 
   return (
@@ -1337,6 +1464,7 @@ export function LibraryView() {
                 const key = itemKey(item)
                 const overridden = folded.overriddenBody.get(key)
                 const hookStatus = item.id !== null ? hookStatusById.get(item.id) : undefined
+                const review = builtinReview(item)
                 return (
                   <li
                     key={key}
@@ -1366,6 +1494,11 @@ export function LibraryView() {
                           <span className="library-badge">slash command</span>
                         )}
                         {item.builtin && <span className="library-badge">built-in</span>}
+                        {review !== null && (
+                          <span className="library-badge library-badge-alert">
+                            built-in updated
+                          </span>
+                        )}
                         {overridden !== undefined && (
                           <span className="library-badge">overrides built-in</span>
                         )}
@@ -1408,6 +1541,16 @@ export function LibraryView() {
                             >
                               {showingVersions === key ? 'hide history' : 'history'}
                             </button>
+                            {review !== null && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setShowingReview(showingReview === key ? null : key)
+                                }
+                              >
+                                {showingReview === key ? 'hide review' : 'review update'}
+                              </button>
+                            )}
                             {overridden !== undefined && (
                               <button
                                 type="button"
@@ -1445,6 +1588,19 @@ export function LibraryView() {
                           ))}
                         </pre>
                       </div>
+                    )}
+                    {showingReview === key && review !== null && item.id !== null && (
+                      <LibraryBuiltinReview
+                        key={item.updated_at ?? ''}
+                        itemId={item.id}
+                        kind={item.kind}
+                        fork={review.fork}
+                        builtin={review.builtin}
+                        onResolved={() => {
+                          setShowingReview(null)
+                          refetch()
+                        }}
+                      />
                     )}
                     {editing === key && (
                       <LibraryForm

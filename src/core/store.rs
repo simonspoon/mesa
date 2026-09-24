@@ -1212,6 +1212,14 @@ const MIGRATIONS: &[&str] = &[
          agent_id   TEXT,
          started_at TEXT NOT NULL
      );",
+    // Task 1349: `builtin_base` is the built-in body a fork last agreed with —
+    // stamped when the fork is created and again when the user keeps, takes
+    // or merges a changed built-in. A fork whose built-in no longer matches
+    // it (and whose body differs from the new one) reads `builtin_updated`.
+    // NULL for every fork made before this migration: a migration cannot
+    // read a Rust constant, so a legacy fork's base is unknown and it is
+    // flagged once, until the user decides.
+    "ALTER TABLE library_items ADD COLUMN builtin_base TEXT;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -2073,7 +2081,7 @@ fn validate_artifact_body(body: &str) -> Result<String> {
 // ---- library (agents, skills, hooks, prompts, CLAUDE.md) ----
 
 const LIBRARY_COLUMNS: &str = "id, name, kind, scope, project_id, body, builtin_id, synced_body, synced_at, \
-     created_at, updated_at, export_command";
+     created_at, updated_at, export_command, builtin_base";
 
 /// `builtin` is always `false` here — a row read out of the db is by
 /// definition a fork, never an unshadowed built-in (`core::library::BUILTINS`
@@ -2095,14 +2103,27 @@ fn row_to_library_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem>
     let export_command: bool = row.get(11)?;
     let path = crate::core::library::relative_path(kind, scope, &name, export_command)
         .map(|p| p.to_string_lossy().into_owned());
+    let body: String = row.get(5)?;
+    let builtin_id: Option<String> = row.get(6)?;
+    // A fork is flagged when its built-in moved on (mesa task 1349): the body
+    // differs from the current built-in, and the stored base — what the fork
+    // last agreed with — is unknown (a pre-1349 fork) or is not that body.
+    let builtin_base: Option<String> = row.get(12)?;
+    let builtin_body = builtin_id
+        .as_deref()
+        .and_then(crate::core::library::builtin)
+        .map(|b| b.body.to_string());
+    let builtin_updated = builtin_body
+        .as_deref()
+        .is_some_and(|current| body != current && builtin_base.as_deref() != Some(current));
     Ok(LibraryItem {
         id: row.get(0)?,
         name,
         kind,
         scope,
         project_id: row.get(4)?,
-        body: row.get(5)?,
-        builtin_id: row.get(6)?,
+        body,
+        builtin_id,
         builtin: false,
         export_command,
         path,
@@ -2110,6 +2131,8 @@ fn row_to_library_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem>
         synced_at: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+        builtin_updated,
+        builtin_body,
     })
 }
 
@@ -2596,6 +2619,30 @@ pub struct LibraryPatch {
     /// `core::library::update_item` is the caller that removes the file a
     /// prompt stops owning, since `Store` never opens the filesystem.
     pub export_command: Option<bool>,
+}
+
+/// How a fork answers a built-in that changed under it (mesa task 1349,
+/// `Store::resolve_library_builtin_update`). Every action stamps the fork's
+/// base to the current built-in body, which is what clears the flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryBuiltinAction {
+    /// The fork's body stays exactly as it is.
+    Keep,
+    /// The fork's body becomes the current built-in body.
+    Take,
+    /// The fork's body becomes a hand-merged text the caller supplies.
+    Merge,
+}
+
+impl LibraryBuiltinAction {
+    pub fn parse(s: &str) -> Option<LibraryBuiltinAction> {
+        match s {
+            "keep" => Some(LibraryBuiltinAction::Keep),
+            "take" => Some(LibraryBuiltinAction::Take),
+            "merge" => Some(LibraryBuiltinAction::Merge),
+            _ => None,
+        }
+    }
 }
 
 /// A new frame to add to a diagram. Coordinates and size are caller-supplied
@@ -7685,11 +7732,17 @@ impl Store {
         if let Some(builtin_id) = builtin_id {
             self.ensure_library_builtin(builtin_id)?;
         }
+        // A fork remembers the built-in body it forked from (mesa task
+        // 1349), so a later Naru that ships a different one can say so.
+        // Every fork path — CLI update, the fork route, a sync pull, an
+        // import — arrives here.
+        let builtin_base =
+            builtin_id.and_then(|id| crate::core::library::builtin(id).map(|b| b.body));
         self.conn.execute(
             "INSERT INTO library_items \
-             (name, kind, scope, project_id, body, builtin_id, export_command, created_at, \
-             updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), datetime('now'))",
+             (name, kind, scope, project_id, body, builtin_id, export_command, builtin_base, \
+             created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))",
             (
                 &name,
                 kind.as_str(),
@@ -7698,6 +7751,7 @@ impl Store {
                 &body,
                 builtin_id,
                 export_command,
+                builtin_base,
             ),
         )?;
         let id = self.conn.last_insert_rowid();
@@ -7760,6 +7814,89 @@ impl Store {
         if next_body != current.body {
             self.append_library_version(id, &next_body, "edit")?;
         }
+        self.get_library_item(id)
+    }
+
+    /// Answers a built-in that changed under a fork (mesa task 1349,
+    /// `docs/library.md` "When a built-in changes under a fork"): `keep`
+    /// leaves the body alone, `take` replaces it with the current built-in
+    /// body, `merge` replaces it with `body`. All three stamp `builtin_base`
+    /// to the current built-in body, in one transaction with the body write,
+    /// so the flag clears exactly when the decision is stored. A body change
+    /// appends an `edit` version and moves `updated_at`, as any edit does;
+    /// `keep` writes neither. The action may be taken whether or not the fork
+    /// is currently flagged.
+    ///
+    /// `validation` for a row that is not a fork, a fork whose built-in no
+    /// longer exists, `merge` without a body and `keep`/`take` with one.
+    pub fn resolve_library_builtin_update(
+        &mut self,
+        id: i64,
+        action: LibraryBuiltinAction,
+        body: Option<&str>,
+    ) -> Result<LibraryItem> {
+        let current = self.get_library_item(id)?;
+        let Some(builtin_id) = current.builtin_id.as_deref() else {
+            return Err(Error::Validation(format!(
+                "library item {id} is not a fork of a built-in"
+            )));
+        };
+        let Some(builtin) = crate::core::library::builtin(builtin_id) else {
+            return Err(Error::Validation(format!(
+                "library item {id} forks {builtin_id:?}, which is no longer a built-in"
+            )));
+        };
+        let next_body = match (action, body) {
+            (LibraryBuiltinAction::Keep, None) => None,
+            (LibraryBuiltinAction::Take, None) => Some(builtin.body.to_string()),
+            (LibraryBuiltinAction::Merge, Some(body)) => Some(validate_library_body(body)?),
+            (LibraryBuiltinAction::Merge, None) => {
+                return Err(Error::Validation("merge requires a body".into()));
+            }
+            (LibraryBuiltinAction::Keep | LibraryBuiltinAction::Take, Some(_)) => {
+                return Err(Error::Validation(
+                    "only merge takes a body; keep and take do not".into(),
+                ));
+            }
+        };
+        let tx = self.conn.transaction()?;
+        match &next_body {
+            None => {
+                tx.execute(
+                    "UPDATE library_items SET builtin_base = ?1 WHERE id = ?2",
+                    (builtin.body, id),
+                )?;
+            }
+            Some(next_body) => {
+                tx.execute(
+                    "UPDATE library_items SET body = ?1, builtin_base = ?2, \
+                     updated_at = datetime('now') WHERE id = ?3",
+                    (next_body, builtin.body, id),
+                )?;
+                if *next_body != current.body {
+                    tx.execute(
+                        "INSERT INTO library_versions (item_id, body, source, created_at) \
+                         VALUES (?1, ?2, 'edit', datetime('now'))",
+                        (id, next_body),
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        self.get_library_item(id)
+    }
+
+    /// Forgets a fork's `builtin_base` (mesa task 1349), leaving the row as
+    /// a pre-1349 fork is: base unknown, so it reads `builtin_updated`
+    /// whenever its body differs from the current built-in. Import's call,
+    /// since a bundle carries no base. Moves nothing else, `updated_at`
+    /// included.
+    pub fn forget_library_builtin_base(&mut self, id: i64) -> Result<LibraryItem> {
+        self.get_library_item(id)?;
+        self.conn.execute(
+            "UPDATE library_items SET builtin_base = NULL WHERE id = ?1",
+            [id],
+        )?;
         self.get_library_item(id)
     }
 
@@ -14045,15 +14182,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            75,
-            "a fresh db should report user_version 75"
+            76,
+            "a fresh db should report user_version 76"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 75);
+        assert_eq!(version, 76);
     }
 
     /// Pins the project-notebook columns (mesa task 1333) at index 72
@@ -14094,6 +14231,19 @@ mod tests {
         assert!(
             MIGRATIONS[PROJECT_DREAMS].contains("CREATE TABLE project_dreams"),
             "migration {PROJECT_DREAMS} is no longer the project dreams migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+    }
+
+    /// Pins the fork's `builtin_base` column (mesa task 1349) at index 75
+    /// (`user_version` 76), for the reason
+    /// [`the_live_summaries_table_arrives_at_migration_49`] gives.
+    #[test]
+    fn the_library_builtin_base_column_arrives_at_migration_75() {
+        const BUILTIN_BASE: usize = 75;
+        assert!(
+            MIGRATIONS[BUILTIN_BASE].contains("ALTER TABLE library_items ADD COLUMN builtin_base"),
+            "migration {BUILTIN_BASE} is no longer the library builtin_base migration — a \
              shipped migration was edited or reordered, which is never allowed"
         );
     }
@@ -17630,6 +17780,241 @@ mod tests {
                 .id,
             forked.id
         );
+    }
+
+    // ---- a built-in changing under a fork (mesa task 1349) ----
+
+    /// Forks `live-summary-prompt` with `body` and returns the row.
+    fn fork_library_summary(store: &mut Store, body: &str) -> LibraryItem {
+        store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "live-summary-prompt",
+                body,
+                Some("live-summary-prompt"),
+                false,
+            )
+            .unwrap()
+    }
+
+    fn library_builtin_base(store: &Store, id: i64) -> Option<String> {
+        store
+            .conn
+            .query_row(
+                "SELECT builtin_base FROM library_items WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn set_library_builtin_base(store: &Store, id: i64, base: Option<&str>) {
+        store
+            .conn
+            .execute(
+                "UPDATE library_items SET builtin_base = ?1 WHERE id = ?2",
+                (base, id),
+            )
+            .unwrap();
+    }
+
+    const SUMMARY: &str = crate::core::live::SUMMARY_PROMPT;
+
+    #[test]
+    fn library_fork_stamps_the_builtin_base_and_is_not_flagged() {
+        let (mut store, _dir) = temp_store();
+        let fork = fork_library_summary(&mut store, "my own summary prompt");
+        let id = fork.id.unwrap();
+        assert_eq!(library_builtin_base(&store, id).as_deref(), Some(SUMMARY));
+        assert!(!fork.builtin_updated);
+        assert_eq!(fork.builtin_body.as_deref(), Some(SUMMARY));
+
+        // A plain row is not a fork: no base, no built-in body, no flag.
+        let plain = store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "plain",
+                "x",
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(library_builtin_base(&store, plain.id.unwrap()), None);
+        assert!(!plain.builtin_updated);
+        assert_eq!(plain.builtin_body, None);
+    }
+
+    #[test]
+    fn library_edit_keeps_the_builtin_base() {
+        let (mut store, _dir) = temp_store();
+        let id = fork_library_summary(&mut store, "v1").id.unwrap();
+        let edited = store
+            .update_library_item(
+                id,
+                LibraryPatch {
+                    body: Some("v2".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(library_builtin_base(&store, id).as_deref(), Some(SUMMARY));
+        assert!(!edited.builtin_updated);
+    }
+
+    #[test]
+    fn library_fork_with_a_legacy_null_base_is_flagged_when_its_body_differs() {
+        let (mut store, _dir) = temp_store();
+        let id = fork_library_summary(&mut store, "legacy body").id.unwrap();
+        set_library_builtin_base(&store, id, None);
+        let item = store.get_library_item(id).unwrap();
+        assert!(item.builtin_updated);
+        // …on every read path, not only `get`.
+        assert!(
+            store
+                .find_library_fork("live-summary-prompt")
+                .unwrap()
+                .unwrap()
+                .builtin_updated
+        );
+        assert!(
+            store
+                .list_library_items(None)
+                .unwrap()
+                .iter()
+                .any(|i| i.id == Some(id) && i.builtin_updated)
+        );
+
+        // A legacy fork whose body IS the current built-in has nothing to review.
+        store
+            .update_library_item(
+                id,
+                LibraryPatch {
+                    body: Some(SUMMARY.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!store.get_library_item(id).unwrap().builtin_updated);
+    }
+
+    #[test]
+    fn library_fork_is_flagged_only_when_its_base_is_not_the_builtin() {
+        let (mut store, _dir) = temp_store();
+        let id = fork_library_summary(&mut store, "mine").id.unwrap();
+        // A Naru upgrade: the base is an older built-in body.
+        set_library_builtin_base(&store, id, Some("an older built-in body"));
+        assert!(store.get_library_item(id).unwrap().builtin_updated);
+        set_library_builtin_base(&store, id, Some(SUMMARY));
+        assert!(!store.get_library_item(id).unwrap().builtin_updated);
+    }
+
+    #[test]
+    fn library_builtin_keep_clears_the_flag_without_touching_the_body() {
+        let (mut store, _dir) = temp_store();
+        let fork = fork_library_summary(&mut store, "mine");
+        let id = fork.id.unwrap();
+        set_library_builtin_base(&store, id, Some("old"));
+        let kept = store
+            .resolve_library_builtin_update(id, LibraryBuiltinAction::Keep, None)
+            .unwrap();
+        assert!(!kept.builtin_updated);
+        assert_eq!(kept.body, "mine");
+        assert_eq!(library_builtin_base(&store, id).as_deref(), Some(SUMMARY));
+        assert_eq!(store.list_library_versions(id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn library_builtin_take_replaces_the_body_and_clears_the_flag() {
+        let (mut store, _dir) = temp_store();
+        let id = fork_library_summary(&mut store, "mine").id.unwrap();
+        set_library_builtin_base(&store, id, None);
+        let taken = store
+            .resolve_library_builtin_update(id, LibraryBuiltinAction::Take, None)
+            .unwrap();
+        assert!(!taken.builtin_updated);
+        assert_eq!(taken.body, SUMMARY);
+        assert_eq!(library_builtin_base(&store, id).as_deref(), Some(SUMMARY));
+        // History keeps the fork's old body; the new one is an ordinary edit.
+        let versions = store.list_library_versions(id).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].body, SUMMARY);
+        assert_eq!(versions[0].source, "edit");
+        assert_eq!(versions[1].body, "mine");
+    }
+
+    #[test]
+    fn library_builtin_merge_writes_the_given_body_and_clears_the_flag() {
+        let (mut store, _dir) = temp_store();
+        let id = fork_library_summary(&mut store, "mine").id.unwrap();
+        set_library_builtin_base(&store, id, Some("old"));
+        let merged = store
+            .resolve_library_builtin_update(id, LibraryBuiltinAction::Merge, Some("mine + theirs"))
+            .unwrap();
+        assert!(!merged.builtin_updated);
+        assert_eq!(merged.body, "mine + theirs");
+        assert_eq!(library_builtin_base(&store, id).as_deref(), Some(SUMMARY));
+        assert_eq!(store.list_library_versions(id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn library_builtin_resolution_errors() {
+        let (mut store, _dir) = temp_store();
+        let fork = fork_library_summary(&mut store, "mine").id.unwrap();
+        let plain = store
+            .create_library_item(
+                LibraryKind::Prompt,
+                LibraryScope::User,
+                None,
+                "plain",
+                "x",
+                None,
+                false,
+            )
+            .unwrap()
+            .id
+            .unwrap();
+        use LibraryBuiltinAction::*;
+        assert!(matches!(
+            store.resolve_library_builtin_update(9999, Keep, None),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store.resolve_library_builtin_update(plain, Keep, None),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.resolve_library_builtin_update(fork, Merge, None),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.resolve_library_builtin_update(fork, Keep, Some("x")),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.resolve_library_builtin_update(fork, Take, Some("x")),
+            Err(Error::Validation(_))
+        ));
+        // A fork whose built-in is gone from this build.
+        store
+            .conn
+            .execute(
+                "UPDATE library_items SET builtin_id = 'gone-builtin' WHERE id = ?1",
+                [fork],
+            )
+            .unwrap();
+        let orphan = store.get_library_item(fork).unwrap();
+        assert!(!orphan.builtin_updated);
+        assert_eq!(orphan.builtin_body, None);
+        assert!(matches!(
+            store.resolve_library_builtin_update(fork, Keep, None),
+            Err(Error::Validation(_))
+        ));
+        // Nothing above wrote: the fork's body is still its own.
+        assert_eq!(store.get_library_item(fork).unwrap().body, "mine");
     }
 
     // ---- cc telemetry ----

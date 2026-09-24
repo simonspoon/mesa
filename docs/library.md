@@ -29,6 +29,7 @@ Table `library_items` (migration index 47, resulting `user_version` 48):
 | `synced_body` | TEXT NULL | the last body Naru and the disk agreed on — the sync baseline |
 | `synced_at` | TEXT NULL | when that agreement was recorded |
 | `export_command` | INTEGER NOT NULL DEFAULT 0 | a prompt's "also a slash command" flag (migration index 54, mesa task 1139); `validation` when set on any other kind |
+| `builtin_base` | TEXT NULL | a fork's last-agreed built-in body (migration index 75, mesa task 1349) — store-only, never on the wire; see [When a built-in changes under a fork](#when-a-built-in-changes-under-a-fork) |
 | `created_at` / `updated_at` | TEXT NOT NULL | |
 
 `(kind, scope, project_id, name)` is unique at the schema level too — two
@@ -97,9 +98,11 @@ That split is the whole point:
 - **Editing a built-in forks it.** The API's `POST /api/library/builtins/{id}/fork`
   and the CLI's edit path both go through `Store::create_library_item` with
   `builtin_id: Some(id)` — a real db row appears, carrying the new body, and
-  from then on Naru **never updates it**. A Naru upgrade that improves a
-  built-in's shipped text changes only the *unshadowed* ones; a user's fork is
-  theirs to keep, forever, until they choose to sync it back.
+  from then on Naru **never updates it on its own**. A Naru upgrade that
+  improves a built-in's shipped text changes only the *unshadowed* ones; a
+  user's fork is theirs to keep — but it is **flagged** for review rather than
+  left silently behind (mesa task 1349, [When a built-in changes under a
+  fork](#when-a-built-in-changes-under-a-fork)).
 - **Deleting the fork restores the built-in.** `Store::delete_library_item`
   on the forked row just removes that row; `effective_items` immediately
   reports the built-in again, unshadowed, `id: null`. Deleting an *unshadowed*
@@ -110,17 +113,19 @@ That split is the whole point:
   `Store::create_library_item`/the fork route both check
   `Store::find_library_fork` first and answer `conflict` on a second attempt.
 
-The starter set is deliberately tiny — seven rows:
+The starter set is deliberately tiny — nine rows:
 
 | `id` | kind | scope | what it is |
 | --- | --- | --- | --- |
 | `naru-live` | `agent` | `user` | The agent definition the live conversation runs as — literally `core::live::AGENT_DEFINITION`, YAML frontmatter plus `core::live::AGENT_PROMPT`, moved here rather than duplicated (mesa task 1068) |
 | `supervisor` | `agent` | `user` | The agent definition an auto-dispatched `/execute-todo` run is supervised as — literally `core::supervisor::SUPERVISOR_DEFINITION` (mesa task 1075), seeded to `~/.claude/agents/supervisor.md` by `core::supervisor::ensure_agent_definition` before the `todo-watcher` spawn |
+| `naru-retro` | `agent` | `user` | The agent definition the session retrospective runs as — literally `core::retro::RETRO_DEFINITION` (mesa task 1158, `docs/retro.md`), seeded to `~/.claude/agents/naru-retro.md` by `core::retro::ensure_agent_definition` before the `retro` spawn |
 | `inbox-triage` | `agent` | `user` | The agent definition a `serve --watch-inbox` dispatch triages one inbox item as — literally `core::inbox_triage::INBOX_TRIAGE_DEFINITION` (mesa task 1168, `docs/inbox-watcher.md`): `opus` at medium effort, no `Edit`/`Write`, seeded to `~/.claude/agents/inbox-triage.md` by `core::inbox_triage::ensure_agent_definition` before the `inbox-watcher` spawn |
 | `live-summary-prompt` | `prompt` | `user` | The instructions for the short-lived agent that writes a live conversation's memory once it ends (mesa task 921) — literally `core::live::SUMMARY_PROMPT`, placed immediately after the prompt it belongs beside |
 | `starter-claude-md` | `claude-md` | `user` | A short starting-point CLAUDE.md |
 | `stop-notify` | `hook` | `user` | A minimal shell hook that echoes when Claude Code stops — its *name* is `stop-notify.sh`, since a hook's name carries its own extension |
 | `task-stop-guard` | `hook` | `user` | A `Stop` hook that keeps a task agent from ending its turn before its Naru task is handled — literally `core::stop_guard::STOP_GUARD_HOOK` (mesa task 1190, "The task-stop-guard hook" below); name `task-stop-guard.sh` |
+| `project-memory` | `hook` | `user` | A `SessionStart` hook that prints the session folder's project notebook into its context — literally `core::project_memory::PROJECT_MEMORY_HOOK` (mesa task 1333, `docs/project-memory.md`); name `project-memory.sh` |
 
 `naru-live`'s body being the literal `AGENT_DEFINITION` constant (and
 `live-summary-prompt`'s the literal `SUMMARY_PROMPT`) is what lets
@@ -191,6 +196,69 @@ reports no counts rather than counts of the part that fits
 `PATCH /api/library/{id}` the editor makes, with no route of its own — so the
 store appends a version for the restored body exactly as it does for any other
 edit, and restoring the newest version changes nothing and writes nothing.
+
+## When a built-in changes under a fork
+
+A fork keeps its own body, but a later Naru may ship a different body for the
+built-in it forked (mesa task 1349) — the `naru-live` loop text gains a rule,
+say. Naru never overwrites the fork, and it does not stay silent either: the
+fork is **flagged**, and the user decides.
+
+- **The stored base.** `library_items.builtin_base` (migration index 75) is
+  the built-in body the fork last agreed with. `Store::create_library_item`
+  stamps it whenever it is given a `builtin_id` — so the CLI's `update` of
+  an unshadowed built-in, `POST /api/library/builtins/{id}/fork` and a sync
+  that pulls a built-in's file in all stamp it the same way. An ordinary
+  edit, a sync pull into an existing row and an import `replace` leave it
+  alone. It is store-only: no wire type carries it, a bundle included.
+- **Legacy and imported forks.** A fork made before the migration has a
+  `NULL` base — a migration cannot read the Rust constant a built-in's body
+  lives in — so its base is unknown, and it is flagged once, until the user
+  decides. An **imported** fork is the same case: a bundle carries no base,
+  and the fork was written against whatever built-in its source machine
+  shipped, so `import` clears the stamp `create_library_item` just wrote
+  (`Store::forget_library_builtin_base`) rather than claim the fork agreed
+  with this machine's built-in. It is flagged iff its body differs from it.
+- **Derived fields.** Every read of a stored row derives two fields on
+  `LibraryItem`: `builtin_body`, the current built-in body behind a fork (null
+  for anything that is not a fork of a built-in this build still ships), and
+  `builtin_updated`, true iff the body differs from `builtin_body` **and**
+  the base is `NULL` or differs from it too. So a fork whose body happens to
+  equal the new built-in is never flagged, and neither is a fork whose base
+  is the current built-in. An unshadowed built-in is always `false`/`null`.
+  `library sync status` carries the same flag on each `LibrarySyncRow` as
+  `builtin_updated` — a separate fact from `status`, which compares Naru with
+  the disk and reads `in-sync` whatever the built-in did. Under `--quiet`,
+  `builtin_body` is dropped (a third copy of a body) and `builtin_updated`
+  kept.
+- **Three answers**, one `Store::resolve_library_builtin_update`, each
+  stamping the base to the current built-in body in the same transaction as
+  any body write, so the flag clears exactly when the decision is stored:
+  - `keep` — the body is untouched; no version, `updated_at` unmoved.
+  - `take` — the body becomes the current built-in body, appending an `edit`
+    version like any edit (the history keeps the fork's old body).
+  - `merge` — the body becomes a hand-merged text the caller supplies,
+    appending a version the same way.
+
+  A row with no `builtin_id`, or whose built-in this build no longer ships, is
+  `validation`; so is `merge` without a body, and `keep`/`take` with one. An
+  unknown id is `not_found`. None of them refuses an unflagged fork — the
+  decision is simply re-recorded against the current built-in.
+- **Surfaces.** `naru library builtin keep|take <ITEM>` and `naru library
+  builtin merge <ITEM> (--body <TEXT> | --body-file <PATH>)`, each printing
+  the updated item (`--quiet` accepted); `POST /api/library/{id}/builtin`
+  with `{"action": "keep"|"take"|"merge", "body"?: string}`, answering the
+  updated `LibraryItem`. On `#/library` a flagged fork wears a **built-in
+  updated** badge and offers **review update**: the fork diffed against the
+  new built-in (`- your fork · + the new built-in`), then **Keep my fork**,
+  **Take the built-in** (confirmed first — it replaces the fork's body) and
+  **Merge…**, an editor seeded with the fork beside the new built-in
+  read-only. Which rows offer it is `frontend/src/libraryBuiltinUpdate.ts`.
+
+The body write deliberately does not go through `library::update_item`: that
+wrapper's only side effect is removing an exported command file when a
+prompt's `export_command` goes off, and these three actions never touch the
+flag.
 
 ## Where a row lives on disk
 
@@ -876,6 +944,7 @@ somewhere else.
 | `POST /api/library/{id}/hook` (`{"event", "matcher"?}`) | 200, the status after the write | `require_agent_access` |
 | `DELETE /api/library/{id}/hook` (`?event=&matcher=`) | 200, the status after the write | `require_agent_access` |
 | `POST /api/library/builtins/{builtin_id}/fork` | 201 | `require_agent_access` |
+| `POST /api/library/{id}/builtin` (`{"action", "body"?}`) | 200, the updated `LibraryItem` | `require_agent_access` |
 | `GET /api/library/sync` (`?project=<id>`) | 200, bare array | `require_agent_access` |
 | `POST /api/library/sync` | 200, results array | `require_agent_access` |
 | `GET /api/library/export` (`?project=<id>`) | 200, the `LibraryBundle` | `require_agent_access` |
@@ -884,9 +953,10 @@ somewhere else.
 | `GET /api/library/hooks/orphans` (`?scope=&project=`) | 200, bare array of `LibraryOrphanHook` | `require_agent_access` |
 | `POST /api/library/hooks/adopt` (`{"scope", "project_id", "path"}`) | 200, the new row's `LibraryHookStatus` | `require_agent_access` |
 
-**All seventeen routes are `require_agent_access`** (mesa task 1004; the
+**All eighteen routes are `require_agent_access`** (mesa task 1004; the
 hook-registration trio joined them in mesa task 1115, the orphan pair in
-mesa task 1128, the import preview in mesa task 1292) — the same
+mesa task 1128, the import preview in mesa task 1292, the built-in review in
+mesa task 1349) — the same
 gate the agents, terminal and scripts-run routes carry. This is not a
 read/write split: unlike scripts (`docs/scripts.md`'s "the read/write
 asymmetry is the point", where a LAN peer may *trigger* a stored script but
@@ -946,7 +1016,7 @@ loopback-connected `curl` makes the relaxed and strict gates identical. So
 `scripts/library-check.sh` proves only the *portable* half — a DNS-name
 `Host` (rebinding) and a foreign `Origin` (cross-site) refused under `--lan`,
 a foreign `Host` and a foreign `Origin` refused in default mode, on all
-seventeen routes. The genuinely remote-peer case — does a LAN device now get
+eighteen routes. The genuinely remote-peer case — does a LAN device now get
 *in*, and does a rebound one still get turned away — can only be proved with
 a forged non-loopback `SocketAddr`, which a shell script driving a real
 `curl` cannot produce. That is a Rust unit test,
@@ -964,7 +1034,7 @@ nothing.
 
 ## The CLI
 
-`mesa library {create,list,show,update,delete,versions,hook,sync}` (`show` also
+`mesa library {create,list,show,update,delete,versions,builtin,hook,sync}` (`show` also
 answers to `get`). An `ITEM` argument, everywhere one appears, is a numeric id
 or a name — a built-in resolves by name too, since its name and its
 `builtin_id` are the same string in the starter set
@@ -987,6 +1057,11 @@ or a name — a built-in resolves by name too, since its name and its
   recoverable transcript that stands in for the prompt Naru doesn't have.
   Deleting the fork of a built-in restores it unshadowed; deleting an
   unshadowed built-in (there is no row) is `validation`.
+- `builtin keep|take ITEM` and `builtin merge ITEM (--body TEXT | --body-file
+  PATH)` answer a built-in that changed under a fork (see [When a built-in
+  changes under a fork](#when-a-built-in-changes-under-a-fork)) and print the
+  updated item. `ITEM` must be a stored fork: an unshadowed built-in or a
+  plain row is `validation`; `merge` with no body is `usage`, exit 2.
 - `list [PROJECT] [--kind KIND]` and `versions ITEM` print bare JSON arrays —
   `list` by kind then name, `versions` newest first (empty for an unshadowed
   built-in, which has no history).
@@ -1032,9 +1107,10 @@ or a name — a built-in resolves by name too, since its name and its
   than to type, so the CLI reports and the web page decides.
 
 `--quiet` follows the house rule (`CLAUDE.md`): accepted on `create`,
-`update`, `delete` and `show`/`get`, dropping `body` and `synced_body`
-(`QUIET_DROP_LIBRARY`) while keeping `name`, `kind`, `scope`, the bounded
-`export_command` flag and the derived `path`; **not defined at all** on `list`, `versions`, any `hook` or `sync`
+`update`, `delete`, `show`/`get` and the three `builtin` subcommands,
+dropping `body`, `synced_body` and `builtin_body` (`QUIET_DROP_LIBRARY`)
+while keeping `name`, `kind`, `scope`, the bounded `export_command` and
+`builtin_updated` flags and the derived `path`; **not defined at all** on `list`, `versions`, any `hook` or `sync`
 subcommand, or `export`/`import`, so passing it there is clap's
 unknown-argument error, exit 2 — those commands answer with a bundle, a
 results array or a status, not a record, so there is nothing for `--quiet` to
@@ -1108,7 +1184,7 @@ place, so there is nothing here for an old `config.json` to leave behind.
 
 ## Gate
 
-`scripts/library-check.sh` (123 checks) covers, over both the CLI and the
+`scripts/library-check.sh` (146 checks) covers, over both the CLI and the
 API:
 
 - **CRUD**: create (positional and flag forms, `--body-file`, the name-rule
@@ -1118,7 +1194,7 @@ API:
   resolution, an unknown id/name as 404/`not_found`), update (one field at a
   time, an explicit `null` name/body refused as an erasure) and delete
   (echoes the destroyed record, a later read is `not_found`).
-- **`--quiet`**: exactly `body`+`synced_body` dropped on `create`/`show`/
+- **`--quiet`**: exactly `body`+`synced_body`+`builtin_body` dropped on `create`/`show`/
   `update`/`delete`, and rejected as an unknown argument (usage, exit 2) on
   `list`, `versions`, `sync status` and `sync apply`.
 - **The built-in fork/restore rule**: editing an unshadowed built-in
@@ -1140,11 +1216,11 @@ API:
   row's `mesa` re-creates the file and its `disk` deletes the row; a
   `both-changed` row shows both bodies, and `skip` leaves both sides and the
   status untouched on the next scan).
-- **The API DTOs and status codes** for all seventeen routes, a malformed JSON
+- **The API DTOs and status codes** for all eighteen routes, a malformed JSON
   body as 422 (never a 500), and every mutating route (create, update,
   delete, fork, sync apply, import, import preview) refusing a request with no
   JSON `Content-Type` as 415.
-- **The `require_agent_access` gate, on all seventeen routes, reads included**,
+- **The `require_agent_access` gate, on all eighteen routes, reads included**,
   in both `default` and `--lan` serve modes: in default mode a foreign `Host`
   and a foreign `Origin` are each refused (a request with no `Origin` at all —
   curl, or a same-origin browser GET — is fine); under `--lan`, a DNS-name
@@ -1202,8 +1278,8 @@ API:
   **byte-identical** (`cmp` against a `sed` of the original), `hook status`
   on the new item seeing both registrations and `sync status` reading
   `in-sync`, `orphans` no longer listing it; `--quiet` rejected on both;
-  and the two routes serving over the API and joining the gate sweeps (now
-  seventeen routes) in both serve modes.
+  and the two routes serving over the API and joining the gate sweeps in
+  both serve modes.
 - **The command kind folded into prompt** (mesa task 1139): a db wound back
   to the pre-1139 schema with `sqlite3` and holding a `command` row with two
   versions opens as a prompt with `export_command` on — same id, path, body,
@@ -1217,6 +1293,19 @@ API:
   scan to report `disk-new`; `--quiet` keeps the flag; `PATCH` carries it;
   and a bundle still saying `"kind": "command"` imports as an exporting
   prompt while a fresh export carries the flag.
+- **A built-in changing under a fork** (mesa task 1349): a fresh fork of
+  `inbox-triage` is stamped and not flagged; a fork exported and imported
+  into a fresh db arrives with no base and flagged; a legacy `NULL` base, and an
+  upgrade simulated by setting `builtin_base` to an older body in `sqlite3`,
+  flag it in `list`, `show` (`--quiet` keeping the flag and dropping
+  `builtin_body`) and `sync status`; `library builtin keep` clears it leaving
+  body and history, `take` writes the built-in and one version, `merge
+  --body-file` writes the given text; `merge` with no body is usage, an
+  unshadowed built-in or a plain row `validation`, an unknown item
+  `not_found`; and `POST /api/library/{id}/builtin` does the same with 404
+  for an unknown id, 422 for a missing merge body, a body on `keep`, an
+  unknown action, a plain row and malformed JSON, writing nothing, and 415
+  without a JSON `Content-Type`.
 
 The same pairing `api-check.sh` holds for tasks and `config-check.sh` holds
 for the config-write routes. The "a configured prompt replaces the built-in

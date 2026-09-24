@@ -33,4 +33,11 @@ mesa_updated_at: string | null,
  * Deliberately two-way: `baseline` is carried separately, and mesa-vs-disk
  * is what a resolution actually picks between.
  */
-diff: Array<LibraryDiffLine> | null, };
+diff: Array<LibraryDiffLine> | null, 
+/**
+ * The row's item is a fork whose built-in changed under it
+ * ([`LibraryItem::builtin_updated`], mesa task 1349) — a separate fact
+ * from `status`, which compares Naru with the disk and so can read
+ * `in-sync` while the built-in has moved on.
+ */
+builtin_updated: boolean, };

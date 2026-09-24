@@ -1750,6 +1750,24 @@ export function forkLibraryItem(
   )
 }
 
+/** How a fork answers a built-in that changed under it (mesa task 1349). */
+export type LibraryBuiltinAction = 'keep' | 'take' | 'merge'
+
+/** Records the decision on a fork flagged `builtin_updated`: `keep` leaves
+ * its body alone, `take` replaces it with the current built-in body, `merge`
+ * replaces it with `body` (required there, refused on the other two). Every
+ * action clears the flag; the answer is the updated item. */
+export function resolveLibraryBuiltin(
+  id: number,
+  action: LibraryBuiltinAction,
+  body?: string,
+): Promise<LibraryItem> {
+  return request(
+    `/api/library/${id}/builtin`,
+    jsonInit('POST', body === undefined ? { action } : { action, body }),
+  )
+}
+
 /** The sync scan: one row per path, comparing the stored body, the file on
  * disk and the last-agreed baseline. Unscoped when `project` is omitted. */
 export function getLibrarySync(project?: number): Promise<LibrarySyncRow[]> {

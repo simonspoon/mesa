@@ -10349,6 +10349,34 @@ button:focus-visible,
   font-size: 0.75rem;
 }
 
+/* A fork whose built-in changed under it (mesa task 1349): the one badge that
+   asks for a decision, so it wears the red the app means by "needs you"
+   rather than the amber of the descriptive badges beside it. */
+.library-badge-alert {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+.library-builtin-review .inline-edit-actions {
+  margin-top: 0.5rem;
+  flex-wrap: wrap;
+}
+
+/* Merge by hand: the editor seeded with the fork on the left, the new
+   built-in read-only on the right — the history panel's two-column grid. */
+.library-builtin-merge {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.library-builtin-readonly {
+  max-height: 18rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* The editor opens inside the row it belongs to, exactly like `.script-form`
    — a well sunk into the card (the page's own black, a hairline and an inset
    shadow) keeps the form and the list item from reading as one block, where a

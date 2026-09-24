@@ -2177,6 +2177,17 @@ pub struct LibraryItem {
     pub synced_at: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    /// Derived, never stored (mesa task 1349): true iff this row is a fork
+    /// whose built-in has changed since the fork last agreed with it — its
+    /// body differs from the current built-in body, and the stored base (the
+    /// built-in body at fork time, or at the last `keep`/`take`/`merge`) is
+    /// unknown or differs too. Always `false` on an unshadowed built-in and
+    /// on a row with no `builtin_id`.
+    pub builtin_updated: bool,
+    /// Derived, never stored: the current built-in body behind a fork, so a
+    /// client can diff the fork against it; `None` on everything that is not
+    /// a fork of a built-in that still exists.
+    pub builtin_body: Option<String>,
 }
 
 /// One entry in a [`LibraryItem`]'s history. A row is appended only when the
@@ -2348,6 +2359,11 @@ pub struct LibrarySyncRow {
     /// Deliberately two-way: `baseline` is carried separately, and mesa-vs-disk
     /// is what a resolution actually picks between.
     pub diff: Option<Vec<LibraryDiffLine>>,
+    /// The row's item is a fork whose built-in changed under it
+    /// ([`LibraryItem::builtin_updated`], mesa task 1349) — a separate fact
+    /// from `status`, which compares Naru with the disk and so can read
+    /// `in-sync` while the built-in has moved on.
+    pub builtin_updated: bool,
 }
 
 /// Which side one line of a [`LibrarySyncRow::diff`] belongs to.

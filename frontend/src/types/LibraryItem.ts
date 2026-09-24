@@ -56,4 +56,19 @@ path: string | null,
  * The last body mesa and the file on disk agreed on — the sync
  * baseline. Null until the first sync.
  */
-synced_body: string | null, synced_at: string | null, created_at: string | null, updated_at: string | null, };
+synced_body: string | null, synced_at: string | null, created_at: string | null, updated_at: string | null, 
+/**
+ * Derived, never stored (mesa task 1349): true iff this row is a fork
+ * whose built-in has changed since the fork last agreed with it — its
+ * body differs from the current built-in body, and the stored base (the
+ * built-in body at fork time, or at the last `keep`/`take`/`merge`) is
+ * unknown or differs too. Always `false` on an unshadowed built-in and
+ * on a row with no `builtin_id`.
+ */
+builtin_updated: boolean, 
+/**
+ * Derived, never stored: the current built-in body behind a fork, so a
+ * client can diff the fork against it; `None` on everything that is not
+ * a fork of a built-in that still exists.
+ */
+builtin_body: string | null, };

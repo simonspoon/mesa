@@ -37,11 +37,11 @@ live-notebook methods are the `None` scope):
 | --- | --- | --- |
 | Entry bound | 600 characters | same |
 | Word budget | 500 words | 500 words **of its own** |
-| At the budget | evict least recently used by `COALESCE(last_used_session_id, source_session_id, 0), id` | evict by `COALESCE(last_used_at, created_at), id` |
+| Past the budget | never refused or trimmed at write time (mesa task 1337); the dream brings it back within 500, and lists entries least recently used first by `COALESCE(last_used_session_id, source_session_id, 0), id` | same, by `COALESCE(last_used_at, created_at), id`; only a manual `naru memory dream` does it |
 | Removal guard | 30% once it holds 100 words | same, on its own words |
 | Provenance | `source_session_id`, `last_used_session_id` | none (both `NULL`) |
 | `touch` | needs a live session | stamps `last_used_at`, no session needed |
-| Unused entries | a retirement candidate after 10 unused ended conversations, decided by the dream pass (mesa task 1337; never retired by the count alone) | **never** a candidate — it shrinks only by eviction, a dream, or a delete |
+| Unused entries | a retirement candidate after 10 unused ended conversations, decided by the dream pass (mesa task 1337; never retired by the count alone) | **never** a candidate — it shrinks only by a dream or a delete |
 | Retire / merge / restore | soft, `merged_into`, undo | same |
 | Search | turns, summaries, live notes | this project's notes only (retired ones included) |
 
@@ -88,13 +88,13 @@ naru live memory move <id> --project <p> [--quiet]
 ```
 
 `--quiet` follows `live memory`: accepted on `show` and the mutations (the
-record minus `body`; a write's `evicted` members too), refused by `list`,
+record minus `body`), refused by `list`,
 `search`, `context`, `dream` and `import`. Flags go **before** trailing text.
 
 `naru live memory move` files a live entry into a project's notebook: same
-row and id, `last_used_at` stamped, judged against the **project's** budget
-(evicting there as an add would). The live notebook's removal guard does not
-apply to a move — nothing is lost.
+row and id, `last_used_at` stamped, and — like an add — never refused for
+the **project's** budget. The live notebook's removal guard does not apply
+to a move — nothing is lost.
 
 ### `context`
 
@@ -126,23 +126,31 @@ overrides; a missing folder, or a project with no `local_path` and no
 `MEMORY.md` (the index): the frontmatter `description` (else `name`), ` — `,
 then the body, whitespace collapsed, cut at a word boundary with `…` to fit
 600 characters. A file whose entry is already in the notebook — active or
-retired, so an entry the budget evicted is not re-added — or came from an
-earlier file in the same run is skipped, so a re-import adds nothing. Entries go through the ordinary add, so the budget evicts as usual.
-Prints `{project_id, source, imported: [{file, id}], skipped: [{file,
-reason}], evicted: [ids]}`; `--dry-run` writes nothing, prints `id: null`
-for each would-be import, and does not predict evictions.
+retired, so an entry a dream or a person retired is not re-added — or came
+from an earlier file in the same run is skipped, so a re-import adds nothing.
+Entries go through the ordinary add, so an import may take the notebook past
+its budget until the next dream. Prints `{project_id, source, imported:
+[{file, id}], skipped: [{file, reason}]}`; `--dry-run` writes nothing and
+prints `id: null` for each would-be import.
 
 ### `dream`
 
 The live dream pass (`docs/live.md`, "Dreaming") for one project: the same
 `live-dream` config template through `agents::spawn_bg`, with
 `project_memory::dream_prompt` — the dream instructions naming `naru memory
-show|list|search|merge|delete --project <id>` and `naru task create <id>` for
-a contradiction — plus the active entries. It runs in the project's
+show|list|search|merge|delete|replace --project <id>` and `naru task create
+<id>` for a contradiction — plus the notebook's word count against its
+budget and the active entries, least recently used first. Since mesa task
+1337 it owns the notebook's 500-word budget with the live dream's budget
+paragraph and step 3 (merge, delete, then shorten with `naru memory replace`,
+never deleting a standing norm to make room), minus the clauses about
+`unused`/`kept` marks a project notebook never carries. It runs in the project's
 `local_path` when that folder exists, else the workspace, with no session
 `{id}`. Fewer than two active entries prints `{"spawned": false, "reason"}`
 and spawns nothing; a failed spawn is `unavailable`. There is no
-live-conversation `conflict` and no automatic trigger.
+live-conversation `conflict` and no automatic trigger — so a project
+notebook, which nothing trims at write time, grows past its budget until
+someone runs `naru memory dream`.
 
 ## The SessionStart hook
 

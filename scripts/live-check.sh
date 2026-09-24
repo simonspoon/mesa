@@ -117,10 +117,10 @@
 #      errors; `--quiet` typed after the text lands in the body, and after
 #      search words is a word), `touch`
 #      with no live session being not_found, every guard — the empty body,
-#      the 600-char entry bound, the 500-word budget evicting rather than
-#      refusing (mesa task 1331: least recently used first, id breaking a
-#      tie, `evicted` in the JSON on the CLI and over the API, the row
-#      retired as `evicted` and still found by `search`),
+#      the 600-char entry bound, and past the 500-word budget an add or
+#      replace neither refused nor retiring anything (mesa task 1337: no
+#      `evicted` key on the CLI or over the API, no row ever retired as
+#      `evicted` — the dream pass owns the budget),
 #      the 30%-removal rule refusing a delete above the 100-word floor and
 #      allowing one below it, a replace judged on the words it removes — a
 #      retired row surviving in `list --all` and in the archive, `search`
@@ -142,10 +142,10 @@
 #      carries the OLDEST source's provenance, both text bodies still
 #      searchable, its refusals (one id, a repeated id, a retired or unknown
 #      id, an empty body, no --ids) touching nothing, its removal guard
-#      judged on the NET words and a merge past the budget evicting the
-#      least-recently-used entry, `restore` un-retiring a
-#      merged or deleted row (retirement fields cleared, nothing else moved)
-#      and refused past the budget or on an active row, the `--quiet` key
+#      judged on the NET words and a merge past the budget retiring nothing
+#      but its sources, `restore` un-retiring a
+#      merged or deleted row (retirement fields cleared, nothing else moved),
+#      past the budget too, and refused on an active row, the `--quiet` key
 #      set on both, and `dream` — `--quiet` a usage error, `{spawned:
 #      false}` under two entries, `conflict` while a session is live (never
 #      spawning), the built-in `live-dream` template's argv with
@@ -2745,9 +2745,9 @@ grep -q "30%" <<<"$STDERR" || fail "the removal guard must name its share"
 run 0 "$MESA" live memory show "$E1"
 [ "$(jqs .retired_at)" = "null" ] || fail "a refused delete must not retire the row"
 # Replacing 99 words with 10 removes 89 of 297 (29.97%): allowed, in place.
-run 0 "$MESA" live memory replace "$E1" "EVICT-E1 $(words 9)"
+run 0 "$MESA" live memory replace "$E1" "GUARD-E1 $(words 9)"
 [ "$(jqs .id)" = "$E1" ] || fail "replace keeps the id"
-[ "$(jqs .body)" = "EVICT-E1 $(words 9)" ] || fail "replace: the new body"
+[ "$(jqs .body)" = "GUARD-E1 $(words 9)" ] || fail "replace: the new body"
 # Replacing 99 with 1 would remove 98 of 208 (47%): refused.
 run 1 "$MESA" live memory replace "$E2" "one"
 [ "$(jqe .error.code)" = "validation" ] || fail "a replace removing 47%: validation"
@@ -2755,66 +2755,56 @@ grep -q "98 of the notebook's 208 words" <<<"$STDERR" ||
   fail "the replace guard must name the words (got $STDERR)"
 ok "live memory: above the 100-word floor a delete or replace removing more than 30% is validation naming the numbers; a smaller replace lands in place"
 
-# ---- the budget evicts the least-recently-used entries (mesa task 1331) ----
+# ---- past the budget nothing is refused or retired (mesa task 1337) ----
 # 208 → 307 → 406, then a live conversation relies on E2, so E1 and E3 are
-# the least recently used (E1 first, by id).
+# the least recently used — and still nothing goes.
 run 0 "$MESA" live memory add "$(words 99)"
 E4=$(jqs .id)
-[ "$(jqs '.evicted | length')" = "0" ] || fail "an add under the budget evicts nothing (got $(jqs .evicted))"
+[ "$(jqs 'has("evicted")')" = "false" ] || fail "an add answers the plain entry, no evicted key (got $STDOUT)"
 run 0 "$MESA" live memory add "$(words 99)"
 E5=$(jqs .id)
 run 0 "$MESA" live start --no-agent
 run 0 "$MESA" live memory touch "$E2"
 run 0 "$MESA" live stop >/dev/null
-# 406 + 150 = 556: E1 (10) then E3 (99) go — not E2, older by id than E3
-# but used more recently — landing at 447.
-run 0 "$MESA" live memory add "EVICT-ADD $(words 149)"
+# 406 + 150 = 556: past the budget, and the add still just lands.
+run 0 "$MESA" live memory add "NOBUDGET-ADD $(words 149)"
 E6=$(jqs .id)
-[ "$(jqs .retired_at)" = "null" ] || fail "the entry an add writes is never evicted"
-[ "$(jqs '.evicted | map(.id) | join(",")')" = "$E1,$E3" ] ||
-  fail "an add past the budget must evict E1 then E3, least recently used first (got $(jqs '.evicted | map(.id)'))"
-[ "$(jqs '.evicted | map(.retired_reason) | unique | join(",")')" = "evicted" ] ||
-  fail "every evicted entry is retired as evicted"
-[ "$(jqs '.evicted[0].body')" = "EVICT-E1 $(words 9)" ] || fail "evicted carries the full retired record"
+[ "$(jqs .retired_at)" = "null" ] || fail "an add past the budget is active"
+[ "$(jqs 'has("evicted")')" = "false" ] || fail "an add past the budget answers the plain entry (got $STDOUT)"
 run 0 "$MESA" live memory show "$E1"
-[ "$(jqs .retired_reason)" = "evicted" ] && [ "$(jqs .retired_at)" != "null" ] ||
-  fail "an evicted entry reads as retired, evicted"
-run 0 "$MESA" live memory search EVICT-E1
-[ "$(jqs 'map(select(.kind == "note"))[0].ref_id')" = "$E1" ] ||
-  fail "an evicted entry must still be found in the archive"
-# A replace evicts the same way, never the entry it rewrites: E4 99 → 160
-# lands at 508 and E5, the one entry left from before the conversation, goes
-# (409). Under --quiet every member drops body too.
+[ "$(jqs .retired_at)" = "null" ] || fail "the least recently used entry must not be retired by an add past the budget"
+# A replace past the budget lands the same way: E4 99 → 160 (617). Under
+# --quiet it is the entry minus body, nothing else.
 run 0 "$MESA" live memory replace --quiet "$E4" "$(words 160)"
 [ "$(jqs .id)" = "$E4" ] && [ "$(jqs 'has("body")')" = "false" ] || fail "replace --quiet: the entry minus body"
-[ "$(jqs '.evicted | map(.id) | join(",")')" = "$E5" ] ||
-  fail "a replace past the budget must evict E5 (got $(jqs '.evicted | map(.id)'))"
-[ "$(jqs '.evicted[0] | has("body")')" = "false" ] || fail "--quiet drops body from an evicted member"
-[ "$(jqs '.evicted[0].retired_reason')" = "evicted" ] || fail "--quiet keeps the evicted member's retired_reason"
-# 409 + 91 = exactly the budget: nothing goes.
+[ "$(jqs 'has("evicted")')" = "false" ] || fail "replace --quiet answers no evicted key (got $STDOUT)"
 run 0 "$MESA" live memory add "$(words 91)"
 E7=$(jqs .id)
-[ "$(jqs '.evicted | length')" = "0" ] || fail "an add landing exactly on the budget evicts nothing"
 run 0 "$MESA" live memory list
-[ "$(jqs '[.[].body | split(" ") | length] | add')" = "$NB_BUDGET" ] ||
-  fail "the notebook must be at exactly $NB_BUDGET words (got $(jqs '[.[].body | split(" ") | length] | add'))"
-[ "$(jqs 'map(.id) | join(",")')" = "$E2,$E4,$E6,$E7" ] || fail "the active notebook after the evictions (got $(jqs 'map(.id)'))"
-ok "live memory: past the $NB_BUDGET-word budget an add or replace evicts the least-recently-used entries (id breaking a tie), never the one written, listed in \`evicted\` and still searchable; landing exactly on the budget evicts nothing"
+[ "$(jqs '[.[].body | split(" ") | length] | add')" = "708" ] ||
+  fail "the notebook must hold all 708 words (got $(jqs '[.[].body | split(" ") | length] | add'))"
+[ "$(jqs 'map(.id) | join(",")')" = "$E1,$E2,$E3,$E4,$E5,$E6,$E7" ] || fail "every entry stays active past the budget (got $(jqs 'map(.id)'))"
+run 0 "$MESA" live memory list --all
+[ "$(jqs 'map(select(.retired_reason == "evicted")) | length')" = "0" ] || fail "nothing is ever retired as evicted"
+ok "live memory: past the $NB_BUDGET-word budget an add or replace just lands — no entry retired, no evicted key; the dream pass owns the budget"
 
 # ---- retirement candidates (mesa task 1337): N ended sessions with no use
 #      make an entry a candidate the dream pass decides, never retire it ----
 #
 # First empty the notebook, in steps the removal guard allows (<= 30% each
-# while it holds 100+ words): 500 -> 409 -> 310 -> 220 -> 160 -> 115 -> 85,
-# then below the floor anything goes.
-run 0 "$MESA" live memory delete "$E7"
-run 0 "$MESA" live memory delete "$E2"
-run 0 "$MESA" live memory replace "$E4" "$(words 70)"
-run 0 "$MESA" live memory replace "$E6" "$(words 90)"
-run 0 "$MESA" live memory replace "$E6" "$(words 45)"
-run 0 "$MESA" live memory replace "$E4" "$(words 40)"
+# while it holds 100+ words): 708 -> 548 -> 398 -> 299 -> 230 -> 171 -> 130
+# -> 100 -> 75, then below the floor anything goes.
 run 0 "$MESA" live memory delete "$E4"
 run 0 "$MESA" live memory delete "$E6"
+run 0 "$MESA" live memory delete "$E2"
+run 0 "$MESA" live memory replace "$E3" "$(words 30)"
+run 0 "$MESA" live memory replace "$E5" "$(words 40)"
+run 0 "$MESA" live memory replace "$E7" "$(words 50)"
+run 0 "$MESA" live memory replace "$E7" "$(words 20)"
+run 0 "$MESA" live memory replace "$E5" "$(words 15)"
+for id in "$E1" "$E3" "$E5" "$E7"; do
+  run 0 "$MESA" live memory delete "$id"
+done
 run 0 "$MESA" live memory list
 [ "$(jqs length)" = "0" ] || fail "the notebook must be empty before the candidate check (got $STDOUT)"
 # Two small, unlike entries: under every older dream trigger, so a dream at
@@ -2920,8 +2910,7 @@ api 200 GET "/api/live/memory"
 api 200 PATCH "/api/live/memory/$M1" '{"body":"Prefers the board sorted by priority, always."}'
 [ "$(jqb .id)" = "$M1" ] || fail "PATCH keeps the id"
 [ "$(jqb .body)" = "Prefers the board sorted by priority, always." ] || fail "PATCH: the new body"
-[ "$(jqb '.evicted | type')" = "array" ] && [ "$(jqb '.evicted | length')" = "0" ] ||
-  fail "PATCH under the budget answers evicted: [] (got $BODY)"
+[ "$(jqb 'has("evicted")')" = "false" ] || fail "PATCH answers the plain entry, no evicted key (got $BODY)"
 api 422 POST "/api/live/memory" '{"body":"   "}'
 [ "$(jqb .error.code)" = "validation" ] || fail "POST an empty body: validation"
 api 422 POST "/api/live/memory" '{}'
@@ -2939,31 +2928,33 @@ api 200 GET "/api/live/memory"
 [ "$BODY" = "[]" ] || fail "a deleted row leaves the active list"
 api 404 DELETE "/api/live/memory/$M1"
 [ "$(jqb .error.code)" = "not_found" ] || fail "DELETE a retired row: not_found"
-# Past the budget the route evicts rather than refusing (mesa task 1331),
-# exactly as the CLI does: 291 + 250 = 541, so the older entry goes.
-api 201 POST "/api/live/memory" "{\"body\":\"API-EVICT $(words 290)\"}"
+# Past the budget the route neither refuses nor retires (mesa task 1337),
+# exactly as the CLI: 291 + 250 = 541, and both entries stay active.
+api 201 POST "/api/live/memory" "{\"body\":\"API-BUDGET $(words 290)\"}"
 AE1=$(jqb .id)
-[ "$(jqb '.evicted | length')" = "0" ] || fail "POST under the budget answers evicted: [] (got $BODY)"
+[ "$(jqb 'has("evicted")')" = "false" ] || fail "POST answers the plain entry, no evicted key (got $BODY)"
 api 201 POST "/api/live/memory" "{\"body\":\"$(words 250)\"}"
 AE2=$(jqb .id)
 [ "$(jqb .retired_at)" = "null" ] || fail "POST past the budget: the written entry is active"
-[ "$(jqb '.evicted | map(.id) | join(",")')" = "$AE1" ] || fail "POST past the budget must evict #$AE1 (got $BODY)"
-[ "$(jqb '.evicted[0].retired_reason')" = "evicted" ] || fail "POST: the evicted entry is retired as evicted"
-[ "$(jqb '.evicted[0].body')" = "API-EVICT $(words 290)" ] || fail "POST: evicted carries the full record"
-# Walk the survivor back under the 100-word floor 30% at a time, then delete
-# it, so the notebook is empty again for what follows.
-for n in 175 123 87; do
+[ "$(jqb 'has("evicted")')" = "false" ] || fail "POST past the budget answers no evicted key (got $BODY)"
+api 200 GET "/api/live/memory"
+[ "$(jqb 'map(.id) | join(",")')" = "$AE1,$AE2" ] || fail "POST past the budget retires nothing (got $BODY)"
+# Walk both back under the 100-word floor 30% at a time, then delete them,
+# so the notebook is empty again for what follows.
+for n in 175 123 87 61 43; do
+  api 200 PATCH "/api/live/memory/$AE1" "{\"body\":\"$(words "$n")\"}"
   api 200 PATCH "/api/live/memory/$AE2" "{\"body\":\"$(words "$n")\"}"
 done
+api 200 DELETE "/api/live/memory/$AE1"
 api 200 DELETE "/api/live/memory/$AE2"
 api 200 GET "/api/live/memory"
-[ "$BODY" = "[]" ] || fail "the API eviction check must leave the notebook empty (got $BODY)"
+[ "$BODY" = "[]" ] || fail "the API budget check must leave the notebook empty (got $BODY)"
 # The 2s poll carries no notebook (`blocked` is the derived agent state of
 # mesa task 1157, a string or null, not a body).
 api 200 GET "/api/live"
 [ "$(jqb 'keys | sort | join(",")')" = "blocked,boards,session,turns" ] ||
   fail "GET /api/live must carry exactly session/turns/boards/blocked — no notebook (got $(jqb 'keys'))"
-ok "/api/live/memory: GET/POST/PATCH/DELETE round trip, 422 validation with the CLI's messages, 404 for unknown and retired ids, POST past the budget evicting and naming what it evicted, and GET /api/live carries no notebook"
+ok "/api/live/memory: GET/POST/PATCH/DELETE round trip, 422 validation with the CLI's messages, 404 for unknown and retired ids, POST past the budget retiring nothing, and GET /api/live carries no notebook"
 
 # Both halves of the boundary, default mode: Host allowlist, Content-Type
 # gate, and the agent gate (a foreign Origin refused on every verb, reads
@@ -3034,8 +3025,8 @@ LAN_PID=
 
 # ---- the dream pass (mesa task 1152): merge, restore, dream ----
 #
-# The active notebook is empty here (everything above was deleted or
-# evicted) and no session is live. `$D1` is a row section 14 deleted, so it
+# The active notebook is empty here (everything above was deleted) and no
+# session is live. `$D1` is a row section 14 deleted, so it
 # is the retired id a merge must refuse.
 
 # `dream` takes no --quiet (like `search`), and with fewer than two active
@@ -3145,11 +3136,11 @@ run 0 "$MESA" live memory restore "$MB"
 [ "$(jqs .retired_reason)" = "null" ] || fail "a deleted row restores too"
 ok "live memory restore: un-retires a merged or deleted row (retirement fields cleared, body and provenance untouched), --quiet drops body alone; an active row is validation, an unknown id not_found"
 
-# ---- restore past the budget is refused ----
+# ---- restore past the budget is not refused (mesa task 1337) ----
 # Retire MB (7 words), fill the notebook to exactly the budget with 30-word
 # entries (30 is at most 30% of any notebook at or above the 100-word floor,
 # so every one of them can be deleted again afterwards), then the restore
-# would land at 507.
+# lands at 507.
 run 0 "$MESA" live memory delete "$MB" >/dev/null
 run 0 "$MESA" live memory list
 CUR=$(jqs '[.[].body | split(" ") | length] | add')
@@ -3166,16 +3157,16 @@ fi
 run 0 "$MESA" live memory list
 [ "$(jqs '[.[].body | split(" ") | length] | add')" = "$NB_BUDGET" ] ||
   fail "restore setup: the notebook must sit at exactly $NB_BUDGET words (got $(jqs '[.[].body | split(" ") | length] | add'))"
-run 1 "$MESA" live memory restore "$MB"
-[ "$(jqe .error.code)" = "validation" ] || fail "a restore past the budget: validation"
-grep -q "$((NB_BUDGET + 7)) words" <<<"$STDERR" || fail "a refused restore names the resulting count (got $STDERR)"
-grep -q "$NB_BUDGET-word" <<<"$STDERR" || fail "a refused restore names the budget"
-run 0 "$MESA" live memory show "$MB"
-[ "$(jqs .retired_reason)" = "deleted" ] || fail "a refused restore must change nothing"
+run 0 "$MESA" live memory restore "$MB"
+[ "$(jqs .retired_at)" = "null" ] && [ "$(jqs .retired_reason)" = "null" ] || fail "a restore past the budget still un-retires the row"
+run 0 "$MESA" live memory list
+[ "$(jqs '[.[].body | split(" ") | length] | add')" = "$((NB_BUDGET + 7))" ] ||
+  fail "after the restore: $((NB_BUDGET + 7)) words (got $(jqs '[.[].body | split(" ") | length] | add'))"
+run 0 "$MESA" live memory delete "$MB" >/dev/null
 for id in "${FILLERS[@]}"; do
   run 0 "$MESA" live memory delete "$id" >/dev/null
 done
-ok "live memory restore: refused with the budget message when the row would not fit, and nothing changes"
+ok "live memory restore: past the budget it is not refused — the dream pass owns the budget"
 
 # ---- merge --quiet, and the two guards judged on the NET words ----
 run 0 "$MESA" live memory merge --quiet --ids "$MA,$MM" MERGED-2: prefers short spoken replies.
@@ -3198,14 +3189,14 @@ grep -q "75 of the notebook's 131 words" <<<"$STDERR" ||
   fail "the merge removal guard must name the NET words removed and held (got $STDERR)"
 run 0 "$MESA" live memory show "$X1"
 [ "$(jqs .retired_at)" = "null" ] || fail "a refused merge must not retire a source"
-# The budget (mesa task 1331): fill to exactly $NB_BUDGET with 30-word
+# The budget (mesa task 1337): fill to exactly $NB_BUDGET with 30-word
 # entries (deletable again, as above), the first carrying a marker. A live
 # conversation then relies on every other entry, so the fillers are the least
-# recently used; folding two of them (60 words) into 61 lands at 501, and the
-# oldest filler — the marker — is evicted rather than the merge refused.
+# recently used; folding two of them (60 words) into 61 lands at 501, and
+# nothing is refused or retired — the marker filler stays active.
 FILLERS=()
 CUR=131
-run 0 "$MESA" live memory add "EVICT-MERGE $(words 29)"
+run 0 "$MESA" live memory add "BUDGET-MERGE $(words 29)"
 FILLERS+=("$(jqs .id)")
 CUR=$((CUR + 30))
 while [ "$CUR" -le $((NB_BUDGET - 30)) ]; do
@@ -3225,19 +3216,16 @@ run 0 "$MESA" live stop >/dev/null
 run 0 "$MESA" live memory merge --ids "${FILLERS[1]},${FILLERS[2]}" "$(words 61)"
 FM=$(jqs .id)
 [ "$(jqs .retired_at)" = "null" ] || fail "a merge past the budget: the merged row is active"
-[ "$(jqs '.evicted | map(.id) | join(",")')" = "${FILLERS[0]}" ] ||
-  fail "a merge past the budget must evict the least-recently-used filler #${FILLERS[0]} (got $(jqs '.evicted | map(.id)'))"
-[ "$(jqs '.evicted[0].retired_reason')" = "evicted" ] || fail "the merge's evicted entry is retired as evicted"
+[ "$(jqs 'has("evicted")')" = "false" ] || fail "a merge answers the plain entry, no evicted key (got $STDOUT)"
 run 0 "$MESA" live memory show "${FILLERS[1]}"
-[ "$(jqs .retired_reason)" = "merged" ] || fail "a merge's source retires as merged, not evicted"
-run 0 "$MESA" live memory search EVICT-MERGE
-[ "$(jqs 'map(select(.kind == "note"))[0].ref_id')" = "${FILLERS[0]}" ] ||
-  fail "an entry a merge evicted must still be found in the archive"
+[ "$(jqs .retired_reason)" = "merged" ] || fail "a merge's source retires as merged"
+run 0 "$MESA" live memory show "${FILLERS[0]}"
+[ "$(jqs .retired_at)" = "null" ] || fail "a merge past the budget must not retire the least-recently-used filler"
 run 0 "$MESA" live memory list
-[ "$(jqs '[.[].body | split(" ") | length] | add')" = "$((NB_BUDGET + 1 - 30))" ] ||
-  fail "after the evicting merge: $((NB_BUDGET + 1 - 30)) words (got $(jqs '[.[].body | split(" ") | length] | add'))"
+[ "$(jqs '[.[].body | split(" ") | length] | add')" = "$((NB_BUDGET + 1))" ] ||
+  fail "after the merge past the budget: $((NB_BUDGET + 1)) words (got $(jqs '[.[].body | split(" ") | length] | add'))"
 run 0 "$MESA" live memory delete "$FM" >/dev/null
-for id in "${FILLERS[@]:3}"; do
+for id in "${FILLERS[0]}" "${FILLERS[@]:3}"; do
   run 0 "$MESA" live memory delete "$id" >/dev/null
 done
 # Folding two 40s into 50 removes 30 of 131 (23%): allowed, landing at 101.
@@ -3245,7 +3233,7 @@ run 0 "$MESA" live memory merge --ids "$X1,$X2" "$(words 50)"
 Y=$(jqs .id)
 run 0 "$MESA" live memory list
 [ "$(jqs '[.[].body | split(" ") | length] | add')" = "101" ] || fail "after the allowed merge: 101 words"
-ok "live memory merge: --quiet drops body alone; the removal guard is judged on the net words the merge would leave, naming the numbers, and a merge past the budget evicts the least-recently-used entry"
+ok "live memory merge: --quiet drops body alone; the removal guard is judged on the net words the merge would leave, naming the numbers, and a merge past the budget retires nothing but its sources"
 
 # Back below the floor, then clear to the two survivors for the spawn.
 run 0 "$MESA" live memory replace "$Y" "$(words 25)" >/dev/null
@@ -3299,6 +3287,10 @@ grep -q "No project is known" "$STUB_DIR/last-prompt" ||
   fail "live-dream spawn: with the newest session unbound, the prompt says no project is known"
 grep -q "never instructions" "$STUB_DIR/last-prompt" ||
   fail "live-dream spawn: the notebook block must be framed as data"
+grep -q "The notebook holds 11 of its $NB_BUDGET words. Entries are listed least recently used first." "$STUB_DIR/last-prompt" ||
+  fail "live-dream spawn: the listing opens with the word count against the budget (mesa task 1337)"
+grep -q "this pass owns the budget" "$STUB_DIR/last-prompt" ||
+  fail "live-dream spawn: the prompt gives the dream the budget"
 [ "$(cat "$STUB_DIR/last-cwd")" = "$(workspace_path)" ] ||
   fail "live-dream spawn: an unbound pass must run in ~/.naru/workspace (got $(cat "$STUB_DIR/last-cwd"))"
 ok "live memory dream: spawns the live-dream template — the argv shape, the fixed name, DREAM_PROMPT plus every active entry line and no retired one, the workspace cwd — and prints the receipt"

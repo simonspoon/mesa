@@ -5,14 +5,16 @@
  * conversations left for later ones — a preference, a working norm, the
  * reason behind a decision, a pointer to a task id. The whole active
  * notebook rides in every live agent's prompt (`live::agent_prompt`), so it
- * is **budgeted** (`live::LIVE_NOTEBOOK_BUDGET_WORDS`) and edited one entry
+ * is **budgeted** (`live::LIVE_NOTEBOOK_BUDGET_WORDS`) — kept by the dream
+ * pass, never enforced at write time (mesa task 1337) — and edited one entry
  * at a time, never rewritten whole.
  *
  * Retiring is a **soft delete**: the row stays (and stays searchable in the
  * archive, `Store::search_live_memory`) with `retired_at`/`retired_reason`
- * stamped, and drops out of the prompt and the default list. `evicted` is the
- * automatic kind (mesa task 1331: the least-recently-used entry an add,
- * replace or merge pushed past the word budget); `decayed` is historical —
+ * stamped, and drops out of the prompt and the default list. `evicted` is
+ * historical (mesa task 1331 retired the least-recently-used entry an add,
+ * replace or merge pushed past the word budget, until mesa task 1337 gave
+ * the budget to the dream pass); `decayed` is historical too —
  * an entry no conversation had used for `live::LIVE_NOTEBOOK_DECAY_SESSIONS`
  * ended sessions, retired at a live start until mesa task 1337 made such an
  * entry a candidate for the dream pass instead — `deleted` an explicit
@@ -44,7 +46,7 @@ source_session_id: number | null,
  */
 last_used_session_id: number | null, retired_at: string | null, 
 /**
- * `decayed` (old rows only) | `evicted` | `deleted` | `replaced` |
+ * `decayed` or `evicted` (old rows only) | `deleted` | `replaced` |
  * `merged`, null while the entry is active.
  */
 retired_reason: string | null, 
@@ -62,14 +64,14 @@ merged_into: number | null,
 project_id: number | null, 
 /**
  * When a project entry was last touched, replaced or moved in — the
- * clock a project notebook evicts on. Always null in the live notebook,
+ * clock a project notebook's recency is read on. Always null in the live notebook,
  * which measures use in sessions (`last_used_session_id`).
  */
 last_used_at: string | null, 
 /**
  * When a dream pass kept this entry as a standing norm (mesa task 1337,
  * `mesa live memory keep`); null when it was never kept. A kept entry
- * is not a retirement candidate, and eviction takes it only once every
- * unkept entry is gone. Bounded, kept by `--quiet`.
+ * is not a retirement candidate, and the dream pass never deletes it to
+ * make room. Bounded, kept by `--quiet`.
  */
 kept_at: string | null, };

@@ -648,16 +648,16 @@ that keeps the first honest:
   notebook entry ever written is kept, never rewritten and never pruned, and
   searched **on demand** — `mesa live memory search <words>`, an FTS5 index.
   Nothing from it is auto-injected.
-- **A notebook, always injected.** Short bullets with ids under a hard word
-  budget, every active one riding in every live agent's prompt. The agent
+- **A notebook, always injected.** Short bullets with ids under a word
+  budget the dream pass keeps, every active one riding in every live agent's prompt. The agent
   edits it one item at a time (add, replace, delete), never rewrites it
   whole, and the person can read and correct it on the Settings page.
 - **Provenance and retirement candidates.** Each entry records when it was
   added, which conversation wrote it and which last relied on it; an entry no
   conversation has used for N sessions becomes a candidate the dream pass
   decides on — a one-off goes (and stays in the archive), a standing norm
-  stays and is marked **kept**, which the budget evicts last (mesa task
-  1337).
+  stays and is marked **kept**, which the dream never deletes to make room
+  (mesa task 1337).
 
 The research the split follows: ACE's *context collapse* (arXiv 2510.04618 —
 a memory that is rewritten whole shrinks toward whatever the rewriter found
@@ -708,9 +708,9 @@ up (see "The CLI surface" below).
 `last_used_session_id` (both `REFERENCES live_sessions ON DELETE SET NULL` —
 an entry outlives the conversation that wrote it), `retired_at`,
 `retired_reason` (`decayed` | `evicted` | `deleted` | `replaced` | `merged`
-— `evicted` since mesa task 1331, a plain string with no CHECK, so no
-migration; nothing writes `decayed` since mesa task 1337, and old rows keep
-it), since
+— a plain string with no CHECK, so no migration; mesa task 1331's
+write-time eviction wrote `evicted`, and since mesa task 1337 nothing writes
+`evicted` or `decayed`, and old rows keep them), since
 mesa task 1152 `merged_into` (migration index 57 — for a `merged` row, the
 entry it was folded into; "Dreaming" below), and since mesa task 1337
 `kept_at` (migration index 73 — when a dream pass kept the entry as a
@@ -721,7 +721,7 @@ standing norm, `mesa live memory keep`; null when never kept). A ts-exported
 `docs/project-memory.md`): a row with a `project_id` is that project's
 notebook — `naru memory`, printed into Claude Code sessions by the
 `project-memory.sh` SessionStart hook — and `project_id IS NULL` is the live
-notebook this section describes, whose every read, guard, budget, eviction,
+notebook this section describes, whose every read, guard, budget,
 retirement candidacy, prompt, dream, merge and search is scoped to it and behaves exactly as
 before. Since the same task rule 9 keeps only project-agnostic memory here
 (preferences, working norms, cross-project learnings) and sends a fact about
@@ -770,40 +770,24 @@ the numbers, judged in `Store` on the notebook the write *would leave*:
   at a time" is worth more as a store rule than as a request: it is the one
   thing that makes context collapse impossible in a single command.
 
-**The budget evicts rather than refuses** (mesa task 1331). An add, replace
-or merge that would take the active notebook past the 500 words still
-succeeds: in the **same transaction** as the write, `Store` retires the
-least-recently-used active entries as **`evicted`**, one at a time, until the
-notebook fits again (`Store::evict_notebook_to_fit`). "Least recently used"
-is `last_used_session_id` ascending, falling back to `source_session_id`, and
-to "oldest of all" when both are null (an entry written before any
-conversation existed) — the same `COALESCE` retirement candidacy counts
-from — with ties
-broken by **id ascending**, so the earlier-written entry goes first. Ahead
-of all that, an entry the dream pass **kept** (`kept_at`, mesa task 1337)
-goes only once every unkept active entry is gone, and then in the same LRU
-order among the kept ones: the full order is `kept_at IS NOT NULL`, then the
-LRU key, then id. The reason is measurement, not taste: a norm is followed
-without being looked up, so a kept norm is least-recently-used by
-construction, and plain LRU at the 500-word budget evicted exactly the norms
-the dream had just kept. A project notebook shares the code, and since
-nothing keeps a project entry its order is unchanged. The row
-being written (the new entry, the replaced one, the merged one) is never
-evicted, and since one entry is at most 600 characters it always fits on its
-own. An eviction is a soft retire like every other: the row and its archive
-index entry stay, `search` still finds it and `restore` brings it back. It is
-**not** judged by the removal rule — that rule is about the edit the caller
-asked for, and is checked before the write on the caller's own edit alone;
-what the budget makes room for is not the agent hollowing the notebook out.
-The command answers a `LiveNotebookWrite`: the written entry's keys **as
-before, at the top level**, plus an `evicted` array of the full retired
-records, least recently used first, `[]` when nothing went — on the CLI
-(`add`/`replace`/`merge`) and over `POST`/`PATCH /api/live/memory`
-alike. Under `--quiet` the key set holds and every member drops `body`, the
-composite rule. A **restore** does not evict: one that would pass the budget
-is still `validation` ("the notebook would hold 505 words, over its 500-word
-budget; replace or delete an entry first"), since un-retiring one row should
-not silently retire another.
+**The budget is the dream's, never a write's** (mesa task 1337). No write
+is refused or trimmed for the 500 words: an add, a replace, a merge, a move
+into a project's notebook and a restore all succeed however far past the
+budget they take the notebook, and nothing is retired to make room. The
+notebook may therefore run over between dreams; the **dream pass** owns the
+budget ("Dreaming" below) — over 500 words it merges, deletes and shortens
+entries until the notebook fits, never deleting a standing norm or a kept
+entry to make room — and its automatic trigger already fires whenever the
+notebook is over (`dream_wanted`'s 300-word mark, "When it runs"). The
+history: until mesa task 1331 a write past the budget was `validation`;
+1331 let it succeed and retired the least-recently-used entries as
+`evicted` in the same transaction; and since a norm is followed without
+being looked up, a kept norm is least-recently-used by construction, so that
+eviction took exactly the norms the dream had just kept — 1337 took the
+budget off the write path. Old `evicted` rows stay readable, searchable and
+restorable. Every notebook write answers the plain `LiveNotebookEntry`, on
+the CLI and over `POST`/`PATCH /api/live/memory` alike (1331's
+`LiveNotebookWrite` wrapper and its `evicted` array are gone).
 
 **Retirement candidates** (mesa task 1337,
 `Store::notebook_retirement_candidates(n)`) are every active entry whose
@@ -823,7 +807,7 @@ so it is never `touch`ed, so the counter read it as unused and retired it
 all. An entry the dream keeps (`mesa live memory keep <id>`, which stamps
 `kept_at`) is **no longer a candidate** — the predicate skips any row with
 `kept_at` set — so the dream does not re-review a norm it already decided
-on at every pass, and the budget evicts it last (above). The dream keeps a
+on at every pass, and the dream never deletes it to make room. The dream keeps a
 standing norm on every pass, candidate or not ("Dreaming" below), so a norm
 is usually kept long before it could become one. A `replace` leaves
 `kept_at` as it is, a merge result starts unkept (the dream may keep it),
@@ -913,7 +897,7 @@ read whenever.
 - **`touch <ID>`** — stamps the live session as the entry's last use.
 - **`keep <ID>`** (mesa task 1337) — stamps `kept_at` on an active entry:
   the dream pass's way of keeping a standing norm, so it is no longer a
-  retirement candidate and the budget evicts it last. Needs no live session
+  retirement candidate and the dream never deletes it to make room. Needs no live session
   (the dream runs between conversations); keeping a kept entry changes
   nothing and echoes it, the first `kept_at` standing; an unknown, retired or
   project entry is `not_found`. CLI only — no HTTP route.
@@ -976,8 +960,9 @@ research above warns against is the obvious one — hand the whole notebook to
 a model and ask for a tidy version — because that is exactly ACE's *context
 collapse*: a rewrite shrinks toward whatever the rewriter found salient, and
 after a few passes what is left is the rewriter's notebook, not the
-person's. So the dream pass is **not** a rewrite. It is an agent with three
-verbs (`merge`, `delete` and `keep`), each a single guarded edit through the same `Store` path every other
+person's. So the dream pass is **not** a rewrite. It is an agent with four
+verbs (`merge`, `delete`, `keep` and, to fit the budget, `replace` to
+shorten), each a single guarded edit through the same `Store` path every other
 notebook write takes, and it is told to prefer doing nothing.
 
 **What it may do.** Merge entries that say the same thing
@@ -989,27 +974,45 @@ themselves is not its to resolve: both entries stay, and it opens a task
 (`mesa task create <project id> "Notebook contradiction: …"`, naming both
 ids) for the person to settle. Since mesa task 1337 it also decides the
 **retirement candidates** (above): each is marked `, unused` inside its
-bracket in the listing it is handed, and step 1 — now "these three things" —
+bracket in the listing it is handed, and step 1 — now "these four things —
+merge, delete, keep, and shorten to fit the budget" —
 tells it to delete one that is about one project, feature, device or task or
 that a newer entry supersedes, and to keep a standing preference or working
 norm, since "A norm is followed without being looked up, so being unused
 does not show that it is no longer needed." That is still the delete verb.
 One sentence follows the verbatim wording: "For each unused entry you keep,
 run `mesa live memory keep <id>`, so it is no longer marked unused and is
-the last to go when the notebook is full." — so a norm the pass keeps is
-decided once, not at every pass, and survives the budget. A norm is also
+never deleted to make room." — so a norm the pass keeps is decided once, not
+at every pass, and survives the budget. A norm is also
 kept **at capture**, not only at candidacy: a paragraph after that wording
 tells every pass to `keep` each entry not yet marked `, kept` that is a
 standing preference or working norm, whether or
-not it is marked unused — because measurement showed a full notebook
-evicting a standing norm before it was ever a candidate, so it was never
-kept. Kept entries carry `, kept` inside their bracket so the pass does not
+not it is marked unused — "because the budget step below must never delete
+a norm to make room, even one not yet marked unused" (measurement under
+mesa task 1331's write-time eviction showed a full notebook evicting a
+standing norm before it was ever a candidate). Kept entries carry `, kept` inside their bracket so the pass does not
 keep them again; a one-off candidate is still deleted as above. A norm is
 therefore protected only once some pass has run over it (the triggers are
-under "When it runs"): one added and evicted inside a single conversation,
-before any stop or handoff, is never seen. It never adds a fact, never rewrites what an
-entry means, edits at most a third of the notebook in one pass, and leaves
-a tidy notebook alone apart from those keeps. The instructions are `core::live::DREAM_PROMPT`;
+under "When it runs"), and since nothing retires an entry between passes,
+a norm added mid-conversation is still there for the next one to keep.
+
+**It owns the budget** (mesa task 1337). The listing it is handed opens with
+"The notebook holds <N> of its 500 words. Entries are listed least recently
+used first." — ordered by `COALESCE(last_used_session_id, source_session_id,
+0), id`, the recency candidacy counts from — and a paragraph after the keep
+paragraphs tells it: when the notebook holds more than 500 words, bring it
+back within 500 before finishing, stopping as soon as it fits, in this
+order — merge entries that say the same thing; delete one a newer entry
+supersedes; delete the unused entries about one project, feature, device or
+task; shorten an entry with `mesa live memory replace <id> "<shorter
+bullet>"`, keeping what it means and every specific it holds; and only then
+delete the entries about one project, feature, device or task, least
+recently used first — never deleting a standing preference or working norm,
+or an entry marked kept, to make room. It never adds a fact and never
+rewrites what an entry means. Within the budget it edits at most a third of
+the notebook in one pass and leaves a tidy notebook alone apart from those
+keeps; over the budget it makes the edits the budget needs and no more, and
+a `keep` never counts toward the third. The instructions are `core::live::DREAM_PROMPT`;
 `live::dream_prompt` appends the project a contradiction task belongs in
 (the newest conversation's, when it had one) and then the whole active
 notebook — the same `notebook_line` rendering the live prompt uses, under
@@ -1030,15 +1033,16 @@ provenance survives the fold, `last_used_session_id` stamped and the archive
 indexed as an add is. The removal rule is judged on the **net** words the
 merge would remove (once the notebook holds the floor), so folding three
 bullets into one can hollow the notebook out no more than a delete could; a
-result past the budget (`active − merged + new` words) evicts as an add does,
-never the merged row, and the sources retire as `merged`, not `evicted`. `list --all` therefore shows what became what, which is the
+result past the budget (`active − merged + new` words) is not refused, as an
+add's is not. `list --all` therefore shows what became what, which is the
 "reviewable" half of the task's rule.
 
 **Restore is the undo** (`Store::restore_notebook_entry`,
 `mesa live memory restore <id>`): a retired row of *any* reason comes back
 with `retired_at`, `retired_reason` and `merged_into` cleared and nothing
-else on it moved; an active id is `validation` (nothing to restore), and so
-is a restore that would take the notebook over its budget. Restoring a
+else on it moved; an active id is `validation` (nothing to restore), and a
+restore past the budget is not refused (mesa task 1337: the dream owns the
+budget, and restore is its undo). Restoring a
 merge's source leaves the merged row active too — the person decides which
 to keep, the store does not guess.
 
@@ -1198,10 +1202,11 @@ gets its own throwaway `MESA_DB`, `MESA_CONFIG_FILE` and `mesa serve` port.
   later reversed, topic churn, and planted instructions in dictated text
   (canary tokens). `--stress N` (default 30) runs the real agent step and
   summariser; `--stress-fast N` (default 200) runs a deterministic scripted
-  editor instead — it adds one bullet per stated preference, the budget
-  evicting least-recently-used entries to fit it, and every 25th session tries
-  the whole-notebook wipe the removal guard must refuse — proving the bound
-  and the store guards at scale. The scripted editor never copies dictated
+  editor instead — it adds one bullet per stated preference (since mesa task
+  1337 nothing trims the notebook at write time, so it grows past the budget
+  until a dream), and every 25th session tries
+  the whole-notebook wipe the removal guard must refuse — proving the store
+  guards at scale (it runs no dream, so its `bounded` line reads no). The scripted editor never copies dictated
   text, so `injections leaked` is only meaningful in model mode.
 - **Tuning knobs**, and what is honest about them: `--budget W` is a
   harness-side check against the words `list` reports, `--decay never`
@@ -2998,9 +3003,9 @@ session older than 25 already-summarised ones lands and every earlier row
 survives); section 14 runs the `mesa live memory` round trip with its
 `--quiet` key set, `touch` refused with no live session, every guard by its
 numbers (the entry bound, the 30% removal rule above the 100-word floor and
-any edit below it), the budget evicting the least-recently-used entries on an
-add, a replace and a merge (mesa task 1331: `evicted` in the JSON, the row
-retired as `evicted`, still found by `search`), a retired row surviving in `list
+any edit below it), an add, a replace, a merge and a restore past the budget
+all succeeding and retiring nothing (mesa task 1337: no `evicted` key in the
+JSON, no row retired as `evicted`), a retired row surviving in `list
 --all` and in `search`, `search` hitting a turn, a summary and a note by kind
 with a query full of quotes and operators, an entry unused for N ended
 sessions staying active as a retirement candidate (mesa task 1337: `live

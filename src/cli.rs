@@ -29,11 +29,10 @@ use crate::core::{
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch,
     FrameShape, ImportDoc, InboxItem, InboxKind, LIVE_TEXT_MAX, LibraryBundle, LibraryItem,
     LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus, LiveAction, LiveBoard,
-    LiveBoardKind, LiveNotebookEntry, LiveNotebookWrite, LiveNotice, LiveRole, LiveSession,
-    LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch,
-    Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch,
-    TaskReceipt, agents, board, cc, config, files, git, library, live, look, migrate,
-    project_memory, receipt, retro, system,
+    LiveBoardKind, LiveNotebookEntry, LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary,
+    LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch, Result, Script, ScriptArg,
+    ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch, TaskReceipt, agents, board, cc,
+    config, files, git, library, live, look, migrate, project_memory, receipt, retro, system,
 };
 
 const TOP_AFTER_HELP: &str = "\
@@ -2392,7 +2391,7 @@ EXAMPLES
   mesa live memory list
   mesa live memory list --all")]
     List {
-        /// Include retired entries (deleted, evicted, merged) — the archive's view
+        /// Include retired entries (deleted, merged, and old evicted or decayed rows) — the archive's view
         #[arg(long)]
         all: bool,
     },
@@ -2411,9 +2410,9 @@ EXAMPLES
     /// a pointer to a task id — something the person said outright. Never
     /// task status, never a guess about the person. Type the text after `add`
     /// (quoting is optional; words are joined) — put --quiet BEFORE it,
-    /// exactly as `live say` requires. Past the notebook's word budget the
-    /// least-recently-used entries are retired as `evicted` (still searchable,
-    /// `restore` undoes it) and listed in the printed `evicted` array.
+    /// exactly as `live say` requires. Never refused or trimmed for the
+    /// notebook's 500-word budget: the dream pass between conversations
+    /// keeps it.
     #[command(after_help = "\
 EXAMPLES
   mesa live memory add Prefers short spoken replies; no lists read aloud.
@@ -2433,7 +2432,7 @@ EXAMPLES
     ///
     /// Keeps the id and the provenance, stamps the session that edited it.
     /// `validation` when the edit removes more than 30% of the notebook's
-    /// words (once it holds 100). Past the budget it evicts, as `add` does.
+    /// words (once it holds 100). Never refused for the budget, as `add` is not.
     #[command(after_help = "\
 EXAMPLES
   mesa live memory replace 3 Prefers short spoken replies.
@@ -2473,8 +2472,8 @@ EXAMPLES
     /// Mark one entry as kept, a standing norm the dream pass decided stays; prints the record
     ///
     /// The dream pass's answer to an entry marked unused (mesa task 1337):
-    /// a kept entry is no longer a retirement candidate, and at the word
-    /// budget it is evicted only after every entry that is not kept. Needs no
+    /// a kept entry is no longer a retirement candidate, and the dream pass
+    /// never deletes it to bring the notebook within its budget. Needs no
     /// live session; keeping a kept entry changes nothing.
     Keep {
         #[arg(value_name = "ID")]
@@ -2509,8 +2508,8 @@ EXAMPLES
     /// `merged` with `merged_into` pointing at the new row, which takes the
     /// oldest source's provenance. Judged like a replace on the notebook it
     /// would leave: `validation` when the net words removed exceed the 30%
-    /// one edit may (once it holds 100), and past the budget it evicts, as
-    /// `add` does. Put --ids
+    /// one edit may (once it holds 100); never refused for the budget, as
+    /// `add` is not. Put --ids
     /// and --quiet BEFORE the text, exactly as `add` requires.
     #[command(after_help = "\
 EXAMPLES
@@ -2529,10 +2528,10 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Un-retire one entry — the undo for a delete, an eviction or a merge (or an old `decayed` row); prints the record
+    /// Un-retire one entry — the undo for a delete or a merge (or an old `decayed` or `evicted` row); prints the record
     ///
-    /// `validation` when the entry is active, or when restoring it would take
-    /// the notebook over its budget. Restoring a merge's source leaves the
+    /// `validation` when the entry is active; never refused for the budget,
+    /// which the dream pass keeps. Restoring a merge's source leaves the
     /// merged entry active too; delete whichever should go.
     Restore {
         #[arg(value_name = "ID")]
@@ -2544,8 +2543,8 @@ EXAMPLES
     /// Move one live-notebook entry into a project's notebook; prints the moved record
     ///
     /// For a bullet that turned out to be about one project (mesa task 1333).
-    /// Same id and provenance; judged against the project's budget, evicting
-    /// its least-recently-used entries as an add would.
+    /// Same id and provenance; never refused for the project's budget, as an
+    /// add is not.
     #[command(after_help = "\
 EXAMPLES
   mesa live memory move 12 --project naru")]
@@ -2581,8 +2580,8 @@ EXAMPLES
 /// resolved (its repo's root commit, else the nearest project `local_path`
 /// or previous path), and a folder no project holds is `not_found`. The
 /// rules are the live notebook's, per project: 600 characters an entry, a
-/// 500-word budget that evicts the least-recently-used entry, a 30% removal
-/// guard, soft retirement. An id from another notebook is `not_found`.
+/// 500-word budget that `naru memory dream` keeps (never enforced at write
+/// time), a 30% removal guard, soft retirement. An id from another notebook is `not_found`.
 #[derive(Subcommand)]
 enum MemoryCmd {
     /// List a project's notebook as a bare JSON array, oldest first (active entries only)
@@ -2593,7 +2592,7 @@ EXAMPLES
     List {
         #[arg(long, value_name = "PROJECT")]
         project: Option<String>,
-        /// Include retired entries (evicted, deleted, merged)
+        /// Include retired entries (deleted, merged, and old evicted rows)
         #[arg(long)]
         all: bool,
     },
@@ -2614,8 +2613,8 @@ EXAMPLES
     /// time: a build or test quirk, a convention, the reason behind a
     /// decision, a pointer to a task id. Type the text after `add` (quoting is
     /// optional; words are joined) — put --project and --quiet BEFORE it.
-    /// Past the notebook's word budget the least-recently-used entries are
-    /// retired as `evicted` and listed in the printed `evicted` array.
+    /// Never refused or trimmed for the notebook's word budget: `naru memory
+    /// dream` keeps it.
     #[command(after_help = "\
 EXAMPLES
   naru memory add --project naru Run cargo fmt before clippy.
@@ -2656,7 +2655,7 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Mark one entry as used, so it is the last to be evicted
+    /// Mark one entry as used, so it lists as recently used to the dream pass
     Touch {
         #[arg(long, value_name = "PROJECT")]
         project: Option<String>,
@@ -2684,10 +2683,9 @@ EXAMPLES
         #[arg(long)]
         quiet: bool,
     },
-    /// Un-retire one entry — the undo for an eviction, a delete or a merge
+    /// Un-retire one entry — the undo for a delete or a merge (or an old eviction)
     ///
-    /// `validation` when the entry is active, or when restoring it would take
-    /// the notebook over its budget.
+    /// `validation` when the entry is active; never refused for the budget.
     Restore {
         #[arg(long, value_name = "PROJECT")]
         project: Option<String>,
@@ -2716,7 +2714,8 @@ EXAMPLES
     /// Runs the `live-dream` config template with a project version of the
     /// dream prompt, in the project's folder (the workspace when it has
     /// none). The agent merges duplicates and deletes what a newer entry
-    /// supersedes, one guarded command at a time. With fewer than two active
+    /// supersedes, one guarded command at a time, and brings the notebook
+    /// back within its 500-word budget. With fewer than two active
     /// entries nothing is spawned and `{"spawned": false, "reason": ...}` is
     /// printed. Takes no --quiet.
     Dream {
@@ -2730,7 +2729,7 @@ EXAMPLES
     /// frontmatter `description` (or `name`) and body, cut to fit an entry.
     /// A file whose entry is already in the notebook is skipped, so a
     /// re-import adds nothing. --dry-run writes nothing and prints what would
-    /// be imported (ids null; evictions are not predicted). Takes no --quiet.
+    /// be imported (ids null). Takes no --quiet.
     Import {
         #[arg(long, value_name = "PROJECT")]
         project: Option<String>,
@@ -3979,25 +3978,6 @@ fn print_live_summary(summary: &LiveSummary, is_quiet: bool) {
 
 fn print_notebook_entry(entry: &LiveNotebookEntry, is_quiet: bool) {
     print_record(entry, is_quiet, QUIET_DROP_LIVE_NOTEBOOK);
-}
-
-/// Print what an `add`/`replace`/`merge` answers (mesa task 1331): the entry
-/// with its `evicted` array beside it. Under `--quiet` the key set is
-/// unchanged — the entry loses `body` and so does each evicted member, the
-/// composite rule (compact the members, keep the structure).
-fn print_notebook_write(write: &LiveNotebookWrite, is_quiet: bool) {
-    if is_quiet {
-        print_json(&quiet_notebook_write(write));
-    } else {
-        print_json(write);
-    }
-}
-
-fn quiet_notebook_write(write: &LiveNotebookWrite) -> serde_json::Value {
-    let mut value = quiet(&write.entry, QUIET_DROP_LIVE_NOTEBOOK);
-    value["evicted"] =
-        serde_json::Value::Array(quiet_all(&write.evicted, QUIET_DROP_LIVE_NOTEBOOK));
-    value
 }
 
 /// Print one task receipt: the full record, or the record minus
@@ -5752,10 +5732,10 @@ fn run_live_memory(store: &mut Store, cmd: LiveMemoryCmd) -> Result<()> {
             print_notebook_entry(&store.get_notebook_entry_in(None, id)?, quiet);
         }
         LiveMemoryCmd::Add { text, quiet } => {
-            print_notebook_write(&store.add_notebook_entry(&text.join(" "))?, quiet);
+            print_notebook_entry(&store.add_notebook_entry(&text.join(" "))?, quiet);
         }
         LiveMemoryCmd::Replace { id, text, quiet } => {
-            print_notebook_write(&store.replace_notebook_entry(id, &text.join(" "))?, quiet);
+            print_notebook_entry(&store.replace_notebook_entry(id, &text.join(" "))?, quiet);
         }
         LiveMemoryCmd::Delete { id, quiet } => {
             print_notebook_entry(&store.delete_notebook_entry(id)?, quiet);
@@ -5770,14 +5750,14 @@ fn run_live_memory(store: &mut Store, cmd: LiveMemoryCmd) -> Result<()> {
             print_json(&store.search_live_memory(&words.join(" "), limit)?);
         }
         LiveMemoryCmd::Merge { ids, text, quiet } => {
-            print_notebook_write(&store.merge_notebook_entries(&ids, &text.join(" "))?, quiet);
+            print_notebook_entry(&store.merge_notebook_entries(&ids, &text.join(" "))?, quiet);
         }
         LiveMemoryCmd::Restore { id, quiet } => {
             print_notebook_entry(&store.restore_notebook_entry(id)?, quiet);
         }
         LiveMemoryCmd::Move { id, project, quiet } => {
             let project = resolve_project(store, &project)?;
-            print_notebook_write(&store.move_notebook_entry(id, project)?, quiet);
+            print_notebook_entry(&store.move_notebook_entry(id, project)?, quiet);
         }
         LiveMemoryCmd::Dream => spawn_live_dream(store)?,
     }
@@ -5805,7 +5785,7 @@ fn run_memory(cmd: MemoryCmd) -> Result<()> {
             quiet,
         } => {
             let p = memory_project(store, project.as_deref())?;
-            print_notebook_write(
+            print_notebook_entry(
                 &store.add_notebook_entry_in(Some(p), &text.join(" "))?,
                 quiet,
             );
@@ -5817,7 +5797,7 @@ fn run_memory(cmd: MemoryCmd) -> Result<()> {
             quiet,
         } => {
             let p = memory_project(store, project.as_deref())?;
-            print_notebook_write(
+            print_notebook_entry(
                 &store.replace_notebook_entry_in(Some(p), id, &text.join(" "))?,
                 quiet,
             );
@@ -5837,7 +5817,7 @@ fn run_memory(cmd: MemoryCmd) -> Result<()> {
             quiet,
         } => {
             let p = memory_project(store, project.as_deref())?;
-            print_notebook_write(
+            print_notebook_entry(
                 &store.merge_notebook_entries_in(Some(p), &ids, &text.join(" "))?,
                 quiet,
             );
@@ -5944,11 +5924,11 @@ fn spawn_memory_dream(store: &Store, project_id: i64) -> Result<()> {
 }
 
 /// `naru memory import`: one entry per Claude Code memory topic file
-/// (`project_memory::import_body`), through the ordinary add path so the
-/// budget evicts as it would for any add. A file whose entry is already
-/// in the notebook, active or retired — or was already taken from an
-/// earlier file in this run — is skipped, which is what makes a re-import
-/// add nothing, even after the budget evicted some of the first import.
+/// (`project_memory::import_body`), through the ordinary add path. A file
+/// whose entry is already in the notebook, active or retired — or was
+/// already taken from an earlier file in this run — is skipped, which is
+/// what makes a re-import add nothing, even after a dream or a person
+/// retired some of the first import.
 fn import_memory(
     store: &mut Store,
     project_id: i64,
@@ -5985,9 +5965,9 @@ fn import_memory(
         })
         .collect();
     files.sort();
-    // Retired entries count too: an entry an earlier import added and the
-    // budget has since evicted (or a person deleted) must not come back on
-    // a re-import — that is what keeps a re-import at the budget a no-op.
+    // Retired entries count too: an entry an earlier import added and a
+    // dream or a person has since retired must not come back on a
+    // re-import — that is what keeps a re-import a no-op.
     let mut seen: std::collections::HashMap<String, &str> = store
         .list_notebook_in(Some(project_id), true)?
         .into_iter()
@@ -6000,7 +5980,7 @@ fn import_memory(
             (e.body, reason)
         })
         .collect();
-    let (mut imported, mut skipped, mut evicted) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut imported, mut skipped) = (Vec::new(), Vec::new());
     for path in files {
         let file = path
             .file_name()
@@ -6026,16 +6006,14 @@ fn import_memory(
             imported.push(json!({ "file": file, "id": null }));
             continue;
         }
-        let write = store.add_notebook_entry_in(Some(project_id), &body)?;
-        imported.push(json!({ "file": file, "id": write.entry.id }));
-        evicted.extend(write.evicted.iter().map(|e| e.id));
+        let entry = store.add_notebook_entry_in(Some(project_id), &body)?;
+        imported.push(json!({ "file": file, "id": entry.id }));
     }
     print_json(&json!({
         "project_id": project_id,
         "source": source.to_string_lossy(),
         "imported": imported,
         "skipped": skipped,
-        "evicted": evicted,
     }));
     Ok(())
 }
@@ -7968,42 +7946,6 @@ mod tests {
             ))),
             minus(&full, QUIET_DROP_LIVE_NOTEBOOK),
         );
-    }
-
-    /// mesa task 1331: an add/replace/merge answers the entry flattened plus
-    /// `evicted`; `--quiet` keeps that key set, dropping `body` from the
-    /// entry and from every evicted member.
-    #[test]
-    fn live_notebook_write_quiet_drops_body_everywhere() {
-        let mut gone = sample_notebook_entry();
-        gone.id = 1;
-        gone.retired_at = Some("2026-09-02 00:00:00".into());
-        gone.retired_reason = Some("evicted".into());
-        let write = LiveNotebookWrite {
-            entry: sample_notebook_entry(),
-            evicted: vec![gone],
-        };
-        let entry_keys = keys(&sample_notebook_entry());
-        let full = keys(&write);
-        let mut expected = entry_keys.clone();
-        expected.push("evicted".into());
-        assert_eq!(
-            sorted_owned(full.clone()),
-            sorted_owned(expected),
-            "LiveNotebookWrite gained/lost a field: decide whether it belongs in \
-             the --quiet shape before updating this test",
-        );
-        let q = quiet_notebook_write(&write);
-        assert_eq!(
-            sorted_owned(value_keys(&q)),
-            minus(&full, QUIET_DROP_LIVE_NOTEBOOK),
-        );
-        let member = &q["evicted"][0];
-        assert_eq!(
-            sorted_owned(value_keys(member)),
-            minus(&entry_keys, QUIET_DROP_LIVE_NOTEBOOK),
-        );
-        assert_eq!(member["retired_reason"], "evicted");
     }
 
     #[test]

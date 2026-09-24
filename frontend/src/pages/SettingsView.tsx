@@ -596,7 +596,7 @@ function KeymapSection() {
 /**
  * Memory: the live notebook (mesa task 1147) — the bullets earlier
  * conversations left for later ones, every active one riding in every live
- * agent's prompt under a hard word budget. Not a config section: the rows
+ * agent's prompt under a word budget the dream pass keeps. Not a config section: the rows
  * live in the db (`live_notebook`) and each is its own record, so this is a
  * list with an inline edit and a delete per row and an add box at the bottom
  * rather than one draft with one save button. Every write is one request for
@@ -706,8 +706,9 @@ function MemorySection() {
         The live notebook: what earlier conversations left for later ones —
         preferences, working norms, the reasons behind decisions, pointers to
         task ids. Every active entry is read by the agent holding the next
-        conversation, so it is budgeted: a write that would pass the budget
-        retires the least-recently-used entries to make room. Entries are
+        conversation, so it is budgeted: a write is never refused for the
+        budget, and the tidy pass between conversations brings the notebook
+        back within it. Entries are
         edited one at a time; an entry no conversation has used for ten
         sessions retires on its own, and a retired entry stays searchable
         with{' '}

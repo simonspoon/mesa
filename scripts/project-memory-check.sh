@@ -85,7 +85,7 @@ E1=$(jqs .id)
 [ "$(jqs .body)" = "Run cargo fmt before clippy." ] || fail "add: trailing words joined"
 [ "$(jqs .source_session_id)" = "null" ] && [ "$(jqs .last_used_session_id)" = "null" ] ||
   fail "a project entry carries no session provenance"
-[ "$(jqs '.evicted | length')" = "0" ] || fail "add: evicted is an empty array"
+[ "$(jqs 'has("evicted")')" = "false" ] || fail "add answers the plain entry, no evicted key"
 run 0 "$NARU" memory add --project Memo --quiet "scripts/build.sh refuses a dirty types folder."
 E2=$(jqs .id)
 [ "$(jqs 'has("body")')" = "false" ] || fail "add --quiet drops body"
@@ -246,7 +246,7 @@ run 0 "$NARU" memory list --project "$P"
 run 0 "$NARU" memory import --project "$P"
 [ "$(jqs '.imported | length')" = "2" ] || fail "import: two entries"
 IB=$(jqs '.imported[0].id')
-[ "$(jqs '.evicted | length')" = "0" ] || fail "import: nothing evicted"
+[ "$(jqs 'has("evicted")')" = "false" ] || fail "import: no evicted key"
 run 0 "$NARU" memory show --project "$P" "$IB"
 [ "$(jqs .body)" = "Run the gates in order — fmt, then clippy, then the tests." ] || fail "import: description + body (got $STDOUT)"
 run 0 "$NARU" memory list --project "$P"
@@ -261,25 +261,31 @@ run 0 "$NARU" memory import --project "$Q" --from "$MEM" --dry-run
 [ "$(jqs '.imported | length')" = "2" ] || fail "import --from reads the named folder"
 run 1 "$NARU" memory import --project "$Q" --from "$TMP/nowhere"
 [ "$(jqe .error.code)" = "not_found" ] || fail "import from a missing folder: not_found"
-# At the budget: three 250-word files overflow 500 words, so the first
-# import evicts; a re-import must still add nothing (the evicted entry is
-# retired, not gone).
+# Past the budget (mesa task 1337): four 250-word files make 1000 words, and
+# every one lands — nothing trims a notebook at write time. A re-import adds
+# nothing, and an entry since retired (a delete of 25%) stays skipped.
 BIG="$TMP/big-memory"
 mkdir -p "$BIG"
-for w in x y z; do
+for w in w x y z; do
   for _ in $(seq 1 250); do printf '%s ' "$w"; done >"$BIG/$w.md"
 done
 run 0 "$NARU" project create "Big" --no-git
 B=$(jqs .id)
 run 0 "$NARU" memory import --project "$B" --from "$BIG"
-[ "$(jqs '.imported | length')" = "3" ] && [ "$(jqs '.evicted | length')" = "1" ] ||
-  fail "import past the budget: three imported, one evicted (got $STDOUT)"
+[ "$(jqs '.imported | length')" = "4" ] && [ "$(jqs 'has("evicted")')" = "false" ] ||
+  fail "import past the budget: four imported, no evicted key (got $STDOUT)"
+BW=$(jqs '.imported[0].id')
+run 0 "$NARU" memory list --project "$B" --all
+[ "$(jqs 'map(select(.retired_at == null)) | length')" = "4" ] ||
+  fail "import past the budget retires nothing (got $STDOUT)"
+[ "$(jqs '[.[].body | split(" ") | map(select(. != "")) | length] | add')" = "1000" ] ||
+  fail "import past the budget: all 1000 words active (got $STDOUT)"
+run 0 "$NARU" memory delete --project "$B" "$BW"
 run 0 "$NARU" memory import --project "$B" --from "$BIG"
-[ "$(jqs '.imported | length')" = "0" ] && [ "$(jqs '.evicted | length')" = "0" ] ||
-  fail "re-import at the budget must add nothing (got $STDOUT)"
+[ "$(jqs '.imported | length')" = "0" ] || fail "re-import past the budget must add nothing (got $STDOUT)"
 [ "$(jqs '[.skipped[] | select(.reason == "already in the notebook, retired")] | length')" = "1" ] ||
-  fail "re-import names the evicted entry as retired (got $STDOUT)"
-ok "memory import: MEMORY.md skipped, description + body, long file cut with …, --dry-run writes nothing, re-import idempotent (at the budget too), missing folder not_found"
+  fail "re-import names the deleted entry as retired (got $STDOUT)"
+ok "memory import: MEMORY.md skipped, description + body, long file cut with …, --dry-run writes nothing, re-import idempotent (past the budget too, nothing retired), missing folder not_found"
 
 # ---- dream: through the live-dream template, stub claude ----
 STUB="$TMP/stub"
@@ -309,6 +315,9 @@ run 0 "$NARU" memory dream --project "$P"
 [ "$(cat "$STUB/last-cwd")" = "$REPO" ] || fail "dream runs in the project's folder (got $(cat "$STUB/last-cwd"))"
 grep -q "naru memory merge --project $P --ids" "$STUB/last-prompt" || fail "dream prompt names the project merge command"
 grep -q "Run cargo fmt before clippy" "$STUB/last-prompt" || fail "dream prompt carries the notebook"
+grep -q "of its 500 words. Entries are listed least recently used first." "$STUB/last-prompt" ||
+  fail "dream prompt opens its listing with the word count against the budget"
+grep -q "naru memory replace --project $P <entry id>" "$STUB/last-prompt" || fail "dream prompt names the project shorten command"
 ok "memory dream: nothing under two entries; otherwise the live-dream template in the project folder, prompt naming naru memory --project $P"
 
 # ---- the hook is a library built-in, enabled on SessionStart ----

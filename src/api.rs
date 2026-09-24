@@ -43,14 +43,14 @@ use crate::core::{
     EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch, FrameShape,
     GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree, InboxItem,
     InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP, LibraryBundle, LibraryImportResult, LibraryKind,
-    LibraryPatch, LibraryScope, LiveBoardKind, LiveContext, LiveNotebookEntry, LiveNotebookWrite,
-    LiveNotice, LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, ModelRates,
-    NaruVersion, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
-    ProjectGitStatus, ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch,
-    STALE_CLAIM_MINUTES, Script, ScriptArg, ScriptPatch, ScriptRunEvent, Status, Store, SystemInfo,
-    Task, TaskPatch, TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard,
-    hooks, inbox_triage, library, listen, live, receipt, retro, script_runs, scripts, speech,
-    supervisor, system, validate_live_client, version,
+    LibraryPatch, LibraryScope, LiveBoardKind, LiveContext, LiveNotebookEntry, LiveNotice,
+    LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow, ModelRates, NaruVersion,
+    NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog, ProjectGitStatus,
+    ProjectGitView, ProjectPatch, ProjectVersion, ReceiptPatch, STALE_CLAIM_MINUTES, Script,
+    ScriptArg, ScriptPatch, ScriptRunEvent, Status, Store, SystemInfo, Task, TaskPatch,
+    TaskSummary, Waypoint, agents, attachments, board, config, files, git, guard, hooks,
+    inbox_triage, library, listen, live, receipt, retro, script_runs, scripts, speech, supervisor,
+    system, validate_live_client, version,
 };
 
 /// The Vite build output, embedded into the binary at compile time.
@@ -4031,9 +4031,9 @@ async fn list_live_memory(
     Ok(Json(state.store.lock().unwrap().list_notebook(false)?))
 }
 
-/// `POST /api/live/memory` — adds one entry; past the word budget the
-/// least-recently-used entries are retired as `evicted` and listed in the
-/// answer's `evicted` array (mesa task 1331), exactly as the CLI prints.
+/// `POST /api/live/memory` — adds one entry; 422 `validation` for the entry
+/// length bound. Never refused for the word budget, which the dream pass
+/// keeps (mesa task 1337).
 async fn add_live_memory(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -4047,15 +4047,15 @@ async fn add_live_memory(
 }
 
 /// `PATCH /api/live/memory/{id}` — rewrites one entry in place; 422 past the
-/// removal guard, 404 for a retired or unknown id, and past the word budget
-/// it evicts as `POST` does.
+/// removal guard, 404 for a retired or unknown id; never refused for the
+/// word budget, as `POST` is not.
 async fn replace_live_memory(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     body: Result<Json<NotebookWrite>, JsonRejection>,
-) -> ApiResult<Json<LiveNotebookWrite>> {
+) -> ApiResult<Json<LiveNotebookEntry>> {
     require_agent_access(&state, &addr, &headers)?;
     let Json(body) = body?;
     Ok(Json(

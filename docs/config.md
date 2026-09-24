@@ -39,7 +39,7 @@ from the vocabulary (see *Retired placeholders* below).
 session is both a Naru record (so it has an `{id}` and a `{name}`) *and* a
 spawn that carries a prompt. **Naru supplies that prompt itself** —
 `core::live::agent_prompt`, which since mesa task 1068 is only the session line
-(`Drive mesa live session <id> (lease <n>).`) plus any recalled memory of earlier
+(`Drive naru live session <id> (lease <n>).`) plus any recalled memory of earlier
 conversations. The instructions themselves are the **`naru-live` agent
 definition** in the library (`docs/library.md`): the loop on `mesa live
 listen`, the reply through `mesa live say` in spoken prose rather than

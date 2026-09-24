@@ -1075,7 +1075,7 @@ run 0 "$MESA" library show naru-live
 [ "$(jqs .path)" = ".claude/agents/naru-live.md" ] ||
   fail "naru-live must map to .claude/agents/naru-live.md, got $(jqs .path)"
 BUILTIN_DEF=$(jqs .body)
-grep -q "mesa live listen" <<<"$BUILTIN_DEF" ||
+grep -q "naru live listen" <<<"$BUILTIN_DEF" ||
   fail "fixture: the built-in definition must state the loop"
 grep -q "^name: naru-live$" <<<"$BUILTIN_DEF" ||
   fail "fixture: the built-in definition must carry YAML frontmatter naming the agent"
@@ -1090,7 +1090,7 @@ MESA_LIVE_STATUS=$(jqs '.[] | select(.path==".claude/agents/naru-live.md") | .st
 [ "$MESA_LIVE_STATUS" = "mesa-new" ] ||
   fail "with no file on disk, naru-live must be mesa-new, got $MESA_LIVE_STATUS"
 run 0 "$MESA" library sync apply --resolve '.claude/agents/naru-live.md=mesa' 
-grep -q "mesa live listen" "$CLAUDE_DIR/agents/naru-live.md" ||
+grep -q "naru live listen" "$CLAUDE_DIR/agents/naru-live.md" ||
   fail "sync apply (mesa wins) must write the definition to \$HOME/.claude/agents/naru-live.md"
 ok "the naru-live definition appears in sync status and sync apply writes it to \$HOME/.claude/agents"
 
@@ -1100,10 +1100,10 @@ rm -f "$STUB_DIR/last-prompt"
 run 0 "$MESA" live start
 S1=$(jqs .id)
 [ -f "$STUB_DIR/last-prompt" ] || fail "live start must spawn the stub claude"
-if grep -q "mesa live listen" "$STUB_DIR/last-prompt"; then
+if grep -q "naru live listen" "$STUB_DIR/last-prompt"; then
   fail "the loop must NOT be injected into the prompt any more: $(cat "$STUB_DIR/last-prompt")"
 fi
-grep -q "Drive mesa live session $S1 (lease 1)\." "$STUB_DIR/last-prompt" ||
+grep -q "Drive naru live session $S1 (lease 1)\." "$STUB_DIR/last-prompt" ||
   fail "live start must inject the session line: $(cat "$STUB_DIR/last-prompt")"
 run 0 "$MESA" live stop
 ok "the spawned prompt carries the session line only — the instructions are the agent definition"
@@ -1120,7 +1120,7 @@ You are a custom live agent. Be terse.'
 run 0 "$MESA" library show naru-live
 grep -q "Be terse." <<<"$(jqs .body)" ||
   fail "the forked body must REPLACE the built-in: $STDOUT"
-if grep -q "mesa live listen" <<<"$(jqs .body)"; then
+if grep -q "naru live listen" <<<"$(jqs .body)"; then
   fail "a fork replaces the built-in rather than extending it: $STDOUT"
 fi
 ok "editing naru-live forks it, and the forked body replaces the built-in definition"

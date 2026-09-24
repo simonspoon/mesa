@@ -665,12 +665,12 @@ got
 $(cat "$STUB_DIR/last-flags")"
 # The prompt is ONE argument, and since mesa task 1068 it carries the session
 # line and nothing else — the loop travels as the agent definition.
-grep -q "Drive mesa live session $S3" "$STUB_DIR/last-prompt" ||
+grep -q "Drive naru live session $S3" "$STUB_DIR/last-prompt" ||
   fail "live spawn: the prompt must be the session line naming the session it drives"
-if grep -q 'You are the voice of mesa' "$STUB_DIR/last-prompt"; then
+if grep -q 'You are the voice of Naru' "$STUB_DIR/last-prompt"; then
   fail "live spawn: the instruction block must NOT be injected into the prompt any more"
 fi
-if grep -q 'mesa live listen' "$STUB_DIR/last-prompt"; then
+if grep -q 'naru live listen' "$STUB_DIR/last-prompt"; then
   fail "live spawn: the loop belongs to the agent definition, not the prompt"
 fi
 [ "$(cat "$STUB_DIR/last-cwd")" = "$WORKDIR" ] ||
@@ -685,7 +685,7 @@ ok "live spawn: the built-in live-agent argv (--agent naru-live), the session na
 SEEDED="$HOME/.claude/agents/naru-live.md"
 [ -f "$SEEDED" ] ||
   fail "live spawn: must seed the naru-live agent definition at $SEEDED"
-grep -q 'mesa live listen' "$SEEDED" ||
+grep -q 'naru live listen' "$SEEDED" ||
   fail "the seeded agent definition must carry the loop"
 head -1 "$SEEDED" | grep -q -- '---' ||
   fail "the seeded agent definition must open with YAML frontmatter"
@@ -1887,7 +1887,7 @@ NOTE_POS=$(grep -bo "$NOTE_TEXT" "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1
 # text — and untrusted text may not sit above the rules (the plan's posture).
 # An argv log is the only place this can be checked as a fact about what was
 # actually sent, rather than about what `prompt_with` returned in isolation.
-SESSION_POS=$(grep -bo 'Drive mesa live session' "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
+SESSION_POS=$(grep -bo 'Drive naru live session' "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
 RECALL_POS=$(grep -bo "$RECALL_TEXT" "$STUB_DIR/last-prompt" | head -1 | cut -d: -f1)
 [ -n "$SESSION_POS" ] || fail "recall join: could not find the session line in the spawned prompt"
 [ -n "$RECALL_POS" ] || fail "recall join: could not find the recall text in the spawned prompt"
@@ -3356,7 +3356,7 @@ HS=$(jqs .id)
 [ "$(jqs .lease)" = "1" ] || fail "a fresh session holds lease 1 (got $(jqs .lease))"
 HA1=$(jqs .agent_id)
 [ "$HA1" = "$(cat "$STUB_DIR/last-id")" ] || fail "live start: the spawn receipt is the stub's newest id"
-[ "$(head -1 "$STUB_DIR/last-prompt")" = "Drive mesa live session $HS (lease 1)." ] ||
+[ "$(head -1 "$STUB_DIR/last-prompt")" = "Drive naru live session $HS (lease 1)." ] ||
   fail "a fresh spawn's first line carries lease 1: $(head -1 "$STUB_DIR/last-prompt")"
 FIRST_FLAGS=$(cat "$STUB_DIR/last-flags")
 for i in $(seq 1 6); do
@@ -3381,7 +3381,7 @@ ok "live handoff: exit 0, the same session with lease 2 and the successor's rece
 
 # The successor's prompt: the session line naming its lease, the note, and
 # exactly the last 10 of the 12 turns, in order.
-[ "$(head -1 "$STUB_DIR/last-prompt")" = "Drive mesa live session $HS (lease 2)." ] ||
+[ "$(head -1 "$STUB_DIR/last-prompt")" = "Drive naru live session $HS (lease 2)." ] ||
   fail "the successor's prompt starts with the session line naming lease 2: $(head -1 "$STUB_DIR/last-prompt")"
 grep -q "HANDOFF-MARKER: we were on the roadmap" "$STUB_DIR/last-prompt" ||
   fail "the note must reach the successor's prompt"

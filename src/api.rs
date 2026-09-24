@@ -15668,7 +15668,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             let head = format!("{}|proj: live {session_id}|", root.display());
             assert!(logged.starts_with(&head), "{logged}");
             assert!(
-                logged.contains(&format!("mesa live session {session_id}")),
+                logged.contains(&format!("naru live session {session_id}")),
                 "the session's own prompt must reach the agent: {logged}"
             );
 

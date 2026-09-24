@@ -1049,9 +1049,10 @@ with no field flag, is still the usage error rather than a legal no-op call.
 instructions live now. Since mesa task 1068 they are the `naru-live` **agent
 definition** (kind `agent`, user scope) rather than the `live-agent-prompt`
 *prompt* they were between tasks 919 and 1068: `core::live::AGENT_DEFINITION`
-is YAML frontmatter (`name`, `description`, `model`, `tools: Bash, Read, Agent`
-— the image reader `mesa live look` needs, and rule 12 delegates long
-jobs through, mesa task 1156) followed by `core::live::AGENT_PROMPT`,
+is YAML frontmatter (`name`, `description`, `model`, `effort` — and no
+`tools:` line since mesa task 1350, so the agent inherits every tool,
+including the image reader `naru live look` needs and the `Agent` tool rule
+12 delegates long jobs through, mesa task 1156) followed by `core::live::AGENT_PROMPT`,
 the loop text, unchanged.
 
 Being an `agent` rather than a `prompt` gives it a real path,
@@ -1077,7 +1078,7 @@ as an error and both spawn sites treat it exactly like a failed spawn —
 `unavailable`, and the session that was just opened is ended again.
 
 What `core::live::agent_prompt(store, session_id)` injects is now only what the
-definition cannot know: `Drive mesa live session <id> (lease <n>).`, plus the recall block
+definition cannot know: `Drive naru live session <id> (lease <n>).`, plus the recall block
 of earlier session summaries when there are any. Forking `naru-live`
 **replaces** the built-in rather than extending it — the same rule the old
 config key followed, just moved: what the forked row holds is the whole of what

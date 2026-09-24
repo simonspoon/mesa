@@ -186,7 +186,7 @@ exactly like a failed spawn — `unavailable`, and the session that was just
 opened is ended again.
 
 What `live::agent_prompt(store, id)` injects is therefore only what the
-definition cannot know: `Drive mesa live session <id>.`, plus the recall block
+definition cannot know: `Drive naru live session <id>.`, plus the recall block
 below when there are earlier summaries. Editing the built-in forks it into a db
 row and a fork replaces the built-in, as everywhere else in the library; before
 mesa task 919 this block was `~/.mesa/config.json`'s `live.prompt`, and before
@@ -444,7 +444,7 @@ the other side, one step later.
 is what stops the outgoing agent from driving on after it has handed off.
 Every driving verb — `listen`, `say`, `navigate`, `sidebars` — takes
 `--lease <n>`, and the agent definition tells the agent to pass the lease
-from the first line of its prompt (`Drive mesa live session <id> (lease
+from the first line of its prompt (`Drive naru live session <id> (lease
 <n>).`; a fresh conversation's is 1) on every one of them. When a lease is
 presented, `Store::check_live_lease` runs **before** the write: a lease the
 session no longer holds is `conflict` ("… is no longer held (current lease
@@ -479,7 +479,7 @@ are byte-identical to its predecessor's — and everything that is
 per-session is **appended** after that shared prefix, never prepended, so
 the cached prefix carries over. The order is:
 
-1. `Drive mesa live session <id> (lease <n>).` — the same first line a
+1. `Drive naru live session <id> (lease <n>).` — the same first line a
    fresh spawn gets, with the lease the successor must present.
 2. The notebook block, then the single most recent summary — unchanged.
 3. The handoff block, introduced as *the note the agent driving this
@@ -843,7 +843,7 @@ first seed.
 `core::live::prompt_with` now builds three parts, in this order, everything
 after the first **appended, never prepended**:
 
-1. `Drive mesa live session <id> (lease <n>).` — the lease is 1 for a fresh
+1. `Drive naru live session <id> (lease <n>).` — the lease is 1 for a fresh
    conversation and the successor's generation after a handoff (mesa task
    1150, above); with no history at all the prompt is this line alone, which
    keeps every existing prompt test and the spawn-argv gate honest.

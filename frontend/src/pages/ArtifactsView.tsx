@@ -59,7 +59,7 @@ function ArtifactMarkdownPreview({ artifactId }: { artifactId: number }) {
   if (error) return <p className="error">{error}</p>
   if (!data) return <p className="muted">Loading…</p>
   return (
-    <div className="artifact-markdown-preview">
+    <div className="artifact-markdown-preview markdown-body markdown-doc">
       <Markdown text={data.body} />
     </div>
   )

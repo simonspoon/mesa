@@ -131,7 +131,7 @@ function BoardMarkdown({ id }: { id: number }) {
   if (error) return <p className="error">{error}</p>
   if (data === null) return <p className="muted">Loading…</p>
   return (
-    <div className="live-board-markdown">
+    <div className="live-board-markdown markdown-body markdown-doc">
       <Markdown text={data} />
     </div>
   )

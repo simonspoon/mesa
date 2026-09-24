@@ -6712,6 +6712,129 @@ body.live-sidebar-resizing {
   font-weight: 600;
 }
 
+/* A markdown *document* (mesa task 1360): a live whiteboard board and a kept
+   markdown artifact — something pushed to be read, and kept or sent on, not
+   a field in a form. Layered over `.markdown-body` (the element carries both
+   classes), and every rule is qualified by both so it outranks the shared
+   `:where()` rules above without touching the Files pane, the task modal or
+   the agent chat, which keep `.markdown-body` alone. */
+.markdown-body.markdown-doc {
+  padding: 1rem 1.25rem;
+  font-size: 0.92rem;
+  line-height: 1.65;
+  overflow-wrap: break-word;
+}
+.markdown-body.markdown-doc > :first-child {
+  margin-top: 0;
+}
+.markdown-body.markdown-doc > :last-child {
+  margin-bottom: 0;
+}
+.markdown-body.markdown-doc :where(h1, h2, h3, h4, h5, h6) {
+  font-family: var(--font-display);
+  color: var(--text-h);
+  line-height: 1.3;
+  margin: 1.5rem 0 0.6rem;
+}
+/* h1/h2 keep the app's own title treatment (index.css: uppercase, spaced,
+   glowing); h1 gets a rule under it as the document's masthead. */
+.markdown-body.markdown-doc :where(h1) {
+  font-size: 1.35rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border);
+}
+.markdown-body.markdown-doc :where(h2) {
+  font-size: 1.05rem;
+}
+.markdown-body.markdown-doc :where(h3) {
+  font-size: 0.92rem;
+  letter-spacing: 0.04em;
+}
+.markdown-body.markdown-doc :where(h4, h5, h6) {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.markdown-body.markdown-doc :where(p, ul, ol, blockquote, table) {
+  margin: 0.75rem 0;
+}
+.markdown-body.markdown-doc :where(strong) {
+  color: var(--text-h);
+  font-weight: 700;
+}
+.markdown-body.markdown-doc :where(a) {
+  border-bottom: 1px solid var(--cyan-dim);
+}
+/* Inline code only — a fenced block's `<code>` is `.markdown-code-block`,
+   inside a `<pre>`, and keeps its own slab (Markdown.tsx's CODE_SLAB). */
+.markdown-body.markdown-doc :where(:not(pre) > code) {
+  padding: 0.05em 0.35em;
+  color: var(--text-h);
+}
+.markdown-body.markdown-doc :where(ul, ol) {
+  padding-left: 1.4rem;
+}
+.markdown-body.markdown-doc :where(li) {
+  margin: 0.25rem 0;
+}
+.markdown-body.markdown-doc :where(li > ul, li > ol) {
+  margin: 0.25rem 0;
+}
+.markdown-body.markdown-doc :where(li)::marker {
+  color: var(--cyan);
+}
+.markdown-body.markdown-doc :where(blockquote) {
+  padding: 0.4rem 0.9rem;
+  margin-left: 0;
+  margin-right: 0;
+  border-left: 2px solid var(--cyan-dim);
+  background: var(--panel-raised);
+  color: var(--muted);
+}
+.markdown-body.markdown-doc :where(hr) {
+  margin: 1.5rem 0;
+  border: none;
+  border-top: 1px solid var(--border);
+}
+/* Tables fill the document's width and wrap their cells, rather than
+   `.markdown-body`'s shrink-wrapped scroller: a board is read in a narrow
+   panel, where a max-content table is either cramped or cut off. A cell too
+   long for any width still wraps (`anywhere`); only the header keeps its
+   words whole. */
+.markdown-body.markdown-doc :where(table) {
+  display: table;
+  width: 100%;
+  border: 1px solid var(--border);
+  font-size: 0.88rem;
+}
+.markdown-body.markdown-doc :where(th, td) {
+  padding: 0.55rem 0.8rem;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+.markdown-body.markdown-doc :where(td) {
+  overflow-wrap: anywhere;
+}
+.markdown-body.markdown-doc :where(th) {
+  background: var(--panel-raised);
+  color: var(--text-h);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border-bottom: 1px solid var(--border-bright);
+}
+.markdown-body.markdown-doc :where(tbody tr:last-child td) {
+  border-bottom: none;
+}
+.markdown-body.markdown-doc :where(tbody tr:hover td) {
+  background: rgba(0, 229, 255, 0.03);
+}
+
 /* Leading YAML frontmatter block (task 283) — a bordered panel above the
    rendered body, visually distinct from prose so it reads as document
    metadata rather than markdown content. */
@@ -9724,6 +9847,20 @@ button:focus-visible,
    takes the pointer from it instead. */
 .live-board-markdown {
   flex: 1 0 auto;
+}
+
+/* The board's markdown reads as a sheet on the panel's near-black (mesa task
+   1360); the prose inside is `.markdown-doc`, shared with kept artifacts. */
+.live-board-markdown.markdown-doc {
+  min-width: min-content;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+
+/* The board's name is the document's title: the head's display line, lit
+   like every other h1/h2 in the app (index.css). */
+.live-board-head .live-head-title {
+  text-shadow: 0 0 12px var(--cyan-dim);
 }
 
 /* The head (mesa task 1069): the panel's instrument cluster — three stacked

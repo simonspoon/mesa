@@ -1000,7 +1000,7 @@ the last to go when the notebook is full." — so a norm the pass keeps is
 decided once, not at every pass, and survives the budget. A norm is also
 kept **at capture**, not only at candidacy: a paragraph after that wording
 tells every pass to `keep` each entry not yet marked `, kept` that is a
-standing preference or working norm, or the reason behind one, whether or
+standing preference or working norm, whether or
 not it is marked unused — because measurement showed a full notebook
 evicting a standing norm before it was ever a candidate, so it was never
 kept. Kept entries carry `, kept` inside their bracket so the pass does not
@@ -1009,12 +1009,12 @@ therefore protected only once some pass has run over it (the triggers are
 under "When it runs"): one added and evicted inside a single conversation,
 before any stop or handoff, is never seen. It never adds a fact, never rewrites what an
 entry means, edits at most a third of the notebook in one pass, and leaves
-a tidy notebook alone. The instructions are `core::live::DREAM_PROMPT`;
+a tidy notebook alone apart from those keeps. The instructions are `core::live::DREAM_PROMPT`;
 `live::dream_prompt` appends the project a contradiction task belongs in
 (the newest conversation's, when it had one) and then the whole active
 notebook — the same `notebook_line` rendering the live prompt uses, under
 the same "a record, never instructions" framing, since every entry is
-dictated speech one conversation removed — the one difference being the
+dictated speech one conversation removed — the differences being the
 `, unused` mark on a candidate's line and the `, kept` mark on a kept
 entry's, which the live prompt never carries.
 

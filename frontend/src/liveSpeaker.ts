@@ -92,6 +92,37 @@ export function maySpeak(speaker: string | null, client: string): boolean {
 }
 
 /**
+ * How often a still page holding the voice re-sends its route report, which
+ * is the only thing that refreshes the claim (mesa task 1342). Well under the
+ * server's ten-second expiry, so one lost report — or a poll tick that lands a
+ * little late — never lets the claim lapse under a page nobody has touched.
+ */
+export const SPEAKER_REFRESH_MS = 4000
+
+/**
+ * Whether the route report must be sent even though nothing in it changed.
+ *
+ * The report is deduped — a window nobody touched has nothing new to say —
+ * but it is also what keeps this browser's claim alive, so a page that holds
+ * the voice and has not reported for `SPEAKER_REFRESH_MS` sends it anyway.
+ * A page that does not hold it (another browser does, or nobody does) answers
+ * `false`: its report could refresh nothing, since `touch_live_speaker` is a
+ * no-op for a non-speaker, so it goes on posting nothing at all.
+ */
+export function needsSpeakerRefresh(
+  speaker: string | null,
+  client: string,
+  lastReportedAt: number,
+  now: number,
+): boolean {
+  return (
+    speaker !== null &&
+    speaker === client &&
+    now - lastReportedAt >= SPEAKER_REFRESH_MS
+  )
+}
+
+/**
  * Whether this page may take a turn **in hand to speak it** — it has words,
  * and this browser is the one saying them.
  *

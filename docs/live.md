@@ -2149,14 +2149,19 @@ So a live session names at most one **speaker**:
 - **A poll can never take it.** The page's ordinary route report carries the
   same id, but only as a *refresh*: `Store::touch_live_speaker` moves
   `speaker_seen_at` when that client already is the speaker and does nothing
-  at all when it is not. A browser sitting in a background tab reports its
-  route every two seconds for the whole conversation, and never once pulls the
-  voice away from the one the person is talking to.
+  at all when it is not. A browser sitting in a background tab may report its
+  route for the whole conversation, and never once pulls the voice away from
+  the one the person is talking to.
 - **A claim expires.** `speaker` is derived on every read
   (`LIVE_SESSION_COLUMNS`): a claim that has not been refreshed for **ten
-  seconds** reads back as `null`. The refresh rides on a report the page
-  already makes twice a second more often than that, so an open tab keeps the
-  voice with slack to spare — and a tab that was *closed* stops refreshing,
+  seconds** reads back as `null`. The refresh rides on the route report,
+  which is otherwise deduped — a page nobody touches has nothing new to say,
+  and posts nothing — so a page that **holds** the claim sends it anyway once
+  its last one is `SPEAKER_REFRESH_MS` (4 s) old
+  (`liveSpeaker.ts::needsSpeakerRefresh`, mesa task 1342), checked on the
+  two-second live poll. An open tab therefore keeps the voice with slack to
+  spare, a still page that does *not* hold it still posts nothing (its report
+  could refresh nothing) — and a tab that was *closed* stops refreshing,
   which frees the conversation instead of leaving it mute for the browsers
   still in it. The ten seconds are judged in SQL on the **store's** clock, the
   posture `stale_claim_minutes` takes: a browser with a skewed clock does not

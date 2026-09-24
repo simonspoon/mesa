@@ -55,7 +55,11 @@ import {
   type InkBook,
 } from '../liveInk'
 import { isPausePhrase } from '../livePausePhrase'
-import { liveClientId, spokenTurnVerdict } from '../liveSpeaker'
+import {
+  liveClientId,
+  needsSpeakerRefresh,
+  spokenTurnVerdict,
+} from '../liveSpeaker'
 import {
   audioInputs,
   chosenInput,
@@ -2548,7 +2552,15 @@ export function LiveHub({
     route: string
     context: LiveContext | null
     window: LiveWindow | null
+    at: number
   } | null>(null)
+  // The claim as the last poll read it, for the dedupe below to consult
+  // without `reportRoute` being rebuilt — and its poll restarted — every time
+  // the session object is.
+  const speakerRef = useRef<string | null>(null)
+  useEffect(() => {
+    speakerRef.current = session?.speaker ?? null
+  }, [session?.speaker])
   const reportRoute = useCallback(() => {
     if (reportTimer.current !== null) window.clearTimeout(reportTimer.current)
     reportTimer.current = window.setTimeout(() => {
@@ -2568,7 +2580,10 @@ export function LiveHub({
         last !== null &&
         last.route === route &&
         sameContext(last.context, context) &&
-        sameBox(last.window, box)
+        sameBox(last.window, box) &&
+        // …unless this page holds the voice: the report is the only thing
+        // that refreshes the claim, and a still page must not let it lapse.
+        !needsSpeakerRefresh(speakerRef.current, client, last.at, Date.now())
       ) {
         return
       }
@@ -2576,7 +2591,7 @@ export function LiveHub({
       // next trigger rather than being treated as already told.
       reportLiveRoute(route, context, box, client)
         .then(() => {
-          reported.current = { route, context, window: box }
+          reported.current = { route, context, window: box, at: Date.now() }
         })
         .catch(() => {})
     }, REPORT_DEBOUNCE_MS)
@@ -2602,7 +2617,9 @@ export function LiveHub({
   // there being none to fire, so the only way to notice it is to look. Looking
   // costs nothing: the sample is four properties the browser already has, and
   // the dedupe above swallows every tick where the box is where it was, so a
-  // window nobody touched posts exactly nothing for the whole conversation.
+  // window nobody touched posts nothing — unless it holds the voice, when it
+  // re-reports every `SPEAKER_REFRESH_MS` (~4 s), since that report is what
+  // keeps its claim from reading back as `null` after ten seconds.
   useEffect(() => {
     if (!live) return
     reportRoute()

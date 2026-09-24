@@ -3,6 +3,8 @@ import {
   liveClientId,
   MAX_LIVE_CLIENT_ID,
   maySpeak,
+  needsSpeakerRefresh,
+  SPEAKER_REFRESH_MS,
   spokenTurnVerdict,
   takesToSpeak,
 } from './liveSpeaker'
@@ -149,5 +151,54 @@ describe('spokenTurnVerdict', () => {
   it('leaves a turn that says nothing, which the action path stamps itself', () => {
     const silent = turn(5, { text: '', action: 'navigate', target: '#/inbox' })
     expect(spokenTurnVerdict(silent, 'tab-a', 'tab-a', true)).toBe('leave')
+  })
+})
+
+describe('needsSpeakerRefresh', () => {
+  // The server reads a claim back as `null` once it is this old.
+  const EXPIRY_MS = 10_000
+
+  it('re-reports for the holder once its last report is stale', () => {
+    expect(needsSpeakerRefresh('tab-a', 'tab-a', 0, SPEAKER_REFRESH_MS)).toBe(true)
+    expect(needsSpeakerRefresh('tab-a', 'tab-a', 0, 9_000)).toBe(true)
+  })
+
+  it('stays quiet for the holder while its last report is fresh', () => {
+    expect(
+      needsSpeakerRefresh('tab-a', 'tab-a', 0, SPEAKER_REFRESH_MS - 1),
+    ).toBe(false)
+    expect(needsSpeakerRefresh('tab-a', 'tab-a', 1_000, 2_000)).toBe(false)
+  })
+
+  it('never re-reports for a page that does not hold the voice', () => {
+    expect(needsSpeakerRefresh('tab-a', 'tab-b', 0, 60_000)).toBe(false)
+  })
+
+  it('never re-reports while nobody holds the voice', () => {
+    expect(needsSpeakerRefresh(null, 'tab-a', 0, 60_000)).toBe(false)
+  })
+
+  it('keeps a still holder refreshed across the expiry while a non-holder posts nothing', () => {
+    // A still page: the live poll ticks every 2 s, and every tick's report is
+    // otherwise deduped. Only the refresh predicate can send one.
+    const POLL = 2_000
+    const still = (speaker: string, client: string): number[] => {
+      let last = 0 // the report the press itself made
+      const sent = [0]
+      for (let now = POLL; now <= 30_000; now += POLL) {
+        if (needsSpeakerRefresh(speaker, client, last, now)) {
+          last = now
+          sent.push(now)
+        }
+      }
+      return sent
+    }
+    const holder = still('tab-a', 'tab-a')
+    expect(holder.length).toBeGreaterThan(1)
+    for (let i = 1; i < holder.length; i++) {
+      expect(holder[i] - holder[i - 1]).toBeLessThan(EXPIRY_MS)
+    }
+    expect(30_000 - holder[holder.length - 1]).toBeLessThan(EXPIRY_MS)
+    expect(still('tab-a', 'tab-b')).toEqual([0])
   })
 })

@@ -2510,17 +2510,40 @@ pub fn audio_url() -> Result<String, String> {
 }
 
 fn audio_url_in(path: &Path) -> Result<String, String> {
-    if let Some(url) = crate::core::env::var("AUDIO_URL")
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    {
-        return Ok(url);
+    let env = crate::core::env::var("AUDIO_URL");
+    let (url, warning) = pick_audio_url(env.as_deref(), read_audio(path)?.url.as_deref());
+    if let Some(warning) = warning {
+        // Read on every request: warn once per bad value, not once per probe.
+        static WARNED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        if warned.as_deref() != env.as_deref() {
+            eprintln!("{warning}");
+            *warned = env;
+        }
     }
-    Ok(read_audio(path)?
-        .url
-        .map(|v| v.trim().to_string())
+    Ok(url)
+}
+
+/// The daemon URL from the environment's value and the config's, each held
+/// to [`validate_audio_url`]: a valid non-empty env value wins, else a valid
+/// config value, else [`audio::DEFAULT_URL`]. The second half is the warning
+/// to print when a non-empty env value was refused.
+fn pick_audio_url(env: Option<&str>, config: Option<&str>) -> (String, Option<String>) {
+    let config = config
+        .map(str::trim)
         .filter(|v| validate_audio_url(v).is_ok())
-        .unwrap_or_else(|| audio::DEFAULT_URL.to_string()))
+        .unwrap_or(audio::DEFAULT_URL);
+    match env.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) if validate_audio_url(v).is_ok() => (v.to_string(), None),
+        Some(v) => (
+            config.to_string(),
+            Some(format!(
+                "warn NARU_AUDIO_URL {v:?} is not a plain http://host[:port] address; \
+                 using {config}"
+            )),
+        ),
+        None => (config.to_string(), None),
+    }
 }
 
 /// The audio settings for the Settings page (`GET /api/config/audio`): each
@@ -5887,7 +5910,39 @@ mod tests {
             std::env::remove_var("MESA_AUDIO_URL");
         }
         assert_eq!(audio_url_in(&path).unwrap(), "http://127.0.0.1:9000");
+        // An unusable env value falls through to the config, not past it.
+        unsafe { std::env::set_var("NARU_AUDIO_URL", "https://127.0.0.1:9003") };
+        assert_eq!(audio_url_in(&path).unwrap(), "http://127.0.0.1:9000");
         unsafe { std::env::remove_var("NARU_AUDIO_URL") };
+    }
+
+    #[test]
+    fn a_bad_audio_url_env_value_falls_through_with_a_warning() {
+        let good = "http://127.0.0.1:9000";
+        assert_eq!(
+            pick_audio_url(Some("http://localhost:9001"), Some(good)),
+            ("http://localhost:9001".to_string(), None)
+        );
+        for bad in [
+            "https://127.0.0.1:9001",
+            "127.0.0.1:9001",
+            "http://x/health",
+        ] {
+            let (url, warning) = pick_audio_url(Some(bad), Some(good));
+            assert_eq!(url, good, "{bad}");
+            let warning = warning.expect("a refused env value warns");
+            assert!(warning.contains(bad) && warning.contains(good), "{warning}");
+            // …and past a bad config value too, to the built-in.
+            let (url, warning) = pick_audio_url(Some(bad), Some("https://nope"));
+            assert_eq!(url, audio::DEFAULT_URL);
+            assert!(warning.is_some());
+        }
+        // Empty is unset, not bad: no warning.
+        assert_eq!(
+            pick_audio_url(Some(" "), None),
+            (audio::DEFAULT_URL.to_string(), None)
+        );
+        assert_eq!(pick_audio_url(None, Some(good)), (good.to_string(), None));
     }
 
     #[test]

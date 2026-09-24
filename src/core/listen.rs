@@ -121,7 +121,8 @@ pub fn status() -> Result<TranscribeStatus, String> {
         AudioEngine::NaruAudio => {
             let probe = audio::probe(&config::audio_url()?);
             TranscribeStatus {
-                available: probe.state == AudioState::Ready,
+                // The POST still runs auris; naru-audio design task 17 switches this to the probe.
+                available: !models().is_empty(),
                 state: probe.state,
                 engine: engine.as_str(),
                 url: Some(probe.url),
@@ -602,5 +603,55 @@ mod tests {
             with,
             Ok("-q --format json -m parakeet-tdt-0.6b-v2-int8".to_string())
         );
+    }
+
+    /// On `naru-audio`, `state` reports the daemon while `available` keeps
+    /// answering "can the POST decode", which still means auris (naru-audio
+    /// design task 17 switches it): a working auris with the daemon down is
+    /// available, a missing auris is not, whatever the daemon says.
+    #[test]
+    fn naru_audio_status_reports_the_daemon_but_available_follows_auris() {
+        let _config = crate::core::attachments::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _auris = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", dead.local_addr().unwrap().port());
+        drop(dead);
+        let config = dir.path().join("config.json");
+        std::fs::write(
+            &config,
+            format!(r#"{{"audio": {{"engine": "naru-audio", "url": "{url}"}}}}"#),
+        )
+        .unwrap();
+        let stub = dir.path().join("auris-lists-a-model.sh");
+        std::fs::write(&stub, "#!/bin/sh\necho parakeet-tdt-0.6b-v2-int8\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: both locks above serialize every test touching these vars.
+        unsafe {
+            std::env::remove_var("NARU_AUDIO_URL");
+            std::env::remove_var("MESA_AUDIO_URL");
+            std::env::set_var("MESA_CONFIG_FILE", &config);
+            std::env::set_var("MESA_AURIS_BIN", &stub);
+        }
+        let working = status().unwrap();
+        unsafe {
+            std::env::set_var("MESA_AURIS_BIN", dir.path().join("no-such-auris"));
+        }
+        let missing = status().unwrap();
+        unsafe {
+            std::env::remove_var("MESA_AURIS_BIN");
+            std::env::remove_var("MESA_CONFIG_FILE");
+        }
+
+        for (label, s) in [("auris working", &working), ("auris missing", &missing)] {
+            assert_eq!(s.engine, "naru-audio", "{label}");
+            assert_eq!(s.state, AudioState::DaemonDown, "{label}");
+            assert_eq!(s.url.as_deref(), Some(url.as_str()), "{label}");
+            assert!(s.message.is_some(), "{label}");
+        }
+        assert!(working.available, "auris decodes, so the POST works");
+        assert!(!missing.available, "no auris, no decoding");
     }
 }

@@ -46,8 +46,11 @@ The page's one ask, at the moment it joins a conversation, of whether
  "checked_at":"2026-09-24T12:00:03Z"}
 ```
 
-`available` keeps its meaning (`state == "ready"`) — it is still all the
-page reads. `state` is `ready | daemon_down | model_missing | incompatible |
+`available` keeps its meaning — "`POST /api/live/transcribe` can decode",
+i.e. `!listen::models().is_empty()` — on **both** engines, because the POST
+still runs `auris` until task 17 of the naru-audio design (§6.3) routes it
+through the daemon; only then does `available` follow the probe. It is still
+all the page reads. `state` is `ready | daemon_down | model_missing | incompatible |
 error`; `message` is the sentence to show (`null` when ready); `checked_at`
 is when the cached answer was taken (RFC 3339 UTC). A config file that
 cannot be read is **502 `unavailable`**.

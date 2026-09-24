@@ -42,12 +42,11 @@ export interface InkFrame {
 
 /** One board's ink. */
 export interface BoardInk {
-  /** What is drawn, oldest first. */
+  /** What is drawn and not yet sent, oldest first. A successful send drops
+   *  the strokes it carried: the PNG the server wrote is their record, and
+   *  once the layout unlocks nothing would keep them over what they marked. */
   strokes: readonly InkStroke[]
-  /** What the agent has seen — the strokes the last successfully sent turn
-   *  carried. Ink is *new* exactly when this is not what is drawn. */
-  seen: readonly InkStroke[]
-  /** The frozen layout — present exactly while there is new ink. */
+  /** The frozen layout — present exactly while there are strokes. */
   frame: InkFrame | null
 }
 
@@ -60,27 +59,22 @@ export function emptyInkBook(): InkBook {
   return {}
 }
 
-const BLANK: BoardInk = { strokes: [], seen: [], frame: null }
+const BLANK: BoardInk = { strokes: [], frame: null }
 
 /** One board's ink, or none. */
 export function boardInk(book: InkBook, boardId: number): BoardInk {
   return book[boardId] ?? BLANK
 }
 
-function sameStrokes(a: readonly InkStroke[], b: readonly InkStroke[]): boolean {
-  return a.length === b.length && a.every((stroke, i) => stroke === b[i])
-}
-
 /**
  * Whether a board carries ink the agent has not seen — the dirty flag.
  *
- * Set by any stroke and by any undo that changes what the agent last saw;
- * cleared by a send that carried it, and by clearing. Undoing every unsent
- * stroke is back to what was sent, so it is clean again rather than a turn
- * carrying a picture of nothing new.
+ * Every stroke on the board is unsent, since a send drops what it carried;
+ * so this is simply "is anything drawn". Undoing every stroke, or clearing,
+ * is clean again rather than a turn carrying a picture of nothing new.
  */
 export function inkIsNew(ink: BoardInk): boolean {
-  return !sameStrokes(ink.strokes, ink.seen)
+  return ink.strokes.length > 0
 }
 
 function withBoard(book: InkBook, boardId: number, ink: BoardInk): InkBook {
@@ -103,37 +97,33 @@ export function addStroke(
   const ink = boardInk(book, boardId)
   return withBoard(book, boardId, {
     strokes: [...ink.strokes, stroke],
-    seen: ink.seen,
-    frame: inkIsNew(ink) && ink.frame !== null ? ink.frame : frame,
+    frame: ink.frame ?? frame,
   })
 }
 
-/**
- * The newest stroke taken back. Unfreezes when that leaves nothing new; and
- * taking back a stroke the agent has already seen is itself new — the next
- * turn shows it gone — so that freezes at `frame`, the content box as it
- * stands, exactly as a stroke would.
- */
-export function undoStroke(book: InkBook, boardId: number, frame: InkFrame): InkBook {
+/** The newest stroke taken back. Unfreezes when that leaves nothing drawn. */
+export function undoStroke(book: InkBook, boardId: number): InkBook {
   const ink = boardInk(book, boardId)
   if (ink.strokes.length === 0) return book
   const strokes = ink.strokes.slice(0, -1)
-  const next: BoardInk = { strokes, seen: ink.seen, frame: ink.frame ?? frame }
-  return withBoard(book, boardId, inkIsNew(next) ? next : { ...next, frame: null })
+  return withBoard(book, boardId, {
+    strokes,
+    frame: strokes.length > 0 ? ink.frame : null,
+  })
 }
 
-/** Every stroke on a board wiped, sent or not — and the layout unfrozen, with
- *  nothing new to send. */
+/** Every stroke on a board wiped — and the layout unfrozen, with nothing new
+ *  to send. */
 export function clearInk(book: InkBook, boardId: number): InkBook {
   if (!(boardId in book)) return book
   return withBoard(book, boardId, BLANK)
 }
 
 /**
- * A turn carrying `strokes` was sent. The agent has now seen exactly those,
- * so the board is clean — and unfrozen — unless the person drew more while
- * the turn was on its way, in which case the later strokes are still new and
- * the layout stays where they were drawn.
+ * A turn carrying `strokes` was sent. Those strokes leave the board — the
+ * PNG on the turn is their record — so the board is clean and unfrozen,
+ * unless the person drew more while the turn was on its way: the later
+ * strokes are still new, and the layout stays where they were drawn.
  */
 export function markInkSent(
   book: InkBook,
@@ -142,11 +132,11 @@ export function markInkSent(
 ): InkBook {
   const ink = boardInk(book, boardId)
   // Cleared while the turn was on its way: clearing already unfroze the
-  // layout and said there is nothing to send, and a late answer must not
-  // freeze it again.
+  // layout, and a late answer has nothing left to take away.
   if (ink.frame === null) return book
-  const next: BoardInk = { ...ink, seen: strokes }
-  return withBoard(book, boardId, inkIsNew(next) ? next : { ...next, frame: null })
+  const sent = new Set(strokes)
+  const left = ink.strokes.filter((stroke) => !sent.has(stroke))
+  return withBoard(book, boardId, { strokes: left, frame: left.length > 0 ? ink.frame : null })
 }
 
 /** The unsent ink the next turn should carry: which board, and exactly which

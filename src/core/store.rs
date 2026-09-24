@@ -5865,12 +5865,22 @@ impl Store {
             )));
         }
         self.conn.execute_batch("SAVEPOINT live_ink")?;
-        let written = self.write_live_ink_turn(session_id, text, board_id, png);
+        let written = self
+            .write_live_ink_turn(session_id, text, board_id, png)
+            .and_then(|id| {
+                // A RELEASE that fails has committed nothing, so it takes the
+                // same way out as any other failure below: the turn rolled
+                // back and its file removed.
+                match self.conn.execute_batch("RELEASE live_ink") {
+                    Ok(()) => Ok(id),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(board::live_ink_path(session_id, id));
+                        Err(e.into())
+                    }
+                }
+            });
         match written {
-            Ok(id) => {
-                self.conn.execute_batch("RELEASE live_ink")?;
-                self.get_live_turn(id)
-            }
+            Ok(id) => self.get_live_turn(id),
             Err(e) => {
                 // Best-effort: the error being reported is the one that
                 // matters, and a rollback that fails leaves the savepoint to

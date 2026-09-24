@@ -51,7 +51,7 @@ describe('strokes', () => {
     book = addStroke(book, 7, b, FRAME)
     expect(boardInk(book, 7).strokes).toEqual([a, b])
     expect(boardInk(book, 8).strokes).toEqual([])
-    book = undoStroke(book, 7, LATER)
+    book = undoStroke(book, 7)
     expect(boardInk(book, 7).strokes).toEqual([a])
     book = clearInk(book, 7)
     expect(boardInk(book, 7).strokes).toEqual([])
@@ -61,7 +61,7 @@ describe('strokes', () => {
   it('ignores a stroke with no points and an undo with nothing to undo', () => {
     const book = emptyInkBook()
     expect(addStroke(book, 7, [], FRAME)).toBe(book)
-    expect(undoStroke(book, 7, FRAME)).toBe(book)
+    expect(undoStroke(book, 7)).toBe(book)
     expect(clearInk(book, 7)).toBe(book)
   })
 })
@@ -76,31 +76,34 @@ describe('the dirty flag and the freeze', () => {
 
   it('is clean again once every unsent stroke is undone', () => {
     let book = addStroke(emptyInkBook(), 7, stroke(1), FRAME)
-    book = undoStroke(book, 7, LATER)
+    book = undoStroke(book, 7)
     expect(inkIsNew(boardInk(book, 7))).toBe(false)
     expect(frozenBoard(book)).toBeNull()
     expect(pendingInk(book)).toBeNull()
   })
 
-  it('is cleared by a send that carried it, and the layout unfreezes', () => {
+  it('is cleared by a send that carried it, which drops those strokes and unfreezes', () => {
     let book = addStroke(emptyInkBook(), 7, stroke(1), FRAME)
     const pending = pendingInk(book)
     expect(pending?.boardId).toBe(7)
     book = markInkSent(book, 7, pending!.strokes)
     expect(pendingInk(book)).toBeNull()
     expect(boardInk(book, 7).frame).toBeNull()
-    // Sent ink stays drawn.
-    expect(boardInk(book, 7).strokes).toHaveLength(1)
+    // The PNG on the turn is the record; nothing stays drawn to drift once
+    // the layout unlocks.
+    expect(boardInk(book, 7).strokes).toEqual([])
   })
 
   it('stays dirty when the person drew more while the turn was on its way', () => {
     let book = addStroke(emptyInkBook(), 7, stroke(1), FRAME)
     const sent = pendingInk(book)!.strokes
     book = addStroke(book, 7, stroke(2), LATER)
+    const later = boardInk(book, 7).strokes[1]
     book = markInkSent(book, 7, sent)
     expect(frozenBoard(book)).toBe(7)
     expect(boardInk(book, 7).frame).toEqual(FRAME)
-    expect(pendingInk(book)?.strokes).toHaveLength(2)
+    // Only the stroke drawn after the send's snapshot is left, still new.
+    expect(pendingInk(book)?.strokes).toEqual([later])
   })
 
   it('stays dirty when the send failed — nothing marks it', () => {
@@ -108,12 +111,13 @@ describe('the dirty flag and the freeze', () => {
     expect(pendingInk(book)).not.toBeNull()
   })
 
-  it('treats undoing a stroke the agent saw as new, freezing where it stands', () => {
+  it('starts a fresh freeze at the next stroke after a send', () => {
     let book = addStroke(emptyInkBook(), 7, stroke(1), FRAME)
     book = markInkSent(book, 7, pendingInk(book)!.strokes)
-    book = undoStroke(book, 7, LATER)
-    expect(frozenBoard(book)).toBe(7)
+    expect(undoStroke(book, 7)).toBe(book)
+    book = addStroke(book, 7, stroke(2), LATER)
     expect(boardInk(book, 7).frame).toEqual(LATER)
+    expect(boardInk(book, 7).strokes).toHaveLength(1)
   })
 
   it('does not refreeze a board cleared while its turn was on its way', () => {

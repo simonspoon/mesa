@@ -415,6 +415,21 @@ const REPORT_DEBOUNCE_MS = 300
  */
 const POLL_MS = 2000
 
+/**
+ * The tail of the page's one queue of utterance posts (mesa task 1353). Each
+ * step starts only once the one before it has settled, so a post awaiting the
+ * ink's flatten can neither be overtaken nor share its ink with the next.
+ * Module-level rather than a ref: there is one `LiveHub` for the life of the
+ * page, and the React Compiler lint refuses a ref written from `post` (it
+ * reports the whole component once one is).
+ */
+let postTail: Promise<void> = Promise.resolve()
+function enqueuePost(step: () => Promise<void>): Promise<void> {
+  const next = postTail.then(step)
+  postTail = next.catch(() => undefined)
+  return next
+}
+
 export function LiveHub({
   onSidebars,
   slot,
@@ -928,6 +943,14 @@ export function LiveHub({
   useEffect(() => {
     inkRef.current = ink
   }, [ink])
+  // The one write path for the ink outside the prune above: the ref moves in
+  // the same call as the state, so a queued post that runs before the next
+  // render reads what the last send left rather than what it carried.
+  const updateInk = useCallback((update: (book: InkBook) => InkBook) => {
+    const next = update(inkRef.current)
+    inkRef.current = next
+    setInk(next)
+  }, [])
   // The panel's flatten, which only it can perform — it sees the pixels.
   const flattenInk = useRef<InkFlatten | null>(null)
 
@@ -2704,14 +2727,26 @@ export function LiveHub({
    * The one way an utterance leaves this page — typed, or heard. Returns the
    * request so a flush of more than one turn can send them **in order**: a
    * recording that had to be split is still one thing the person said, and
-   * two overlapping writes could land the halves the wrong way round.
+   * two overlapping writes could land the halves the wrong way round. Every
+   * post runs through one queue (`enqueuePost`, mesa task 1353): a post awaits
+   * the ink's flatten before its request, so two posts fired together could
+   * otherwise both carry the same ink, or a post with none overtake one still
+   * flattening.
    */
   function post(text: string, carriesInk = true) {
-    // New ink on the whiteboard (mesa task 1353) rides on this turn as a PNG
-    // the panel flattens now — at the frozen size, since the layout stays
-    // frozen until the send succeeds. A turn that is a piece of a longer
-    // recording leaves it to the last piece. A flatten that fails sends the
-    // words alone and leaves the ink new, for the next turn to carry.
+    return enqueuePost(() => postNow(text, carriesInk))
+  }
+
+  /**
+   * One queued post. New ink on the whiteboard (mesa task 1353) rides on this
+   * turn as a PNG the panel flattens now — at the frozen size, since the
+   * layout stays frozen until the send succeeds — read here, inside the
+   * queue, so it is exactly what no earlier post has carried. A turn that is a
+   * piece of a longer recording leaves it to the last piece. A flatten that
+   * fails sends the words alone, says so, and leaves the ink new for the next
+   * turn. Never rejects: a failed send is reported and its words put back.
+   */
+  function postNow(text: string, carriesInk: boolean): Promise<void> {
     const pending = carriesInk ? pendingInk(inkRef.current) : null
     const flatten = flattenInk.current
     const drawn: Promise<string | null> =
@@ -2724,12 +2759,18 @@ export function LiveHub({
         return sendLiveUtterance(
           text,
           carried === null ? undefined : { board_id: carried.boardId, png_base64: carried.png },
-        ).then(() => carried)
+        ).then(() => ({ carried, dropped: pending !== null && png === null }))
       })
       .then(
-        (carried) => {
+        ({ carried, dropped }) => {
           if (carried !== null) {
-            setInk((book) => markInkSent(book, carried.boardId, carried.strokes))
+            updateInk((book) => markInkSent(book, carried.boardId, carried.strokes))
+          }
+          if (dropped) {
+            setActionError(
+              'your drawing could not be attached — it stays on the board for your next turn',
+            )
+            setOpen(true)
           }
           refetch()
         },
@@ -2745,6 +2786,7 @@ export function LiveHub({
         },
       )
   }
+
   useEffect(() => {
     postRef.current = post
   })
@@ -3351,7 +3393,7 @@ export function LiveHub({
             open={nextBoardPanel.open}
             onClose={() => setBoardPanel((panel) => ({ ...panel, open: false }))}
             ink={ink}
-            onInk={setInk}
+            onInk={updateInk}
             flattenRef={flattenInk}
           />,
           boardSlot,

@@ -1386,20 +1386,29 @@ board, and seen by the agent only when the person next sends a turn.
   panel, and no scroll — the content box's px width and height are pinned
   inline and its overflow hidden (with the scrollbar's gutter kept where it
   had one, so text does not reflow into the freed width), which holds even when
-  the browser window is resized. Size, maximise or collapse the board freely
+  the browser window is resized — the panel keeps the width it froze at as its
+  minimum, so a narrowed window cannot shrink it under the pinned box. Size, maximise or collapse the board freely
   *before* drawing. A board pushed meanwhile does **not** take the panel away
   (`heldBoardView`); the moment the freeze lifts the ordinary "newest board is
   showing" rule shows it. The freeze lifts when the turn carrying the ink is
   sent, or when the ink is cleared.
-- **New ink rides on the next user turn.** "New" is a dirty flag: set by a
-  stroke, and by an undo that changes what the agent last saw; cleared when a
-  turn carrying it posts successfully (a failed post keeps it), and by
-  clearing. With no new ink a turn carries no image. A typed turn carries it;
+- **New ink rides on the next user turn.** "New" is a dirty flag: set while
+  anything is drawn, since every stroke left on a board is unsent; cleared when
+  a turn carrying it posts successfully (a failed post keeps it), by undoing
+  the last stroke, and by clearing. With no new ink a turn carries no image. A typed turn carries it;
   a spoken recording flushed as several turns puts it on the **last** of them
   (`inkCarrier`), and the mid-recording posts the 8 KiB cap forces carry none.
-  Sent ink stays drawn on its board for the rest of the session, in memory.
+  Every post runs through one queue, and reads the ink inside it, so two posts
+  in quick succession can never both carry the same ink, and one with no ink
+  cannot overtake one still flattening. **A successful send takes the strokes
+  it carried off the board** — the PNG on the turn is their record, and once
+  the layout unlocks nothing would keep them over what they marked — leaving
+  only strokes drawn after the send's snapshot, still new and still frozen.
+  A flatten that fails, or a PNG still past the cap at 1×, sends the words
+  alone and says so in the panel; the ink stays new for the next turn.
 - **Flattening is the page's**, on an offscreen canvas at the frozen size ×
-  `devicePixelRatio` (redrawn at 1× if the PNG would pass the cap), the board
+  `devicePixelRatio` (redrawn at 1× if the PNG would pass the cap, and not
+  attached at all if it still would), the board
   underneath and the strokes on top in a saturated magenta:
   - `image`: the `<img>`'s own pixels, drawn where it sits;
   - `diagram`: the SVG fetched again from the same-origin render route and

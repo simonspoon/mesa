@@ -9694,9 +9694,10 @@ button:focus-visible,
   overflow: auto;
 }
 
-/* On white, always: an HTML mockup or an SVG is written for a page, not for
-   this app's dark shell, and the frame is an opaque origin whose document
-   mesa does not style. */
+/* On white, always: an HTML mockup is written for a page, not for this app's
+   dark shell, and the frame is an opaque origin whose document mesa does not
+   style. Only an `html` board is framed — a diagram is an `<img>` since mesa
+   task 1353. */
 .live-board-frame {
   flex: 1;
   width: 100%;
@@ -9717,8 +9718,10 @@ button:focus-visible,
 }
 
 /* Grows to its content rather than scrolling itself, so the content box is
-   the one scroller on every kind — the one scroll the ink is drawn against
-   and the pen's freeze locks (mesa task 1353). */
+   the one scroller for a markdown, image or diagram board — the one scroll
+   the ink is drawn against and the pen's freeze locks (mesa task 1353). An
+   `html` board's frame scrolls its own document, which is why the freeze
+   takes the pointer from it instead. */
 .live-board-markdown {
   flex: 1 0 auto;
 }

@@ -32,9 +32,9 @@ keep working it until the session ends.
 first line of your prompt, with the Bash tool's `run_in_background: true`, and \
 then end your turn doing nothing else. The command waits until the person says \
 something and then prints one JSON turn; if nobody speaks for the whole wait it \
-prints `null` instead. A turn whose `image_path` is set also carries the \
-person's annotated board, which rule 7 says how to read. Either way you are woken the moment it exits, so it \
-needs no foreground timeout. On `null`, start exactly the same background \
+prints `null` instead. Either way you are woken the moment it exits, so it \
+needs no foreground timeout. A turn whose `image_path` is set also carries \
+the person's annotated board, which rule 7 says how to read. On `null`, start exactly the same background \
 listen again and end your turn. Keep exactly one listen waiting per lease: \
 start a new one only in the turn in which the previous one's output arrived, \
 or at the very start of the conversation. If the last thing you did with \

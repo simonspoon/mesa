@@ -562,8 +562,15 @@ export function LiveBoardPanel({
   const contentRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   // The stroke being drawn, before the pen lifts and it joins the book — and
-  // the frame the content box stood in when it went down.
-  const drawing = useRef<{ points: InkPoint[]; frame: InkFrame } | null>(null)
+  // the frame the content box stood in, and the panel's own width, when it
+  // went down.
+  const drawing = useRef<{ points: InkPoint[]; frame: InkFrame; panel: number } | null>(
+    null,
+  )
+  // The panel's width when the layout froze. Kept as its minimum while frozen:
+  // the content box is pinned in px, and a window narrowed under it would
+  // otherwise shrink the panel and leave the pinned box poking past its edge.
+  const [frozenPanel, setFrozenPanel] = useState<number | null>(null)
   // The content box's size, which the overlay canvas is kept exactly over.
   const [box, setBox] = useState<{ width: number; height: number }>({ width: 0, height: 0 })
   const showingInk = showing === null ? null : boardInk(ink, showing.id)
@@ -658,7 +665,11 @@ export function LiveBoardPanel({
     if (point === null || at === null) return
     e.preventDefault()
     e.currentTarget.setPointerCapture(e.pointerId)
-    drawing.current = { points: [point], frame: at }
+    drawing.current = {
+      points: [point],
+      frame: at,
+      panel: asideRef.current?.getBoundingClientRect().width ?? 0,
+    }
     redraw()
   }
 
@@ -675,15 +686,15 @@ export function LiveBoardPanel({
     drawing.current = null
     if (stroke === null || showing === null) return
     const id = showing.id
+    // The stroke that freezes the layout records the panel width it froze at.
+    if (!frozen) setFrozenPanel(stroke.panel)
     onInk((book) => addStroke(book, id, stroke.points, stroke.frame))
   }
 
   function undo() {
     if (showing === null) return
-    const at = currentFrame()
-    if (at === null) return
     const id = showing.id
-    onInk((book) => undoStroke(book, id, at))
+    onInk((book) => undoStroke(book, id))
   }
 
   function clear() {
@@ -710,8 +721,10 @@ export function LiveBoardPanel({
         // Past the server's cap it would be refused; redrawn at 1× instead.
         if (png !== null && base64Bytes(png) <= INK_MAX_BYTES) return png
       }
+      // Still past the cap at 1×, or not drawn at all: the server would
+      // refuse the whole turn, so the words go without it and the ink waits.
       if (png === null) throw new Error('the ink could not be drawn')
-      return png
+      throw new Error('the drawing is too large to attach')
     }
   })
 
@@ -723,10 +736,14 @@ export function LiveBoardPanel({
       }`}
       // Nothing stored and nothing dragged means no inline property at all —
       // the stylesheet's `min(40rem, 50vw)` is the default, not a number.
+      // While frozen for ink, the width it froze at is its floor too.
       style={
-        width === null
+        width === null && !(frozen && frozenPanel !== null)
           ? undefined
-          : ({ '--live-board-width': `${width}px` } as CSSProperties)
+          : ({
+              ...(width === null ? {} : { '--live-board-width': `${width}px` }),
+              ...(frozen && frozenPanel !== null ? { minWidth: `${frozenPanel}px` } : {}),
+            } as CSSProperties)
       }
       aria-label="the live whiteboard"
     >

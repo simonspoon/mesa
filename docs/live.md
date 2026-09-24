@@ -151,7 +151,11 @@ tree or repository at once (own worktree, own files, or one after another). A
 result that lands mid-discussion on another topic is held for a natural pause;
 one that lands while the conversation is quiet is announced right away, never
 left until the person next speaks. `Agent` is in the definition's `tools:` list
-for exactly this. Quiet time is still spent inside `listen` — the wait happens
+for exactly this. Since mesa task 1359 the brief's one exception to "no
+`naru live` command" is the delegate's last step, `naru live result
+"<findings>"`, and the driver reads results from `listen` rather than from
+the task-notification — so a result survives a handoff (see "Delegated
+results across a handoff" below). Quiet time is still spent inside `listen` — the wait happens
 in the command, as before — only now the agent's turn ends instead of blocking
 on it.
 
@@ -538,6 +542,81 @@ carries `resting_since` on the session, and the panel's aperture shows a
 person can still talk and nothing is being worked on) — with the status
 line saying memory is being tidied. Anything said meanwhile
 queues, and the successor takes it the moment the rest ends.
+
+### Delegated results across a handoff (mesa task 1359)
+
+A delegate — a fork or subagent started under rule 12 — runs *inside* the
+driving agent's Claude Code process, and its result used to arrive only as
+a task-notification to that process. A handoff broke both halves: the
+notification went to an agent that had been told to do nothing more, and
+the successor's first `listen` ran `claude stop` on that agent, very likely
+killing the delegate before it finished. Live session 12 lost a
+crash-analysis this way.
+
+Three pieces close it:
+
+- **A durable channel.** `naru live result "<text>"` (CLI only — no route,
+  no ts-rs type) writes a row in `live_results` (migration index 77, a
+  sibling table like `live_boards`, `ON DELETE CASCADE`), against the one
+  live session — `not_found` with none, `validation` for blank text or more
+  than `LIVE_RESULT_MAX` (16384) characters. It takes no `--lease`: a result
+  belongs to the conversation, not to the generation of driver that asked
+  for it — it goes to whichever session is live at the moment it is posted.
+  Put `--quiet` before the text, as with `say`.
+- **`listen` delivers it.** Each poll first asks `Store::next_live_result`
+  — one `UPDATE … RETURNING` stamping `delivered_at`, so a result is handed
+  out exactly once — and only then `next_user_turn`, so a finished job is
+  heard before a waiting utterance. A result prints as
+  `{"id", "session_id", "kind": "result", "text", "created_at",
+  "delivered_at"}`; a turn never has a `kind` key, so that is how the agent
+  tells them apart (`--quiet` drops `text` and keeps `kind`). Handing one
+  out opens `working_since` exactly as handing out a turn does — the agent
+  now has something to retell — and leaves the close to `next_user_turn`.
+  A result is never a turn: it is not spoken, not in `live turns`, not in
+  `GET /api/live` and not indexed into the memory archive.
+- **The handoff protects the delegates.** `handoff` asks
+  `agents::running_subagents` for the outgoing job's running subagents
+  (`claude agents --json --all` → the row whose `id` is the session's
+  `agent_id`, if it is still running → its `sessionId` → that session's
+  `subagents/*.jsonl` transcripts judged by `delegate_running`; any failure
+  is an empty list, never a failed handoff) and appends a last block to the
+  successor's prompt naming each by name and transcript id, framed as data
+  like the rest, saying their results will come through `listen`. And the
+  successor's lease-carrying `listen` now **peeks** at
+  `predecessor_agent_id` first: while that job still has a running
+  subagent, the id is left on the row and nothing is stopped — a later
+  `listen` tries again — and once none is running,
+  `take_live_predecessor_if` clears exactly the id it probed (a
+  compare-and-set, so a handoff landing between the probe and the take is
+  never cleared by a caller that probed the old predecessor) and `claude
+  stop` runs as before.
+- **Nothing is orphaned.** A predecessor still deferred is taken and
+  stopped by `live stop` (and `DELETE /api/live`) *before* the session is
+  ended, since ending clears the column; and by the next `handoff`, whose
+  rebind would otherwise overwrite it — so two handoffs inside one
+  delegate's run lose that delegate, a cost accepted over a predecessor
+  nobody would ever stop.
+- **A stale listen takes nothing.** A lease-carrying `listen` re-checks
+  its lease on every poll, not only on entry, so a listen the outgoing
+  agent left waiting across its handoff ends in `conflict` on its next poll
+  rather than taking the successor's next result or turn.
+
+The outgoing driver, if a delegate's notification wakes it after the
+handoff, does nothing (rule 11). If a delegate posted nothing, the driver
+falls back to the notification's final message (rule 12).
+
+What counts as a running delegate (`agents::delegate_running`, over the
+transcript's last record): never one whose last record is an assistant
+message that ended its turn (`end_turn`); one waiting on a tool call — an
+assistant message ending in `tool_use`, no `tool_result` after it — for up
+to 30 minutes since its transcript was last written, because a delegate
+inside one long tool call writes nothing until the call returns (the
+crash-analysis case); anything else only within `cc::ACTIVE_SECS` (90s),
+the Agents panel's rule. The limits: a tool call silent for more than 30
+minutes, or any other silence over 90s, reads as gone and its agent may be
+stopped; a process killed mid-call holds the stop for up to those 30
+minutes; and a shell child of the outgoing agent is its own Bash call, not
+a delegate, so it never holds the stop.
 
 ## What a turn may be
 

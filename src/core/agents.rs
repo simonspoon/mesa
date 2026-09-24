@@ -315,6 +315,22 @@ fn basename(comm: &str) -> &str {
 /// here, so every slug directory is checked for the session — the same
 /// glob-by-session-id shape `cc.rs` uses.
 fn subagent_children(root: &Path, session_id: &str, now: SystemTime) -> Vec<AgentChild> {
+    subagent_transcripts(root, session_id, now, cc::ACTIVE_SECS)
+        .into_iter()
+        .map(|(path, _)| subagent_child(&path))
+        .collect()
+}
+
+/// Every `subagents/*.jsonl` of `session_id`, under any project slug, whose
+/// mtime is at most `max_age` seconds old, with that age — the walk
+/// [`subagent_children`] and [`running_subagents`] share. An mtime in the
+/// future (clock skew) is as live as it gets, age 0.
+fn subagent_transcripts(
+    root: &Path,
+    session_id: &str,
+    now: SystemTime,
+    max_age: i64,
+) -> Vec<(std::path::PathBuf, i64)> {
     let mut out = Vec::new();
     let Ok(slugs) = std::fs::read_dir(root) else {
         return out;
@@ -329,42 +345,47 @@ fn subagent_children(root: &Path, session_id: &str, now: SystemTime) -> Vec<Agen
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let fresh = entry
+            let age = entry
                 .metadata()
                 .and_then(|m| m.modified())
                 .ok()
-                .is_some_and(|mtime| match now.duration_since(mtime) {
-                    Ok(age) => age.as_secs() as i64 <= cc::ACTIVE_SECS,
-                    // mtime in the future (clock skew) is as live as it gets.
-                    Err(_) => true,
+                .map(|mtime| match now.duration_since(mtime) {
+                    Ok(age) => age.as_secs() as i64,
+                    Err(_) => 0,
                 });
-            if !fresh {
-                continue;
+            if let Some(age) = age
+                && age <= max_age
+            {
+                out.push((path, age));
             }
-            let pulse = cc::subagent_pulse(&path);
-            out.push(AgentChild {
-                // The transcript's file stem — free here, since this walk
-                // already holds the path — and the id
-                // `cc::subagent_chat` reads the run back by (mesa task 1278).
-                id: path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .map(|stem| stem.to_string()),
-                kind: AgentChildKind::Subagent,
-                name: subagent_name(&path),
-                detail: pulse.detail,
-                started_at: pulse.started_at,
-                context_tokens: pulse.context_tokens,
-                model: pulse.model,
-                state: if subagent_finished(&path) {
-                    AgentChildState::Finished
-                } else {
-                    AgentChildState::Running
-                },
-            });
         }
     }
     out
+}
+
+/// One subagent transcript as a child card.
+fn subagent_child(path: &Path) -> AgentChild {
+    let pulse = cc::subagent_pulse(path);
+    AgentChild {
+        // The transcript's file stem — free here, since this walk
+        // already holds the path — and the id
+        // `cc::subagent_chat` reads the run back by (mesa task 1278).
+        id: path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| stem.to_string()),
+        kind: AgentChildKind::Subagent,
+        name: subagent_name(path),
+        detail: pulse.detail,
+        started_at: pulse.started_at,
+        context_tokens: pulse.context_tokens,
+        model: pulse.model,
+        state: if subagent_finished(path) {
+            AgentChildState::Finished
+        } else {
+            AgentChildState::Running
+        },
+    }
 }
 
 /// What a subagent run calls itself: the `agentType` of the `.meta.json`
@@ -394,27 +415,29 @@ fn meta_agent_type(path: &Path) -> Option<String> {
 /// else (unreadable, unparseable, a `tool_use` stop, a user line) is `false`,
 /// so an uncertain file still counts as live.
 fn subagent_finished(path: &Path) -> bool {
+    last_record(path).is_some_and(|v| stop_reason(&v) == Some("end_turn"))
+}
+
+/// A transcript's last non-empty line, parsed — only the file's tail is read.
+/// `None` for anything unreadable or unparseable.
+fn last_record(path: &Path) -> Option<serde_json::Value> {
     use std::io::{Read, Seek, SeekFrom};
     const TAIL: u64 = 64 * 1024;
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
+    let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).is_err() {
-        return false;
-    }
+    f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
     let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() {
-        return false;
-    }
+    f.read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf);
-    let Some(last) = text.lines().rev().find(|l| !l.trim().is_empty()) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(last) else {
-        return false;
-    };
-    v["type"] == "assistant" && v["message"]["stop_reason"] == "end_turn"
+    let last = text.lines().rev().find(|l| !l.trim().is_empty())?;
+    serde_json::from_str(last).ok()
+}
+
+/// An `assistant` record's `stop_reason`; `None` for any other record.
+fn stop_reason(v: &serde_json::Value) -> Option<&str> {
+    (v["type"] == "assistant")
+        .then(|| v["message"]["stop_reason"].as_str())
+        .flatten()
 }
 
 /// Resolves the script to run for one spawn `action` (`config::TODO_WATCHER`,
@@ -578,6 +601,66 @@ pub fn job_running(job_id: &str) -> bool {
     list_all_agents(&claude_bin())
         .map(|bytes| running(&bytes, job_id))
         .unwrap_or(false)
+}
+
+/// The subagents the background job `job_id` still has running — its
+/// delegates in flight (mesa task 1359). What a live handoff names to the
+/// successor, and what keeps the successor's `listen` from stopping a
+/// predecessor whose delegates have not reported.
+///
+/// Its own walk rather than [`list_all`]'s child cards, for one reason: a
+/// delegate inside one long tool call writes nothing until the call returns,
+/// so its transcript falls out of `cc::ACTIVE_SECS` while it is still
+/// working — exactly the delegate a handoff must not kill. See
+/// [`delegate_running`] for the verdict. Subagents only: a shell child of the
+/// outgoing driver is its own Bash call (a `listen` still waiting, most
+/// often), not a delegate. A job `claude agents --json --all` does not list
+/// as running has no delegates at all, since they run in its process.
+/// **Every failure is an empty list**, like [`job_running`]'s `false`: a
+/// probe that cannot answer must never block a handoff or keep a stop
+/// waiting on nothing.
+pub fn running_subagents(job_id: &str) -> Vec<AgentChild> {
+    let Some(root) = cc::projects_dir() else {
+        return Vec::new();
+    };
+    let Ok(bytes) = list_all_agents(&claude_bin()) else {
+        return Vec::new();
+    };
+    if !running(&bytes, job_id) {
+        return Vec::new();
+    }
+    let Ok(Some(session_id)) = session_for_job(&bytes, job_id) else {
+        return Vec::new();
+    };
+    running_delegates(&root, &session_id, SystemTime::now())
+}
+
+/// How long a subagent whose last record is a `tool_use` still awaiting its
+/// result counts as running (mesa task 1359): one tool call may run for many
+/// minutes without a line written, but not forever — a process killed
+/// mid-call leaves the same record behind.
+const DELEGATE_TOOL_CALL_SECS: i64 = 30 * 60;
+
+/// The walk half of [`running_subagents`], for one session uuid.
+fn running_delegates(root: &Path, session_id: &str, now: SystemTime) -> Vec<AgentChild> {
+    subagent_transcripts(root, session_id, now, DELEGATE_TOOL_CALL_SECS)
+        .into_iter()
+        .filter(|(path, age)| delegate_running(*age, last_record(path).as_ref()))
+        .map(|(path, _)| subagent_child(&path))
+        .collect()
+}
+
+/// Whether a subagent transcript `age` seconds old whose last record is
+/// `last` is a delegate still at work: never once it has ended its turn
+/// (`end_turn`); for up to [`DELEGATE_TOOL_CALL_SECS`] when it is waiting on
+/// a tool call (`tool_use` is the last record, so no `tool_result` followed);
+/// otherwise within `cc::ACTIVE_SECS`, the Agents panel's own rule.
+fn delegate_running(age: i64, last: Option<&serde_json::Value>) -> bool {
+    match last.and_then(stop_reason) {
+        Some("end_turn") => false,
+        Some("tool_use") => age <= DELEGATE_TOOL_CALL_SECS,
+        _ => age <= cc::ACTIVE_SECS,
+    }
 }
 
 /// Pure half of [`job_running`]: bytes in, a verdict out, and unparseable
@@ -1759,5 +1842,60 @@ echo "backgrounded · cf0c3945 · proj: do the thing""#,
         assert!(err.contains("kaboom"), "{err}");
         let missing = list_sessions("/nonexistent/claude").unwrap_err();
         assert!(missing.contains("failed to run claude"), "{missing}");
+    }
+
+    /// The delegate verdict (mesa task 1359): an ended turn never runs; a
+    /// pending tool call runs for up to 30 minutes of silence; anything else
+    /// only inside the Agents panel's own freshness window.
+    #[test]
+    fn delegate_running_holds_a_pending_tool_call_for_thirty_minutes() {
+        let rec =
+            |stop: &str| serde_json::json!({"type": "assistant", "message": {"stop_reason": stop}});
+        let result = serde_json::json!({"type": "user", "message": {"content": "tool_result"}});
+        assert!(!delegate_running(0, Some(&rec("end_turn"))));
+        assert!(delegate_running(
+            cc::ACTIVE_SECS + 1,
+            Some(&rec("tool_use"))
+        ));
+        assert!(delegate_running(
+            DELEGATE_TOOL_CALL_SECS,
+            Some(&rec("tool_use"))
+        ));
+        assert!(!delegate_running(
+            DELEGATE_TOOL_CALL_SECS + 1,
+            Some(&rec("tool_use"))
+        ));
+        // A tool_result already followed: the old rule.
+        assert!(delegate_running(cc::ACTIVE_SECS, Some(&result)));
+        assert!(!delegate_running(cc::ACTIVE_SECS + 1, Some(&result)));
+        assert!(delegate_running(0, None));
+        assert!(!delegate_running(cc::ACTIVE_SECS + 1, None));
+    }
+
+    /// The walk half reads the real transcript tail, keeps only running
+    /// delegates of the named session, and never a finished one.
+    #[test]
+    fn running_delegates_reads_the_transcript_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("-slug").join("sess-1").join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let tool_use = r#"{"type":"assistant","message":{"stop_reason":"tool_use"}}"#;
+        let end_turn = r#"{"type":"assistant","message":{"stop_reason":"end_turn"}}"#;
+        std::fs::write(sub.join("agent-busy.jsonl"), format!("{tool_use}\n")).unwrap();
+        std::fs::write(
+            sub.join("agent-done.jsonl"),
+            format!("{tool_use}\n{end_turn}\n"),
+        )
+        .unwrap();
+        std::fs::write(sub.join("agent-busy.meta.json"), r#"{"agentType":"crash"}"#).unwrap();
+        let now = SystemTime::now();
+        let running = running_delegates(dir.path(), "sess-1", now);
+        assert_eq!(running.len(), 1, "{running:?}");
+        assert_eq!(running[0].name, "crash");
+        assert_eq!(running[0].id.as_deref(), Some("agent-busy"));
+        // Forty minutes on, the pending call is past its window too.
+        let later = now + std::time::Duration::from_secs(40 * 60);
+        assert!(running_delegates(dir.path(), "sess-1", later).is_empty());
+        assert!(running_delegates(dir.path(), "sess-2", now).is_empty());
     }
 }

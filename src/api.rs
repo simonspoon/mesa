@@ -4336,7 +4336,7 @@ async fn stop_live(
     require_agent_access(&state, &addr, &headers)?;
     // The store lock is dropped before the blocking `claude stop` shell-out,
     // like every other agent call in this file.
-    let (session, has_turns, was_live) = {
+    let (session, has_turns, was_live, predecessor) = {
         let mut store = state.store.lock().unwrap();
         let Some(current) = store.current_live_session()? else {
             return Err(no_live_session());
@@ -4345,6 +4345,10 @@ async fn stop_live(
         // summary is worth writing is a question about the conversation that
         // just finished, not about the row after the write (mesa task 921).
         let was_live = current.status == LiveStatus::Live;
+        // A predecessor whose stop `listen` deferred for its delegates (mesa
+        // task 1359) is taken before the end clears it, and stopped below
+        // with the current agent — the CLI's `live stop` does the same.
+        let predecessor = store.take_live_predecessor(current.id)?;
         let ended = store.end_live_session(current.id)?;
         // Best-effort, matching the CLI's `live stop`: by this point the
         // session is already ended, so a failure reading its turns must never
@@ -4362,13 +4366,21 @@ async fn stop_live(
                     false
                 }
             };
-        (ended, has_turns, was_live)
+        (ended, has_turns, was_live, predecessor)
     };
     if has_turns {
         spawn_live_summary(&state, session.id, session.project_id).await;
     }
     if was_live {
         spawn_live_dream_after(&state, session.id, session.project_id).await;
+    }
+    if let Some(prev) = predecessor {
+        let id = session.id;
+        match tokio::task::spawn_blocking(move || agents::stop(&prev)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("live session {id}: could not stop its previous agent: {e}"),
+            Err(e) => eprintln!("live session {id}: stopping its previous agent panicked: {e}"),
+        }
     }
     if let Some(agent_id) = session.agent_id.clone() {
         let id = session.id;

@@ -32,9 +32,10 @@ pub mod version;
 pub use store::{
     ArtifactPatch, DiagramPatch, EdgeNew, EdgePatch, Error, FrameNew, FramePatch,
     INBOX_ARCHIVE_REASON_MAX, ImportDoc, LIVE_AUDIO_MAX, LIVE_BOARD_BODY_MAX, LIVE_BOARD_KEEP,
-    LIVE_INK_MAX, LIVE_TEXT_MAX, LIVE_TURNS_MAX, LibraryBuiltinAction, LibraryPatch, NextResult,
-    ProjectPatch, ReceiptPatch, Result, SCRIPT_RUN_ABANDONED, SCRIPT_RUN_KEEP, STALE_CLAIM_MINUTES,
-    ScriptPatch, Store, TaskPatch, default_db_path, validate_live_client,
+    LIVE_INK_MAX, LIVE_RESULT_MAX, LIVE_TEXT_MAX, LIVE_TURNS_MAX, LibraryBuiltinAction,
+    LibraryPatch, NextResult, ProjectPatch, ReceiptPatch, Result, SCRIPT_RUN_ABANDONED,
+    SCRIPT_RUN_KEEP, STALE_CLAIM_MINUTES, ScriptPatch, Store, TaskPatch, default_db_path,
+    validate_live_client,
 };
 pub use types::{
     ARTIFACT_CONTENT_TYPES, AgentSession, AgentSpawned, AnchorSide, ArchiveOutcome, Artifact,
@@ -48,9 +49,9 @@ pub use types::{
     GitWorktree, GpuInfo, HookRun, InboxItem, InboxKind, LibraryBundle, LibraryImportResult,
     LibraryItem, LibraryKind, LibraryScope, LibrarySyncResult, LibrarySyncRow, LibrarySyncStatus,
     LibraryVersion, LiveAction, LiveBoard, LiveBoardKind, LiveBoardSummary, LiveContext,
-    LiveContextKind, LiveMemoryHit, LiveNotebookEntry, LiveNotice, LiveRole, LiveSession,
-    LiveState, LiveStatus, LiveSummary, LiveTranscript, LiveTurn, LiveWindow, ModelRates,
-    NaruVersion, Priority, Project, ProjectAgents, ProjectFileTree, ProjectGitLog,
+    LiveContextKind, LiveMemoryHit, LiveNotebookEntry, LiveNotice, LiveResult, LiveRole,
+    LiveSession, LiveState, LiveStatus, LiveSummary, LiveTranscript, LiveTurn, LiveWindow,
+    ModelRates, NaruVersion, Priority, Project, ProjectAgents, ProjectFileTree, ProjectGitLog,
     ProjectGitStatus, ProjectGitView, ProjectVersion, RetroFinding, RetroRun, RetroStatus, Script,
     ScriptArg, ScriptArgKind, ScriptRun, ScriptRunEvent, ScriptRunRecord, ScriptRunStatus,
     ScriptStream, Status, SystemInfo, Task, TaskReceipt, TaskSummary, Waypoint,

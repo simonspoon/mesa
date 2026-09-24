@@ -4275,6 +4275,31 @@ pub struct LiveMemoryHit {
     pub snippet: String,
 }
 
+/// What a delegate of a live conversation found, posted with `naru live
+/// result` and handed to the driving agent by `naru live listen` (mesa task
+/// 1359). A sibling record rather than a turn: it is never spoken, never on
+/// the page and never in the transcript — it is the driver's to read and
+/// retell — and it outlives a handoff, because it waits in the db for
+/// whichever agent holds the conversation rather than in the one process a
+/// task-notification reaches.
+///
+/// `kind` is always `"result"`: it is what tells a `listen` caller this line
+/// is a delegate's result and not a [`LiveTurn`], which never has the key.
+///
+/// **Not ts-exported**, like [`LiveMemoryHit`]: results are CLI-only, with no
+/// HTTP route and no page.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LiveResult {
+    pub id: i64,
+    pub session_id: i64,
+    /// Always `"result"`.
+    pub kind: &'static str,
+    pub text: String,
+    pub created_at: String,
+    /// When `listen` handed it out; null while it waits.
+    pub delivered_at: Option<String>,
+}
+
 /// One run of the session retrospective (mesa task 1158, `docs/retro.md`):
 /// when it started and what started it — `watcher` for `serve --watch-retro`'s
 /// scheduled pass, `manual` for `mesa retro run`. The row is written **before**

@@ -65,6 +65,16 @@
 #      exactly once, a failed spawn leaving the session untouched, an empty
 #      note refused, `mesa live context`'s key set (no `--quiet`), the page
 #      seeing one session id throughout, and `handoff --quiet`'s key set;
+#      plus delegate results (mesa task 1359): `live result` not_found with
+#      nothing live, `listen` handing a result out once and before a waiting
+#      turn as `kind: result` (never a turn, never on the page), blank and
+#      over-16384 validation, the `--quiet` key set, a handoff naming the
+#      outgoing agent's running delegate to the successor, and the
+#      successor's listen leaving that agent running until its delegate
+#      finishes, delivering the result posted after the handoff, then
+#      stopping it once; a listen left waiting across a handoff ending in
+#      conflict, and a later handoff or `live stop` stopping a predecessor
+#      that is still deferred;
 #  11. session memory (mesa task 921): the `mesa live summary` CLI round-trip
 #      (set/show/list, the upsert keeping `created_at`), its `--quiet`
 #      contract (drops `body` only; `list --quiet` is a usage error; `--quiet`
@@ -276,15 +286,24 @@ case "\$1" in
     # NOT a permission prompt (mesa task 1293).
     # A \`done-ids\` file listing the job makes its row \`state: "done"\`, the
     # shape \`agents::job_running\` reads as finished (mesa task 1155).
+    # An \`extra-id\` file naming an older job lists it too, on the same
+    # session uuid — the outgoing agent of a handoff, still alive while its
+    # delegates run (mesa task 1359). Whole rows, as the \`working\` one below.
     ID=\$(cat "$STUB_DIR/last-id" 2>/dev/null)
-    if [ "\$ID" = "\$(cat "$STUB_DIR/blocked-id" 2>/dev/null)" ]; then
+    EXTRA=\$(cat "$STUB_DIR/extra-id" 2>/dev/null)
+    if [ -n "\$EXTRA" ] && [ "\$EXTRA" != "\$ID" ]; then
+      printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"working","cwd":"/","kind":"background","startedAt":0},{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"working","cwd":"/","kind":"background","startedAt":0}]\n' "\$ID" "\$EXTRA"
+    elif [ "\$ID" = "\$(cat "$STUB_DIR/blocked-id" 2>/dev/null)" ]; then
       REASON=\$(cat "$STUB_DIR/blocked-reason" 2>/dev/null)
       [ -n "\$REASON" ] || REASON="permission prompt"
       printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"blocked","waitingFor":"%s"}]\n' "\$ID" "\$REASON"
     elif grep -qx "\$ID" "$STUB_DIR/done-ids" 2>/dev/null; then
       printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"done"}]\n' "\$ID"
     else
-      printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"working"}]\n' "\$ID"
+      # \`cwd\`/\`kind\`/\`startedAt\` too: \`agents::list_all\` parses whole rows
+      # (the delegate probe, mesa task 1359), where the lookups above read
+      # only the keys they need.
+      printf '[{"id":"%s","sessionId":"00000000-0000-0000-0000-000000000000","state":"working","cwd":"/","kind":"background","startedAt":0}]\n' "\$ID"
     fi
     ;;
   stop)
@@ -293,6 +312,8 @@ case "\$1" in
     # job was stopped; a \`stop-fail\` marker makes it the failure that must
     # still leave a cleanly ended session behind.
     printf '%s\n' "\$*" > "$STUB_DIR/last-stop"
+    # Every stop, in order, for a command that stops two jobs (mesa task 1359).
+    printf '%s\n' "\$*" >> "$STUB_DIR/stop-log"
     # An \`if\`, not \`[ … ] &&\`: as the case's last command the bare test
     # would make every ordinary stop exit 1 (mesa task 1155 caught it).
     if [ -e "$STUB_DIR/stop-fail" ]; then echo "No job matching" >&2; exit 1; fi
@@ -3654,6 +3675,131 @@ run 1 "$MESA" live context
 [ "$(jqe .error.code)" = "unavailable" ] || fail "live context with no agent bound: unavailable"
 run 0 "$MESA" live stop >/dev/null
 ok "live stop after handoffs stops the current agent; a handoff after the end is not_found spawning nothing; live context on a --no-agent session is unavailable"
+
+# ---- (k) delegate results (mesa task 1359) ----
+# A delegate posts what it found with `live result`; the driver's `listen`
+# hands it out once, before any waiting turn, as a record whose `kind` is
+# `result`. Never a turn, never on the page.
+run 1 "$MESA" live result "nobody to hear it"
+[ "$(jqe .error.code)" = "not_found" ] || fail "live result with no session: not_found"
+grep -q 'mesa live start' <<<"$STDERR" || fail "live result with no session must name mesa live start"
+run 0 "$MESA" live start "live gate project"
+RS=$(jqs .id)
+RA1=$(jqs .agent_id)
+api 201 POST "/api/live/utterance" '{"text":"waiting behind a result"}'
+run 0 "$MESA" live result "RESULT-ONE: the crash is in parse_row"
+[ "$(jq -c 'keys' <<<"$STDOUT")" = '["created_at","delivered_at","id","kind","session_id","text"]' ] ||
+  fail "live result: key set (got $STDOUT)"
+[ "$(jqs .kind)" = "result" ] && [ "$(jqs .session_id)" = "$RS" ] && [ "$(jqs .delivered_at)" = "null" ] ||
+  fail "live result: kind result, the live session, undelivered (got $STDOUT)"
+run 0 "$MESA" live listen --lease 1 --wait 0
+[ "$(jqs .kind)" = "result" ] && [ "$(jqs .text)" = "RESULT-ONE: the crash is in parse_row" ] ||
+  fail "listen hands out the result BEFORE the waiting turn (got $STDOUT)"
+[ "$(jqs .delivered_at)" != "null" ] && [ "$(jqs 'has("role")')" = "false" ] ||
+  fail "a delivered result is stamped and carries no turn keys (got $STDOUT)"
+run 0 "$MESA" live status
+[ "$(jqs .working_since)" != "null" ] || fail "a delivered result opens working_since"
+run 0 "$MESA" live listen --lease 1 --wait 0
+[ "$(jqs .role)" = "user" ] && [ "$(jqs .text)" = "waiting behind a result" ] && [ "$(jqs 'has("kind")')" = "false" ] ||
+  fail "the next listen hands out the turn, unchanged, never the result again (got $STDOUT)"
+run 0 "$MESA" live listen --lease 1 --wait 0
+[ "$STDOUT" = "null" ] || fail "a result is handed out once (got $STDOUT)"
+run 0 "$MESA" live turns
+! grep -q "RESULT-ONE" <<<"$STDOUT" || fail "a result is never a turn"
+api 200 GET "/api/live"
+! grep -q "RESULT-ONE" <<<"$BODY" || fail "a result never reaches GET /api/live"
+ok "live result: stored against the live session; listen hands it out once, before a waiting turn, as kind result; never a turn, never on the page"
+
+run 1 "$MESA" live result "   "
+[ "$(jqe .error.code)" = "validation" ] || fail "a blank result: validation"
+run 1 "$MESA" live result "$(head -c 16385 /dev/zero | tr '\0' x)"
+[ "$(jqe .error.code)" = "validation" ] || fail "a result over 16384 chars: validation"
+run 0 "$MESA" live listen --lease 1 --wait 0
+[ "$STDOUT" = "null" ] || fail "a refused result stores nothing (got $STDOUT)"
+run 0 "$MESA" live result --quiet "a quiet finding"
+[ "$(jq -c 'keys' <<<"$STDOUT")" = '["created_at","delivered_at","id","kind","session_id"]' ] ||
+  fail "live result --quiet drops text alone (got $STDOUT)"
+run 0 "$MESA" live listen --quiet --lease 1 --wait 0
+[ "$(jqs .kind)" = "result" ] && [ "$(jqs 'has("text")')" = "false" ] ||
+  fail "listen --quiet keeps kind and drops text on a result (got $STDOUT)"
+run 0 "$MESA" live result A finding that mentions --quiet in passing.
+[ "$(jqs .text)" = "A finding that mentions --quiet in passing." ] || fail "--quiet after the text is text"
+run 0 "$MESA" live listen --lease 1 --wait 0
+ok "live result: blank or over 16384 chars is validation storing nothing; --quiet drops text and keeps kind, and must come before the text"
+
+# The handoff names the outgoing agent's running delegates, and the
+# successor's listen leaves it running until they are done. A subagent
+# transcript under the stub's session uuid, fresh and mid-turn, is a running
+# delegate (agents::running_subagents).
+SUBDIR="$HOME/.claude/projects/-live-gate/00000000-0000-0000-0000-000000000000/subagents"
+mkdir -p "$SUBDIR"
+printf '{"agentType":"crash-analysis"}' >"$SUBDIR/agent-crash-abc.meta.json"
+printf '%s\n' '{"type":"assistant","message":{"stop_reason":"tool_use"}}' >"$SUBDIR/agent-crash-abc.jsonl"
+run 0 "$MESA" live handoff "we were on the crash"
+grep -q "^- crash-analysis (agent-crash-abc)$" "$STUB_DIR/last-prompt" ||
+  fail "the successor's prompt names the running delegate (got $(tail -3 "$STUB_DIR/last-prompt"))"
+grep -q "still working when it handed off" "$STUB_DIR/last-prompt" || fail "the delegate block is introduced"
+echo "$RA1" >"$STUB_DIR/extra-id"
+rm -f "$STUB_DIR/last-stop"
+run 0 "$MESA" live listen --lease 2 --wait 0
+[ "$STDOUT" = "null" ] || fail "nothing queued yet (got $STDOUT)"
+[ ! -e "$STUB_DIR/last-stop" ] || fail "a predecessor with a running delegate must not be stopped"
+run 0 "$MESA" live result "RESULT-TWO: posted after the handoff"
+printf '%s\n' '{"type":"assistant","message":{"stop_reason":"end_turn"}}' >>"$SUBDIR/agent-crash-abc.jsonl"
+run 0 "$MESA" live listen --lease 2 --wait 0
+[ "$(jqs .kind)" = "result" ] && [ "$(jqs .text)" = "RESULT-TWO: posted after the handoff" ] ||
+  fail "the successor's listen hands out the result the delegate posted after the handoff (got $STDOUT)"
+[ "$(cat "$STUB_DIR/last-stop" 2>/dev/null)" = "stop $RA1" ] ||
+  fail "once its delegate is done the predecessor is stopped (got $(cat "$STUB_DIR/last-stop" 2>/dev/null))"
+rm -f "$STUB_DIR/last-stop"
+run 0 "$MESA" live listen --lease 2 --wait 0
+[ ! -e "$STUB_DIR/last-stop" ] || fail "the predecessor is still stopped exactly once"
+RA2=$(cat "$STUB_DIR/last-id")
+
+# A listen the outgoing agent left waiting across its handoff ends in
+# conflict on its next poll rather than taking the successor's result.
+printf '%s\n' '{"type":"assistant","message":{"stop_reason":"tool_use"}}' >"$SUBDIR/agent-crash-abc.jsonl"
+set +e
+"$MESA" live listen --lease 2 --wait 30 >"$TMP/stale.out" 2>"$TMP/stale.err" &
+STALE_PID=$!
+set -e
+sleep 1
+run 0 "$MESA" live handoff "a second handoff while the delegate runs"
+RA3=$(jqs .agent_id)
+run 0 "$MESA" live result "RESULT-THREE: posted after the second handoff"
+set +e
+wait "$STALE_PID"
+STALE_CODE=$?
+set -e
+[ "$STALE_CODE" = "1" ] && [ "$(jq -r .error.code <"$TMP/stale.err")" = "conflict" ] ||
+  fail "a listen waiting across a handoff ends in conflict (exit $STALE_CODE, $(cat "$TMP/stale.err"))"
+[ ! -s "$TMP/stale.out" ] || fail "the stale listen took nothing (got $(cat "$TMP/stale.out"))"
+echo "$RA2" >"$STUB_DIR/extra-id"
+: >"$STUB_DIR/stop-log"
+run 0 "$MESA" live listen --lease 3 --wait 0
+[ "$(jqs .text)" = "RESULT-THREE: posted after the second handoff" ] ||
+  fail "the successor gets the result the stale listen did not (got $STDOUT)"
+[ ! -s "$STUB_DIR/stop-log" ] || fail "the deferred predecessor is not stopped while its delegate runs"
+# A third handoff would overwrite that deferred predecessor, so it stops it.
+run 0 "$MESA" live handoff "a third handoff"
+RA4=$(jqs .agent_id)
+[ "$(cat "$STUB_DIR/stop-log")" = "stop $RA2" ] ||
+  fail "a handoff stops the predecessor still deferred from the last one (got $(cat "$STUB_DIR/stop-log"))"
+# And ending the conversation stops a deferred predecessor with the agent.
+echo "$RA3" >"$STUB_DIR/extra-id"
+: >"$STUB_DIR/stop-log"
+run 0 "$MESA" live listen --lease 4 --wait 0
+[ ! -s "$STUB_DIR/stop-log" ] || fail "the new predecessor is deferred too"
+run 0 "$MESA" live stop
+[ "$(cat "$STUB_DIR/stop-log")" = "$(printf 'stop %s\nstop %s' "$RA3" "$RA4")" ] ||
+  fail "live stop stops the deferred predecessor and the current agent (got $(cat "$STUB_DIR/stop-log"))"
+rm -f "$STUB_DIR/extra-id"
+rm -rf "$HOME/.claude/projects/-live-gate"
+run 0 "$MESA" live start "live gate project"
+run 0 "$MESA" live handoff "no delegates this time"
+! grep -q "still working when it handed off" "$STUB_DIR/last-prompt" || fail "no running delegate, no block"
+run 0 "$MESA" live stop >/dev/null
+ok "live handoff names the outgoing agent's running delegates; the successor's listen leaves it running until they finish, delivers the result posted after the handoff, then stops it once; a listen left waiting across a handoff is conflict; a later handoff or live stop stops a deferred predecessor"
 
 # =====================================================================
 # 16. Notice turns (mesa task 1157): telling the person the agent is stuck

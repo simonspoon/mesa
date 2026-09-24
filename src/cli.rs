@@ -29,10 +29,10 @@ use crate::core::{
     EdgeMarker, EdgeNew, EdgePatch, EdgeStyle, Error, Frame, FrameEdge, FrameNew, FramePatch,
     FrameShape, ImportDoc, InboxItem, InboxKind, LIVE_TEXT_MAX, LibraryBuiltinAction,
     LibraryBundle, LibraryItem, LibraryKind, LibraryPatch, LibraryScope, LibrarySyncStatus,
-    LiveAction, LiveBoard, LiveBoardKind, LiveNotebookEntry, LiveNotice, LiveRole, LiveSession,
-    LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch, ReceiptPatch,
-    Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task, TaskPatch,
-    TaskReceipt, agents, board, cc, config, files, git, library, live, look, migrate,
+    LiveAction, LiveBoard, LiveBoardKind, LiveNotebookEntry, LiveNotice, LiveResult, LiveRole,
+    LiveSession, LiveStatus, LiveSummary, LiveTurn, NextResult, Priority, Project, ProjectPatch,
+    ReceiptPatch, Result, Script, ScriptArg, ScriptArgKind, ScriptPatch, Status, Store, Task,
+    TaskPatch, TaskReceipt, agents, board, cc, config, files, git, library, live, look, migrate,
     project_memory, receipt, retro, system,
 };
 
@@ -2000,6 +2000,9 @@ EXAMPLES
     ///
     /// Prints the oldest undelivered `user` turn and marks it delivered, so an
     /// utterance is handed out exactly once no matter how many listeners run.
+    /// A delegate's result posted with `live result` (mesa task 1359) is
+    /// handed out the same way, and BEFORE any waiting turn; it prints as a
+    /// result record, told apart from a turn by its `"kind": "result"`.
     /// With nothing to hear it polls (about twice a second) until --wait
     /// seconds have passed and then prints `null` and exits 0: a quiet minute
     /// is DATA, not an error. It also returns `null` early if the session ends
@@ -2030,7 +2033,32 @@ EXAMPLES
         /// Absent (a person at a terminal), nothing is checked.
         #[arg(long, value_name = "N")]
         lease: Option<i64>,
-        /// Print the turn without its `text` instead of in full
+        /// Print the turn (or result) without its `text` instead of in full
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Post what a delegate found for the agent driving the conversation; prints the result
+    ///
+    /// For a delegate of a live conversation (mesa task 1359) — a subagent or
+    /// fork the driving agent started for a long job — as its last step. The
+    /// result is stored against the live session and handed to whichever
+    /// agent is driving it by its next `live listen`, exactly once, so it
+    /// survives a handoff that replaces the agent that asked for it. Never
+    /// spoken and never shown on the page. Takes no --lease: it belongs to
+    /// the conversation, not to one generation of its driver. Text is
+    /// required and at most 16384 characters. Put --quiet BEFORE the text.
+    #[command(after_help = "\
+EXAMPLES
+  mesa live result \"The crash is a nil deref in parse_row; task 812 filed.\"
+  mesa live result --quiet Nothing found in the last week of logs.")]
+    Result {
+        /// What the delegate found (everything after `result`); quoting is optional
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
+        /// Print the result without its `text` instead of in full
+        ///
+        /// Must come BEFORE the text: everything after `result` that is not
+        /// a leading flag is swallowed as the text.
         #[arg(long)]
         quiet: bool,
     },
@@ -3889,6 +3917,11 @@ const QUIET_DROP_LIVE_SUMMARY: &[&str] = &["body"];
 /// its own bullet text. Ids, timestamps and the retirement reason all stay.
 const QUIET_DROP_LIVE_NOTEBOOK: &[&str] = &["body"];
 
+/// Keys dropped from a `LiveResult` under `--quiet` (mesa task 1359): the
+/// delegate's report, capped at 16 KiB by `Store`. `kind` stays — it is what
+/// tells a `listen` caller the line is a result rather than a turn.
+const QUIET_DROP_LIVE_RESULT: &[&str] = &["text"];
+
 /// A board's one unbounded field is its `body` — a whole document, an SVG or
 /// a base64 image. Everything else (ids, a fixed kind word, a 200-char title,
 /// a content type, a timestamp) is bounded and stays.
@@ -4022,6 +4055,11 @@ fn print_live_session(session: &LiveSession, is_quiet: bool) {
 /// Print one live turn: the full record, or the record minus its spoken `text`.
 fn print_live_turn(turn: &LiveTurn, is_quiet: bool) {
     print_record(turn, is_quiet, QUIET_DROP_LIVE_TURN);
+}
+
+/// Print one delegate result: the full record, or the record minus `text`.
+fn print_live_result(result: &LiveResult, is_quiet: bool) {
+    print_record(result, is_quiet, QUIET_DROP_LIVE_RESULT);
 }
 
 /// Print one live summary: the full record, or the record minus `body`.
@@ -5349,10 +5387,22 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             // conversation that just finished, not about the row after the
             // write.
             let was_live = session.status == LiveStatus::Live;
+            // A predecessor whose stop `listen` deferred for its delegates
+            // (mesa task 1359) is taken before the end clears it, or ending
+            // the conversation would orphan it.
+            let predecessor = store.take_live_predecessor(session.id)?;
             let ended = store.end_live_session(session.id)?;
             if was_live {
                 spawn_live_summary(&mut store, &ended);
                 spawn_live_dream_after(&mut store, &ended);
+            }
+            if let Some(prev) = predecessor
+                && let Err(e) = agents::stop(&prev)
+            {
+                eprintln!(
+                    "live session {}: could not stop its previous agent: {e}",
+                    ended.id
+                );
             }
             stop_live_agent(&ended);
             print_live_session(&ended, quiet);
@@ -5377,7 +5427,14 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                 // outgoing agent (mesa task 1150): an agent must not stop
                 // itself, and by now the successor is provably listening.
                 // Handed out once, so a later listen finds nothing to stop.
-                if let Some(prev) = store.take_live_predecessor(session.id)?
+                // Unless it still has delegates running (mesa task 1359): they
+                // run inside its process, so stopping it would kill them before
+                // they post their results. The id stays on the row and a later
+                // listen tries again; the take is still the one-shot, and only
+                // of the very id whose delegates were probed.
+                if let Some(prev) = store.live_predecessor(session.id)?
+                    && agents::running_subagents(&prev).is_empty()
+                    && store.take_live_predecessor_if(session.id, &prev)?
                     && let Err(e) = agents::stop(&prev)
                 {
                     eprintln!(
@@ -5388,6 +5445,20 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
             loop {
+                // A lease is re-checked on every poll (mesa task 1359), not only
+                // on entry: a listen the outgoing agent left waiting across its
+                // handoff must end in `conflict`, not take the successor's
+                // next result or turn.
+                if let Some(lease) = lease {
+                    store.check_live_lease(session.id, lease)?;
+                }
+                // A delegate's result goes first (mesa task 1359): it is work
+                // already done that the person is waiting to hear, and it is
+                // one-shot the same way a turn is.
+                if let Some(result) = store.next_live_result(session.id)? {
+                    print_live_result(&result, quiet);
+                    return Ok(());
+                }
                 // `next_user_turn` stamps `delivered_at` inside one statement,
                 // so two listeners can never be handed the same utterance.
                 // There is deliberately no second guard here.
@@ -5407,6 +5478,10 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                 std::thread::sleep(LISTEN_POLL.min(left));
             }
             print_json(&serde_json::Value::Null);
+        }
+        LiveCmd::Result { text, quiet } => {
+            let result = store.add_live_result(&text.join(" "))?;
+            print_live_result(&result, quiet);
         }
         LiveCmd::Say { text, lease, quiet } => {
             let session = current_live_session(&store)?;
@@ -5508,6 +5583,14 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
             // once the successor exists, so a failed successor spawn still
             // changes nothing at all.
             let dream_wanted = live::dream_wanted(&store.list_notebook(false)?, &[]);
+            // The outgoing agent's delegates still at work (mesa task 1359),
+            // named to the successor so it knows whose results `listen` will
+            // bring. Best-effort: a failed probe names nobody.
+            let delegates = session
+                .agent_id
+                .as_deref()
+                .map(agents::running_subagents)
+                .unwrap_or_default();
             let spawned = live::ensure_agent_definition(&store).and_then(|_| {
                 let prompts = library::prompts(&store).map_err(|e| e.to_string())?;
                 agents::spawn_bg(
@@ -5515,14 +5598,16 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                     &dir,
                     Some(session.id),
                     Some(&successor),
-                    Some(&live::handoff_prompt(&store, session.id, lease, note)),
+                    Some(&live::handoff_prompt(
+                        &store, session.id, lease, note, &delegates,
+                    )),
                     &prompts,
                 )
             });
             // NOT `bind_live_agent_or_end`: a successor that could not start
             // leaves the conversation exactly as it was — still live, still
-            // the caller's, same lease — rather than ending it. Nothing is
-            // stopped here either: the caller IS the outgoing agent, and the
+            // the caller's, same lease — rather than ending it. The caller is
+            // never stopped here: it IS the outgoing agent, and the
             // successor's first `listen --lease` stops it.
             let job = spawned.map_err(|e| {
                 Error::Unavailable(format!(
@@ -5549,6 +5634,21 @@ fn run_live(cmd: LiveCmd) -> Result<()> {
                     }
                 }
             });
+            // A predecessor still waiting on its delegates from an earlier
+            // handoff (mesa task 1359) would be overwritten by this one's
+            // rebind and never stopped, so it is stopped now, delegates and
+            // all — two handoffs inside one delegate's run lose that
+            // delegate. Only once the successor exists, so a failed spawn
+            // still changes nothing, and best-effort: a failed read here must
+            // not strand a successor that is already running.
+            if let Ok(Some(prev)) = store.take_live_predecessor(session.id)
+                && let Err(e) = agents::stop(&prev)
+            {
+                eprintln!(
+                    "live session {}: could not stop its previous agent: {e}",
+                    session.id
+                );
+            }
             // The rebind is guarded on `status = 'live'`: a session ended
             // while the successor was spawning is refused, and a successor
             // bound to nothing must not be left running — best-effort, the
@@ -7918,6 +8018,47 @@ mod tests {
                 QUIET_DROP_LIVE_BOARD
             ))),
             minus(&full, QUIET_DROP_LIVE_BOARD),
+        );
+    }
+
+    fn sample_live_result() -> LiveResult {
+        LiveResult {
+            id: 4,
+            session_id: 2,
+            kind: "result",
+            text: "The crash is a nil deref in parse_row.".into(),
+            created_at: "2026-01-01 00:00:00".into(),
+            delivered_at: None,
+        }
+    }
+
+    #[test]
+    fn live_result_quiet_drops_text() {
+        let full = keys(&sample_live_result());
+        assert_eq!(
+            sorted_owned(full.clone()),
+            sorted(&[
+                "id",
+                "session_id",
+                // Always `result`, and what tells a `listen` caller the line
+                // is a delegate's result rather than a turn. Kept.
+                "kind",
+                // The delegate's report, capped at 16 KiB by `Store` but
+                // unbounded to a caller reading a JSON line. Dropped.
+                "text",
+                "created_at",
+                // Bounded, and the field `listen` exists to write.
+                "delivered_at",
+            ]),
+            "LiveResult gained/lost a field: decide whether it belongs in the \
+             --quiet shape before updating this list",
+        );
+        assert_eq!(
+            sorted_owned(value_keys(&quiet(
+                &sample_live_result(),
+                QUIET_DROP_LIVE_RESULT
+            ))),
+            minus(&full, QUIET_DROP_LIVE_RESULT),
         );
     }
 

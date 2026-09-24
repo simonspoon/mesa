@@ -13,8 +13,8 @@ use super::types::{
     DiagramView, DiffStat, EdgeMarker, EdgeStyle, Frame, FrameEdge, FrameShape, GitCommit,
     InboxItem, InboxKind, LibraryItem, LibraryKind, LibraryScope, LibraryVersion, LiveAction,
     LiveBoard, LiveBoardKind, LiveBoardSummary, LiveContext, LiveMemoryHit, LiveNotebookEntry,
-    LiveNotice, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow, Priority,
-    Project, RetroFinding, RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind,
+    LiveNotice, LiveResult, LiveRole, LiveSession, LiveStatus, LiveSummary, LiveTurn, LiveWindow,
+    Priority, Project, RetroFinding, RetroRun, RetroStatus, Script, ScriptArg, ScriptArgKind,
     ScriptRunRecord, ScriptRunStatus, Status, Task, TaskEvent, TaskReceipt, Waypoint,
     is_valid_artifact_content_type, task_name,
 };
@@ -1229,6 +1229,20 @@ const MIGRATIONS: &[&str] = &[
     // the link.
     "ALTER TABLE live_turns ADD COLUMN image_path TEXT;
      ALTER TABLE live_turns ADD COLUMN board_id INTEGER REFERENCES live_boards(id) ON DELETE SET NULL;",
+    // Task 1359: what a live conversation's delegates found. A sibling table,
+    // not a turn role — a result is never spoken or shown, only handed to the
+    // driving agent by `listen` — and durable, so a result posted after a
+    // handoff reaches the successor instead of dying with the predecessor's
+    // process. `delivered_at` is the `live_turns` rule: stamped once, by the
+    // one `UPDATE … RETURNING` that hands it out.
+    "CREATE TABLE live_results (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id   INTEGER NOT NULL REFERENCES live_sessions(id) ON DELETE CASCADE,
+        text         TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        delivered_at TEXT
+    );
+    CREATE INDEX idx_live_results_session ON live_results(session_id);",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1495,6 +1509,25 @@ const LIVE_WINDOW_EXTENT_MAX: i32 = 20000;
 /// Longest turn text. Bounded because a Naru turn is **spoken**: a runaway
 /// body would wedge the synthesiser rather than say anything.
 pub const LIVE_TEXT_MAX: usize = 8192;
+
+/// Longest delegate result `naru live result` accepts (mesa task 1359). Twice
+/// [`LIVE_TEXT_MAX`]: a result is read by the driving agent, never spoken, so
+/// it may carry more than one reply's worth — but it lands in that agent's
+/// context, so a runaway report is refused rather than stored.
+pub const LIVE_RESULT_MAX: usize = 16384;
+
+const LIVE_RESULT_COLUMNS: &str = "id, session_id, text, created_at, delivered_at";
+
+fn row_to_live_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveResult> {
+    Ok(LiveResult {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        kind: "result",
+        text: row.get(2)?,
+        created_at: row.get(3)?,
+        delivered_at: row.get(4)?,
+    })
+}
 
 /// Largest audio recording `POST /api/live/transcribe` accepts, in bytes
 /// (`docs/listen.md`, mesa task 954). This is a cap on **one recording**, not
@@ -5409,8 +5442,10 @@ impl Store {
             // An ended conversation is nobody's turn: whatever the agent was
             // in the middle of, the loop it was in is over (mesa task 894).
             // A handoff still in flight is over too: nobody's first `listen`
-            // will come to stop the outgoing agent, and `stop` already stops
-            // whichever agent the row names (mesa task 1150). A rest is over
+            // will come to stop the outgoing agent, so both stop sites take
+            // it with `take_live_predecessor` and stop it *before* this write
+            // (mesa task 1359) — the clear here only catches a caller that did
+            // not (mesa task 1150). A rest is over
             // as well (mesa task 1155): nobody will wake an ended session,
             // and the dream agent finishes on its own.
             "UPDATE live_sessions SET status = ?2, working_since = NULL, \
@@ -5548,6 +5583,38 @@ impl Store {
             (id, &since),
         )?;
         Ok((cleared == 1).then_some(dream).flatten())
+    }
+
+    /// The outgoing agent's job id, if one is still waiting to be stopped —
+    /// a read that takes nothing. `listen` peeks first so it can leave a
+    /// predecessor that still has delegates running in place for a later
+    /// listen (mesa task 1359); the stop itself still goes through
+    /// [`take_live_predecessor`].
+    pub fn live_predecessor(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT predecessor_agent_id FROM live_sessions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// [`take_live_predecessor`] made conditional on the id the caller
+    /// already looked at (mesa task 1359): clears `predecessor_agent_id` only
+    /// while it is still `expected`, and answers whether it did. `listen`
+    /// probes a predecessor's delegates between its peek and this take, so a
+    /// handoff landing in that gap must not have its *new* predecessor
+    /// cleared by a caller that probed the old one.
+    pub fn take_live_predecessor_if(&mut self, id: i64, expected: &str) -> Result<bool> {
+        let cleared = self.conn.execute(
+            "UPDATE live_sessions SET predecessor_agent_id = NULL \
+             WHERE id = ?1 AND predecessor_agent_id = ?2",
+            (id, expected),
+        )?;
+        Ok(cleared == 1)
     }
 
     /// The outgoing agent's job id, handed out **exactly once**: the clear is
@@ -6050,6 +6117,71 @@ impl Store {
             )?,
         };
         Ok(turn)
+    }
+
+    /// Records a delegate's result against the one live conversation (mesa
+    /// task 1359), for `listen` to hand to whichever agent is driving it.
+    /// `NotFound` with no live session, like every other `live` verb; the
+    /// text is trimmed, required and bounded by [`LIVE_RESULT_MAX`].
+    pub fn add_live_result(&mut self, text: &str) -> Result<LiveResult> {
+        let session = self.current_live_session()?.ok_or_else(|| {
+            Error::NotFound("no live session; start one with `mesa live start`".into())
+        })?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(Error::Validation(
+                "a result is required and may not be empty".into(),
+            ));
+        }
+        if text.chars().count() > LIVE_RESULT_MAX {
+            return Err(Error::Validation(format!(
+                "a result must be at most {LIVE_RESULT_MAX} characters"
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO live_results (session_id, text, created_at) \
+             VALUES (?1, ?2, datetime('now'))",
+            (session.id, text),
+        )?;
+        let id = self.conn.last_insert_rowid();
+        Ok(self.conn.query_row(
+            &format!("SELECT {LIVE_RESULT_COLUMNS} FROM live_results WHERE id = ?1"),
+            [id],
+            row_to_live_result,
+        )?)
+    }
+
+    /// Hands the driving agent the oldest undelivered delegate result,
+    /// stamping it delivered in the same statement — [`next_user_turn`]'s
+    /// rule, so two listeners can never be handed one result.
+    ///
+    /// A handed-out result opens `working_since` exactly as a handed-out
+    /// utterance does: the agent now has something to retell. It never
+    /// *clears* the column — `listen` asks for a user turn straight after an
+    /// empty answer here, and that call owns the close.
+    pub fn next_live_result(&mut self, session_id: i64) -> Result<Option<LiveResult>> {
+        let result = self
+            .conn
+            .query_row(
+                &format!(
+                    "UPDATE live_results SET delivered_at = datetime('now') \
+                     WHERE id = (SELECT id FROM live_results \
+                                 WHERE session_id = ?1 AND delivered_at IS NULL \
+                                 ORDER BY id LIMIT 1) \
+                     RETURNING {LIVE_RESULT_COLUMNS}"
+                ),
+                [session_id],
+                row_to_live_result,
+            )
+            .optional()?;
+        if result.is_some() {
+            self.conn.execute(
+                "UPDATE live_sessions SET working_since = datetime('now') \
+                 WHERE id = ?1 AND status = ?2",
+                (session_id, LiveStatus::Live.as_str()),
+            )?;
+        }
+        Ok(result)
     }
 
     /// A session's turns in id order — the transcript, and the page's poll.
@@ -14019,6 +14151,109 @@ mod tests {
         );
     }
 
+    /// Delegate results (mesa task 1359): written against the live session,
+    /// validated, handed out exactly once in id order, opening the working
+    /// span without ever closing it, and gone with the session's row.
+    #[test]
+    fn live_results_are_handed_out_once_and_open_the_working_span() {
+        let (mut store, _dir) = temp_store();
+        assert!(matches!(
+            store.add_live_result("found it"),
+            Err(Error::NotFound(_))
+        ));
+        let session = store.start_live_session(None).unwrap();
+        assert!(matches!(
+            store.add_live_result("   "),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            store.add_live_result(&"a".repeat(LIVE_RESULT_MAX + 1)),
+            Err(Error::Validation(_))
+        ));
+        store
+            .add_live_result(&"a".repeat(LIVE_RESULT_MAX))
+            .expect("exactly at the bound");
+        let first = store.add_live_result("  second finding  ").unwrap();
+        assert_eq!(first.text, "second finding");
+        assert_eq!(first.kind, "result");
+        assert_eq!(first.session_id, session.id);
+        assert_eq!(first.delivered_at, None);
+
+        let a = store.next_live_result(session.id).unwrap().unwrap();
+        assert_eq!(a.text.len(), LIVE_RESULT_MAX);
+        assert!(a.delivered_at.is_some());
+        assert!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .working_since
+                .is_some(),
+            "a delivered result starts the working span"
+        );
+        let b = store.next_live_result(session.id).unwrap().unwrap();
+        assert_eq!(b.id, first.id);
+        assert_eq!(store.next_live_result(session.id).unwrap(), None);
+        assert!(
+            store
+                .get_live_session(session.id)
+                .unwrap()
+                .working_since
+                .is_some(),
+            "an empty result poll leaves the span to next_user_turn"
+        );
+        // Never a turn: the transcript is untouched.
+        assert!(
+            store
+                .list_live_turns(session.id, None, 100)
+                .unwrap()
+                .is_empty()
+        );
+
+        store.add_live_result("undelivered").unwrap();
+        store.end_live_session(session.id).unwrap();
+        assert!(matches!(
+            store.add_live_result("too late"),
+            Err(Error::NotFound(_))
+        ));
+        store
+            .conn
+            .execute("DELETE FROM live_sessions WHERE id = ?1", [session.id])
+            .unwrap();
+        let left: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM live_results", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "results cascade with their session");
+    }
+
+    /// `live_predecessor` peeks without taking, and `take_live_predecessor_if`
+    /// takes only the id that was peeked, once (mesa task 1359).
+    #[test]
+    fn live_predecessor_peeks_without_taking() {
+        let (mut store, _dir) = temp_store();
+        let session = store.start_live_session(None).unwrap();
+        store.bind_live_agent(session.id, Some("job-1")).unwrap();
+        assert_eq!(store.live_predecessor(session.id).unwrap(), None);
+        store
+            .hand_off_live_session(session.id, Some("job-2"), None)
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                store.live_predecessor(session.id).unwrap().as_deref(),
+                Some("job-1")
+            );
+        }
+        assert!(!store.take_live_predecessor_if(session.id, "job-0").unwrap());
+        assert_eq!(
+            store.live_predecessor(session.id).unwrap().as_deref(),
+            Some("job-1"),
+            "a take conditional on another id clears nothing"
+        );
+        assert!(store.take_live_predecessor_if(session.id, "job-1").unwrap());
+        assert!(!store.take_live_predecessor_if(session.id, "job-1").unwrap());
+        assert_eq!(store.live_predecessor(session.id).unwrap(), None);
+    }
+
     /// `working_since` is the agent's half of the header band (mesa task
     /// 894), and `next_user_turn` owns both of its edges: taking an utterance
     /// starts the span, a poll that finds nothing ends it. A fresh session has
@@ -14320,15 +14555,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            77,
-            "a fresh db should report user_version 77"
+            78,
+            "a fresh db should report user_version 78"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 77);
+        assert_eq!(version, 78);
     }
 
     /// Pins the project-notebook columns (mesa task 1333) at index 72
@@ -15843,6 +16078,19 @@ mod tests {
             MIGRATIONS[INK].contains("ALTER TABLE live_turns ADD COLUMN image_path")
                 && MIGRATIONS[INK].contains("ALTER TABLE live_turns ADD COLUMN board_id"),
             "migration {INK} is no longer the live turn ink migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
+    }
+
+    /// Pins the delegate-results table (mesa task 1359) at index 77
+    /// (`user_version` 78), for the reason
+    /// [`the_live_summaries_table_arrives_at_migration_49`] gives.
+    #[test]
+    fn the_live_results_table_arrives_at_migration_77() {
+        const RESULTS: usize = 77;
+        assert!(
+            MIGRATIONS[RESULTS].contains("CREATE TABLE live_results"),
+            "migration {RESULTS} is no longer the live results migration — a \
              shipped migration was edited or reordered, which is never allowed"
         );
     }

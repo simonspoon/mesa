@@ -4,6 +4,7 @@ import {
   captureHint,
   COMMON_ENGLISH,
   correctVocabulary,
+  enterHoldsForRecording,
   HEARING_HOLD_MS,
   HELD_MAX,
   heldFlush,
@@ -462,6 +463,52 @@ describe('heldFlush', () => {
     for (const text of heldFlush(held, 'and then')) {
       expect(text.length).toBeLessThanOrEqual(HELD_MAX)
     }
+  })
+
+  // mesa task 1351: typed or pasted text rides on the end of the speech.
+  it('sends the spoken text then the typed text as one turn', () => {
+    expect(heldFlush('his username is', '', ' 4815162342 \n')).toEqual([
+      'his username is 4815162342',
+    ])
+  })
+
+  it('puts the typed text after the sentence still being guessed at', () => {
+    expect(heldFlush('his username', 'is', '4815162342')).toEqual([
+      'his username is 4815162342',
+    ])
+  })
+
+  it('sends nothing, typed text included, when nothing was spoken', () => {
+    expect(heldFlush('', '', 'half a thought')).toEqual([])
+    expect(heldFlush(' ', '\n', 'half a thought')).toEqual([])
+  })
+
+  it('is unchanged when nothing was typed', () => {
+    expect(heldFlush('make a task', '', '  ')).toEqual(['make a task'])
+  })
+
+  it('splits at the cap rather than posting a turn over it', () => {
+    const held = 'x'.repeat(HELD_MAX - 3)
+    expect(heldFlush(held, '', 'pasted')).toEqual([held, 'pasted'])
+  })
+
+  it('sends a paste longer than the cap whole, in cap-sized pieces', () => {
+    const paste = 'y'.repeat(HELD_MAX + 10)
+    const texts = heldFlush('it is', '', paste)
+    for (const text of texts) expect(text.length).toBeLessThanOrEqual(HELD_MAX)
+    expect(texts.join('').replace(/ /g, '')).toBe(`itis${paste}`)
+  })
+})
+
+describe('enterHoldsForRecording', () => {
+  it('holds the box while speech is held, guessed at or in flight', () => {
+    expect(enterHoldsForRecording({ recording: 'his name is', interim: '', outstanding: 0 })).toBe(true)
+    expect(enterHoldsForRecording({ recording: '', interim: 'his name', outstanding: 0 })).toBe(true)
+    expect(enterHoldsForRecording({ recording: '', interim: '', outstanding: 1 })).toBe(true)
+  })
+
+  it('leaves Enter a plain send of the box when nothing was spoken', () => {
+    expect(enterHoldsForRecording({ recording: ' ', interim: '\n', outstanding: 0 })).toBe(false)
   })
 })
 

@@ -548,11 +548,51 @@ export function heldWith(
  * monologue was: one implementation of the boundary, so the last sentence
  * cannot be the one that slips over it and takes the whole flush down with a
  * 422.
+ *
+ * `typed` (mesa task 1351) is what the person typed or pasted into the box
+ * while the microphone was listening — "his username is" said, the username
+ * pasted. It rides on the **end** of the recording, after the interim, so the
+ * turn reads in the order it was made. It rides only on speech: with nothing
+ * spoken this sends nothing and the box keeps its text for Enter, so no
+ * boundary of the recording's (silence, the switch, a refused microphone) ever
+ * posts a half-typed box on its own. It joins under the same cap as every
+ * sentence, and one longer than the cap is sent in cap-sized pieces rather
+ * than cut, since a paste has no sentence boundary to split on and losing its
+ * tail is losing what the person meant to send.
  */
-export function heldFlush(held: string, interim: string): string[] {
-  const grown = heldWith(held, interim)
-  const last = utteranceFrom(grown.held)
-  return [grown.flush, last].filter((t): t is string => t !== null)
+export function heldFlush(held: string, interim: string, typed = ''): string[] {
+  let grown = heldWith(held, interim)
+  if (utteranceFrom(grown.held) === null) return []
+  const flushed: string[] = []
+  for (let rest = typed.trim(); ; rest = rest.slice(HELD_MAX)) {
+    if (grown.flush !== null) flushed.push(grown.flush)
+    if (rest === '') break
+    grown = heldWith(grown.held, rest.slice(0, HELD_MAX))
+  }
+  return [...flushed, grown.held.trim()]
+}
+
+/**
+ * Whether Enter in the typed box holds rather than sends (mesa task 1351):
+ * true while there is speech held, still being guessed at, or still on its
+ * way back from the transcriber. Then the box text stays where it is and rides
+ * on the end of the recording at the recording's own boundary — silence or
+ * the switch — since sending it alone would post the typed half of the thought
+ * before the spoken half. Enter is deliberately *not* an early boundary: on
+ * the browser path, flushing an unsettled guess without muting lets the
+ * recognizer's late final hold the same sentence again, and on the auris path
+ * a segment still in flight may turn out to be noise, leaving nothing for the
+ * box to ride on. With none of that pending, Enter sends the box as it always
+ * has (mesa task 977).
+ */
+export function enterHoldsForRecording(input: {
+  recording: string
+  interim: string
+  outstanding: number
+}): boolean {
+  return (
+    input.recording.trim() !== '' || input.interim.trim() !== '' || input.outstanding > 0
+  )
 }
 
 // The chord that turns the microphone on and off (mesa task 887) was
@@ -916,7 +956,7 @@ export function captureHint(input: {
     // an install away, the browser recognizer is not — so the ladder saying
     // only "listening" would hide something worth knowing.
     const via = input.path === 'auris' ? 'auris' : 'this browser'
-    return `Listening through ${via} — everything you say is held here and sent to Naru once you go quiet, or right away if you press the switch. She stops listening while she is speaking. You can still type here.`
+    return `Listening through ${via} — everything you say is held here and sent to Naru once you go quiet, or right away if you press the switch. She stops listening while she is speaking. Anything you type while she is holding what you said waits and is sent on the end of it.`
   }
   // Joined, unmuted, and still not the way in — nothing left that is worth a
   // line of its own; the box is the way in and says so.

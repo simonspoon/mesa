@@ -71,6 +71,7 @@ import {
   isSilentTranscribe,
   HEARING_HOLD_MS,
   LISTEN_CHORD,
+  enterHoldsForRecording,
   heldFlush,
   heldWith,
   listenPath,
@@ -1318,17 +1319,25 @@ export function LiveHub({
    *
    * Ordered rather than fired together: a split recording is still one thing
    * the person said.
+   *
+   * The typed box rides on the end (mesa task 1351): whatever was typed or
+   * pasted while listening goes out in the same turn, after the speech, and
+   * the box is cleared — but only when there was speech to carry it
+   * (`heldFlush`), so every boundary that lands here, both engines' alike,
+   * leaves a box typed alone for Enter.
    */
   const flushRecording = useCallback(() => {
-    const texts = heldFlush(recordingRef.current, interimRef.current)
+    const typed = draftRef.current
+    const texts = heldFlush(recordingRef.current, interimRef.current, typed)
     setRecordingNow('')
     setInterimNow('')
     if (!armed.current.live) return
+    if (texts.length > 0 && typed.trim() !== '') updateDraft('')
     texts.reduce(
       (queue, text) => queue.then(() => postRef.current(text)),
       Promise.resolve(),
     )
-  }, [setInterimNow, setRecordingNow])
+  }, [setInterimNow, setRecordingNow, updateDraft])
   const flushRef = useRef(flushRecording)
   useEffect(() => {
     flushRef.current = flushRecording
@@ -2644,6 +2653,19 @@ export function LiveHub({
     // own clearing below both read.
     const text = draftRef.current.trim()
     if (text === '' || !live) return
+    // Speech held or on its way: Enter holds (mesa task 1351). The box stays
+    // put to ride on the end of the recording at its own boundary, and the
+    // silence wait restarts so a timer about to fire does not leave it behind.
+    if (
+      enterHoldsForRecording({
+        recording: recordingRef.current,
+        interim: interimRef.current,
+        outstanding: chainRef.current?.outstanding ?? 0,
+      })
+    ) {
+      if (recognizes) markHeard()
+      return
+    }
     updateDraft('')
     post(text)
   }
@@ -3137,7 +3159,13 @@ export function LiveHub({
                             : 'dictate or type here…'
                     }
                     aria-label="say something to Naru"
-                    onChange={(e) => updateDraft(e.target.value)}
+                    onChange={(e) => {
+                      updateDraft(e.target.value)
+                      // Typing or pasting while listening is the person still
+                      // adding to the recording (mesa task 1351), so the silence
+                      // wait restarts rather than sending the speech without it.
+                      if (recognizes) markHeard()
+                    }}
                     onBlur={(e) => {
                       // The arbiter: focus lost to somewhere a person types, on the
                       // heels of a gesture, is them deliberately going elsewhere —

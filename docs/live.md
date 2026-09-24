@@ -2569,6 +2569,26 @@ conversation") working with no backend change.
   `updateDraft` writes alongside the render state, so `send` and `post`
   always act on what is actually in the box. A line the server **refused**
   is put back in the box unmarked — Enter is simply how it is retried.
+  **While listening, the box rides on the recording** (mesa task 1351) — say
+  "his username is", paste the username: every flush of the recording
+  (`flushRecording`, the one point the silence boundary, the switch's drain
+  and a refused microphone share on both engines) sends the held speech with
+  the box's text on its **end** as one turn and clears the box
+  (`liveRecognition.ts::heldFlush`'s `typed`, split at `HELD_MAX` like any
+  sentence, a paste over the cap sent in cap-sized pieces rather than cut). It
+  rides only on speech: with nothing spoken, no boundary sends the box, so the
+  silence timer still never posts a half-typed box. Typing or pasting while
+  listening restarts the silence wait, since the person is still adding to
+  the turn, and a pause in typing longer than `live.auto-send-ms` with speech
+  held sends what is in the box so far. **Enter** while speech is held, being
+  guessed at or still being transcribed (`enterHoldsForRecording`) **holds**:
+  it sends nothing and closes nothing, leaves the box to ride on the
+  recording's own boundary (silence or the switch) and restarts the silence
+  wait. It is deliberately not an early boundary — on the browser path a
+  flushed guess would be held again by the recognizer's late final and sent
+  twice, and on the auris path a segment in flight may be noise, leaving
+  nothing for the box to ride on. With no speech pending, Enter sends the box
+  exactly as above.
   A failed press (`Go live` on a machine with no `claude`, most likely)
   **opens the panel**, because the error is the status line's to report and a
   failed start leaves no session for the header to hint with.

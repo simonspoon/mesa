@@ -601,10 +601,29 @@ function App() {
     <>
       <header>
         <a className="brand" href="#/">
-          <svg className="brand-mark" viewBox="0 0 100 100" role="img" aria-hidden="true">
-            <polygon points="8,84 8,68 16,68 16,52 26,52 26,34 74,34 74,52 84,52 84,68 92,68 92,84" fill="#0a4d59" />
-            <polygon points="16,68 16,52 26,52 26,34 74,34 74,52 84,52 84,68" fill="#00a8c2" />
-            <polygon points="26,52 26,34 74,34 74,52" fill="#00e5ff" />
+          <svg className="brand-mark" viewBox="0 0 64 64" role="img" aria-hidden="true">
+            <rect x="2" y="2" width="60" height="60" rx="14" fill="#07030f" />
+            <g strokeLinecap="round">
+              <g strokeWidth="4">
+                <line x1="8" y1="28" x2="8" y2="36" stroke="#8a2bff" />
+                <line x1="16" y1="21" x2="16" y2="43" stroke="#ff2bd6" />
+                <line x1="24" y1="14" x2="24" y2="50" stroke="#2b8aff" />
+                <line x1="32" y1="8" x2="32" y2="56" stroke="#29e6ff" />
+                <line x1="40" y1="14" x2="40" y2="50" stroke="#2b8aff" />
+                <line x1="48" y1="21" x2="48" y2="43" stroke="#ff2bd6" />
+                <line x1="56" y1="28" x2="56" y2="36" stroke="#8a2bff" />
+              </g>
+              <g stroke="#f1e6ff" strokeWidth="1.2">
+                <line x1="8" y1="28" x2="8" y2="36" />
+                <line x1="16" y1="21" x2="16" y2="43" />
+                <line x1="24" y1="14" x2="24" y2="50" />
+                <line x1="32" y1="8" x2="32" y2="56" />
+                <line x1="40" y1="14" x2="40" y2="50" />
+                <line x1="48" y1="21" x2="48" y2="43" />
+                <line x1="56" y1="28" x2="56" y2="36" />
+              </g>
+            </g>
+            <rect x="2" y="2" width="60" height="60" rx="14" fill="none" stroke="#b44bff" strokeWidth="4" />
           </svg>
           <span className="brand-text">
             Naru

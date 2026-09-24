@@ -17,6 +17,8 @@
 //! a frame title is free text an untrusted source may have written, and the
 //! result is served as `image/svg+xml`, which is markup.
 
+use std::path::{Path, PathBuf};
+
 use super::types::{DiagramView, LiveBoard, LiveBoardKind};
 
 /// The file extension a board's bytes should carry — what the render route
@@ -63,6 +65,42 @@ pub fn filename(board: &LiveBoard) -> String {
     } else {
         format!("{stem}.{ext}")
     }
+}
+
+/// Where the person's annotated boards live (mesa task 1353):
+/// `NARU_LIVE_INK_DIR`/`MESA_LIVE_INK_DIR` if set and non-empty, else
+/// `live-ink/` beside the resolved database — `attachments::attachments_dir`'s
+/// rule, empty counting as unset for the same reason.
+pub fn live_ink_dir() -> PathBuf {
+    if let Some(p) = crate::core::env::var("LIVE_INK_DIR")
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
+    }
+    let mut path = crate::core::default_db_path();
+    path.set_file_name("live-ink");
+    path
+}
+
+/// Where the PNG one user turn carried is written: `<dir>/<session>/<turn>.png`.
+/// Both components are ids, so there is nothing here a caller could traverse
+/// with.
+pub fn live_ink_path(session_id: i64, turn_id: i64) -> PathBuf {
+    live_ink_dir()
+        .join(session_id.to_string())
+        .join(format!("{turn_id}.png"))
+}
+
+/// What `mesa live board keep --task` names the ink it attaches beside the
+/// board: the board's own name without its extension, plus `-ink.png`, so
+/// `plan.md` keeps as `plan.md` and `plan-ink.png` side by side.
+pub fn ink_filename(name: &str) -> String {
+    let stem = Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| name.to_string());
+    format!("{stem}-ink.png")
 }
 
 /// Padding around the content's bounding box, in canvas units.
@@ -185,6 +223,15 @@ fn escape(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::core::types::{Diagram, DiagramType, Frame, FrameEdge, LiveBoard};
+
+    /// The ink rides beside the board under the board's own stem, so a
+    /// titled board and an untitled one both keep a recognisable pair.
+    #[test]
+    fn ink_filename_is_the_board_stem_plus_ink_png() {
+        assert_eq!(ink_filename("plan.md"), "plan-ink.png");
+        assert_eq!(ink_filename("board-7.svg"), "board-7-ink.png");
+        assert_eq!(ink_filename("notes"), "notes-ink.png");
+    }
 
     fn diagram() -> Diagram {
         Diagram {

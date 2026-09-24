@@ -32,7 +32,8 @@ keep working it until the session ends.
 first line of your prompt, with the Bash tool's `run_in_background: true`, and \
 then end your turn doing nothing else. The command waits until the person says \
 something and then prints one JSON turn; if nobody speaks for the whole wait it \
-prints `null` instead. Either way you are woken the moment it exits, so it \
+prints `null` instead. A turn whose `image_path` is set also carries the \
+person's annotated board, which rule 7 says how to read. Either way you are woken the moment it exits, so it \
 needs no foreground timeout. On `null`, start exactly the same background \
 listen again and end your turn. Keep exactly one listen waiting per lease: \
 start a new one only in the turn in which the previous one's output arrived, \
@@ -100,7 +101,14 @@ file with `--image <path>`, or a snapshot of a Naru diagram with \
 `--diagram <id>`. Add `--say \"…\"` to speak a sentence as it appears, and \
 `--title` to caption it. A board belongs to this conversation and goes with \
 it, so if the person wants to keep one, run \
-`naru live board keep --project <id>` or `--task <id>`. Keep it sparse and \
+`naru live board keep --project <id>` or `--task <id>`. The person can draw on \
+a board with a pen. When they do, their next turn carries `image_path`, a PNG \
+of the board with their ink over it, and `board_id`, the board they drew on: \
+open that PNG with your image tool (Read) before you answer, since what they \
+marked is usually what they are talking about, and use \
+`naru live board show <board_id>` if you need the board itself. \
+`naru live board keep --task <id>` keeps a board with its ink; a board with ink \
+cannot go to `--project`. Keep it sparse and \
 visual — a diagram, a flow, a small table, a mockup, a screenshot, a few \
 information-rich words — and never paragraphs or long bullet lists, because \
 the person reads far slower than you write. Speech carries the explanation; \
@@ -1334,6 +1342,8 @@ mod tests {
             "naru live look",
             "naru live board push",
             "naru live board keep",
+            "image_path",
+            "naru live board show <board_id>",
             "naru live memory add",
             "naru live memory replace",
             "naru live memory delete",
@@ -1346,6 +1356,32 @@ mod tests {
             "untrusted",
         ] {
             assert!(AGENT_PROMPT.contains(expected), "missing {expected:?}");
+        }
+    }
+
+    /// The whiteboard's ink (mesa task 1353): rule 1 points a turn carrying
+    /// `image_path` at rule 7, and rule 7 says to open the PNG before
+    /// answering and how `keep` treats it — without renumbering anything.
+    #[test]
+    fn agent_prompt_reads_the_persons_ink_before_answering() {
+        let rule1 = AGENT_PROMPT.find("\n1. Run").unwrap_or(0);
+        let rule2 = AGENT_PROMPT.find("\n2. Reply").unwrap();
+        let rule7 = AGENT_PROMPT
+            .find("\n7. Use the conversation's whiteboard")
+            .unwrap();
+        let rule8 = AGENT_PROMPT.find("\n8. Do the actual work").unwrap();
+        let listen = &AGENT_PROMPT[rule1..rule2];
+        assert!(listen.contains("`image_path`"), "{listen}");
+        assert!(listen.contains("rule 7"), "{listen}");
+        let board = &AGENT_PROMPT[rule7..rule8];
+        for expected in [
+            "`image_path`",
+            "`board_id`",
+            "image tool (Read) before you answer",
+            "naru live board show <board_id>",
+            "keeps a board with its ink",
+        ] {
+            assert!(board.contains(expected), "missing {expected:?} in {board}");
         }
     }
 
@@ -1403,6 +1439,8 @@ question is a task, not a note",
             target: None,
             notice: None,
             agent_id: None,
+            image_path: None,
+            board_id: None,
             created_at: "2026-09-01 10:00:00".into(),
             delivered_at: None,
             played_at: None,

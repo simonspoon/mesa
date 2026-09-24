@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension};
 
 use super::attachments;
+use super::board;
 use super::files;
 use super::live;
 use super::types::{
@@ -1220,6 +1221,14 @@ const MIGRATIONS: &[&str] = &[
     // read a Rust constant, so a legacy fork's base is unknown and it is
     // flagged once, until the user decides.
     "ALTER TABLE library_items ADD COLUMN builtin_base TEXT;",
+    // Task 1353: ink on the whiteboard. A user turn may carry the person's
+    // annotated board — `image_path` the PNG written beside the db
+    // (`board::live_ink_path`), `board_id` the board it was drawn on. Both
+    // NULL on every other turn. `board_id` is a pointer, `ON DELETE SET NULL`,
+    // so a board pruned past the keep bound leaves the image and loses only
+    // the link.
+    "ALTER TABLE live_turns ADD COLUMN image_path TEXT;
+     ALTER TABLE live_turns ADD COLUMN board_id INTEGER REFERENCES live_boards(id) ON DELETE SET NULL;",
 ];
 
 /// Selects full task rows including the derived `blocked` flag.
@@ -1464,7 +1473,7 @@ pub struct LiveRest {
 }
 
 const LIVE_TURN_COLUMNS: &str = "id, session_id, role, text, action, target, \
-     created_at, delivered_at, played_at, notice, agent_id";
+     created_at, delivered_at, played_at, notice, agent_id, image_path, board_id";
 
 /// Longest route mesa will store or navigate to. A route is a hash path the
 /// page already knows how to render, not free text, so the bound is generous
@@ -1495,6 +1504,17 @@ pub const LIVE_TEXT_MAX: usize = 8192;
 /// whole session — a long conversation is many requests, not one growing
 /// body.
 pub const LIVE_AUDIO_MAX: usize = 25 * 1024 * 1024;
+
+/// Largest annotated-board PNG a user turn may carry, in decoded bytes (mesa
+/// task 1353). The page flattens the board at the content box's size times
+/// the device pixel ratio, which lands well under a megabyte or two for any
+/// real panel; the cap is there so a runaway canvas is refused rather than
+/// written to disk, not to judge a display.
+pub const LIVE_INK_MAX: usize = 8 * 1024 * 1024;
+
+/// The eight bytes every PNG file starts with — the one check that the ink a
+/// page posted is the image the turn will claim it is.
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// Most turns one `list_live_turns` call returns. The page polls with a
 /// cursor, so a bigger page would only ever be a slower first paint.
@@ -1574,6 +1594,8 @@ fn row_to_live_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<LiveTurn> {
         target: row.get(5)?,
         notice: notice.map(|n| LiveNotice::parse(&n).expect("invalid live turn notice in db")),
         agent_id: row.get(10)?,
+        image_path: row.get(11)?,
+        board_id: row.get(12)?,
         created_at: row.get(6)?,
         delivered_at: row.get(7)?,
         played_at: row.get(8)?,
@@ -5796,6 +5818,112 @@ impl Store {
                 }
                 e => Error::Db(e),
             })
+    }
+
+    /// Records a **user** turn that carries the person's annotated board
+    /// (mesa task 1353): the text, as [`Store::add_live_turn`] records any
+    /// user turn, plus a PNG of the whiteboard with their ink over it, written
+    /// to [`board::live_ink_path`] and pointed at by `image_path`, and the
+    /// board it was drawn on in `board_id`.
+    ///
+    /// Only a user turn may carry ink — the method writes no other kind. The
+    /// ink is refused as `validation`, before anything is written, unless the
+    /// bytes start with the PNG signature, are at most [`LIVE_INK_MAX`], and
+    /// the board belongs to this session (an unknown board and another
+    /// conversation's are the same answer). The row and the file are one
+    /// write: the turn is inserted inside a savepoint, the file written, the
+    /// row pointed at it, and only then released — a failed file write rolls
+    /// the turn back, so a retry from the page never duplicates it, and a
+    /// listener on another connection can never be handed the turn before its
+    /// image is there.
+    pub fn add_live_ink_turn(
+        &mut self,
+        session_id: i64,
+        text: &str,
+        board_id: i64,
+        png: &[u8],
+    ) -> Result<LiveTurn> {
+        if !png.starts_with(PNG_MAGIC) {
+            return Err(Error::Validation("board ink must be a PNG image".into()));
+        }
+        if png.len() > LIVE_INK_MAX {
+            return Err(Error::Validation(format!(
+                "board ink must be at most {LIVE_INK_MAX} bytes"
+            )));
+        }
+        let owner: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT session_id FROM live_boards WHERE id = ?1",
+                [board_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if owner != Some(session_id) {
+            return Err(Error::Validation(format!(
+                "live board {board_id} is not part of live session {session_id}"
+            )));
+        }
+        self.conn.execute_batch("SAVEPOINT live_ink")?;
+        let written = self.write_live_ink_turn(session_id, text, board_id, png);
+        match written {
+            Ok(id) => {
+                self.conn.execute_batch("RELEASE live_ink")?;
+                self.get_live_turn(id)
+            }
+            Err(e) => {
+                // Best-effort: the error being reported is the one that
+                // matters, and a rollback that fails leaves the savepoint to
+                // the connection's own teardown.
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO live_ink; RELEASE live_ink");
+                Err(e)
+            }
+        }
+    }
+
+    /// The three steps [`Store::add_live_ink_turn`] runs inside its savepoint.
+    fn write_live_ink_turn(
+        &mut self,
+        session_id: i64,
+        text: &str,
+        board_id: i64,
+        png: &[u8],
+    ) -> Result<i64> {
+        let turn = self.add_live_turn(session_id, LiveRole::User, text, None, None)?;
+        let path = board::live_ink_path(session_id, turn.id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, png)?;
+        let stored = self.conn.execute(
+            "UPDATE live_turns SET image_path = ?1, board_id = ?2 WHERE id = ?3",
+            (path.to_string_lossy(), board_id, turn.id),
+        );
+        if let Err(e) = stored {
+            let _ = std::fs::remove_file(&path);
+            return Err(e.into());
+        }
+        Ok(turn.id)
+    }
+
+    /// The newest turn carrying ink drawn on `board_id` — what
+    /// `mesa live board keep --task` attaches beside the board. `None` for a
+    /// board nobody has drawn on.
+    pub fn latest_live_ink(&self, board_id: i64) -> Result<Option<LiveTurn>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {LIVE_TURN_COLUMNS} FROM live_turns \
+                     WHERE board_id = ?1 AND image_path IS NOT NULL \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                [board_id],
+                row_to_live_turn,
+            )
+            .optional()?)
     }
 
     /// Records mesa's own report about the agent as a `mesa` turn (mesa task
@@ -14182,15 +14310,15 @@ mod tests {
         );
         assert_eq!(
             MIGRATIONS.len(),
-            76,
-            "a fresh db should report user_version 76"
+            77,
+            "a fresh db should report user_version 77"
         );
         let (store, _dir) = temp_store();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 76);
+        assert_eq!(version, 77);
     }
 
     /// Pins the project-notebook columns (mesa task 1333) at index 72
@@ -15587,6 +15715,126 @@ mod tests {
             store.get_live_board(board.id),
             Err(Error::NotFound(_))
         ));
+    }
+
+    /// `attachment_test_store`, plus `MESA_LIVE_INK_DIR` pointed into the same
+    /// tempdir under the same lock, so an ink test never writes beside the
+    /// real db.
+    fn ink_test_store() -> (Store, tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let (store, dir, guard) = attachment_test_store();
+        // SAFETY: the guard gives this test exclusive access to the env vars.
+        unsafe { std::env::set_var("MESA_LIVE_INK_DIR", dir.path().join("live-ink")) };
+        (store, dir, guard)
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let mut png = PNG_MAGIC.to_vec();
+        png.extend_from_slice(b"not really the rest of a png");
+        png
+    }
+
+    /// A user turn carrying ink (mesa task 1353) writes the PNG byte-identical
+    /// beside the db and points the turn at it and at its board; a plain turn
+    /// carries neither, and the newest ink per board is what `keep` finds.
+    #[test]
+    fn a_user_turn_may_carry_the_persons_ink() {
+        let (mut store, dir, _lock) = ink_test_store();
+        let session = store.start_live_session(None).unwrap();
+        let board = store
+            .add_live_board(session.id, LiveBoardKind::Markdown, None, "body", None)
+            .unwrap();
+        let plain = store
+            .add_live_turn(session.id, LiveRole::User, "no ink", None, None)
+            .unwrap();
+        assert_eq!(plain.image_path, None);
+        assert_eq!(plain.board_id, None);
+        assert!(store.latest_live_ink(board.id).unwrap().is_none());
+
+        let png = tiny_png();
+        let turn = store
+            .add_live_ink_turn(session.id, "  this one  ", board.id, &png)
+            .unwrap();
+        assert_eq!(turn.role, LiveRole::User);
+        assert_eq!(turn.text, "this one");
+        assert_eq!(turn.board_id, Some(board.id));
+        let path = turn.image_path.clone().unwrap();
+        assert_eq!(
+            PathBuf::from(&path),
+            dir.path()
+                .join("live-ink")
+                .join(session.id.to_string())
+                .join(format!("{}.png", turn.id))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), png);
+
+        let second = store
+            .add_live_ink_turn(session.id, "again", board.id, &png)
+            .unwrap();
+        assert_eq!(
+            store.latest_live_ink(board.id).unwrap().unwrap().id,
+            second.id
+        );
+        // The listener is handed the ink with the turn.
+        let heard = store.next_user_turn(session.id).unwrap().unwrap();
+        assert_eq!(heard.id, plain.id);
+        let heard = store.next_user_turn(session.id).unwrap().unwrap();
+        assert_eq!(heard.image_path.as_deref(), Some(path.as_str()));
+    }
+
+    /// Every ink rule refuses before anything is written: no turn, no file.
+    #[test]
+    fn ink_that_breaks_a_rule_writes_nothing() {
+        let (mut store, dir, _lock) = ink_test_store();
+        let session = store.start_live_session(None).unwrap();
+        let board = store
+            .add_live_board(session.id, LiveBoardKind::Markdown, None, "body", None)
+            .unwrap();
+        store.end_live_session(session.id).unwrap();
+        let other = store.start_live_session(None).unwrap();
+        let mine = store
+            .add_live_board(other.id, LiveBoardKind::Markdown, None, "body", None)
+            .unwrap();
+        let mut oversize = tiny_png();
+        oversize.resize(LIVE_INK_MAX + 1, 0);
+        for (board_id, png, text) in [
+            (mine.id, b"GIF89a not a png".to_vec(), "x"),
+            (mine.id, Vec::new(), "x"),
+            (mine.id, oversize, "x"),
+            (board.id, tiny_png(), "x"),
+            (mine.id + 1000, tiny_png(), "x"),
+            // The user-turn rules still hold: text is required.
+            (mine.id, tiny_png(), "   "),
+        ] {
+            let err = store
+                .add_live_ink_turn(other.id, text, board_id, &png)
+                .unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "{err}");
+        }
+        assert!(
+            store
+                .list_live_turns(other.id, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let ink_dir = dir.path().join("live-ink").join(other.id.to_string());
+        assert!(
+            !ink_dir.exists() || std::fs::read_dir(&ink_dir).unwrap().next().is_none(),
+            "a refused ink wrote a file"
+        );
+    }
+
+    /// Pins the turn-ink columns (mesa task 1353) at index 76 (`user_version`
+    /// 77), for the reason [`the_live_summaries_table_arrives_at_migration_49`]
+    /// gives.
+    #[test]
+    fn the_live_turn_ink_columns_arrive_at_migration_76() {
+        const INK: usize = 76;
+        assert!(
+            MIGRATIONS[INK].contains("ALTER TABLE live_turns ADD COLUMN image_path")
+                && MIGRATIONS[INK].contains("ALTER TABLE live_turns ADD COLUMN board_id"),
+            "migration {INK} is no longer the live turn ink migration — a \
+             shipped migration was edited or reordered, which is never allowed"
+        );
     }
 
     /// Pins the live-boards migration (mesa task 1071) at index 51, the same

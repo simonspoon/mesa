@@ -4129,6 +4129,16 @@ pub struct LiveTurn {
     /// it, since `predecessor_agent_id` is cleared by the successor's first
     /// listen and the lease says only that one happened, not where.
     pub agent_id: Option<String>,
+    /// The person's **annotated board** (mesa task 1353): an absolute path to
+    /// a PNG of the whiteboard with their ink drawn over it, flattened by the
+    /// page and written beside the db when this turn was sent. Only a `user`
+    /// turn carries one, and only when there was new ink since the last turn
+    /// — null otherwise. A bounded pointer, so `--quiet` keeps it.
+    pub image_path: Option<String>,
+    /// The board that ink was drawn on — present iff `image_path` is, until
+    /// the board itself is pruned past the keep bound.
+    #[ts(type = "number | null")]
+    pub board_id: Option<i64>,
     /// When the turn was recorded (SQLite `datetime` text, UTC).
     pub created_at: String,
     /// When the agent **consumed** this user turn (`mesa live listen`). Stamped

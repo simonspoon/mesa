@@ -2327,7 +2327,9 @@ EXAMPLES
     /// Exactly one destination: `--project` writes an artifact (id or name,
     /// the house rule), `--task` writes an attachment. Without `--id` it is
     /// the board that is showing. An `image` board can only go to a task —
-    /// an artifact is markdown, HTML or SVG, never raster bytes.
+    /// an artifact is markdown, HTML or SVG, never raster bytes — and so can
+    /// a board the person drew on: `--task` attaches their newest ink beside
+    /// it as `<stem>-ink.png` and reports it under an added `ink` key.
     #[command(after_help = "\
 EXAMPLES
   mesa live board keep --project mesa
@@ -3871,7 +3873,8 @@ const QUIET_DROP_LIBRARY: &[&str] = &["body", "synced_body", "builtin_body"];
 const QUIET_DROP_FRAME_EDGE: &[&str] = &[];
 /// Keys dropped from a `LiveTurn` under `--quiet`: the spoken body, capped at
 /// 8 KiB by `Store` but unbounded as far as a caller reading a JSON line is
-/// concerned. Everything else on a turn is an id, a fixed word or a timestamp.
+/// concerned. Everything else on a turn is an id, a fixed word, a timestamp or
+/// the path of an annotated board's PNG (mesa task 1353).
 const QUIET_DROP_LIVE_TURN: &[&str] = &["text"];
 /// A `LiveSession` has no unbounded field either — ids, one of two status
 /// words, a 200-char route, a four-field context each of whose free-text
@@ -6332,10 +6335,24 @@ fn run_live_board(store: &mut Store, cmd: LiveBoardCmd) -> Result<()> {
         } => {
             let board = resolve_live_board(store, &session, id)?;
             let name = name.unwrap_or_else(|| board::filename(&board));
+            // The person's ink on this board, if they drew on it (mesa task
+            // 1353): the newest annotated PNG a turn carried. Kept beside the
+            // board, never instead of it.
+            let ink = store.latest_live_ink(board.id)?;
             match (project, task) {
                 // Exactly one destination; clap's required ArgGroup refuses
                 // none and both, so the remaining arms cannot happen.
                 (Some(project), _) => {
+                    // An artifact is one document, and the ink is a second,
+                    // raster one — the image board's refusal, for its reason.
+                    if ink.is_some() {
+                        return Err(Error::Validation(format!(
+                            "live board {} carries the person's ink, a PNG, and an \
+                             artifact may only be markdown, HTML or SVG; keep it on a \
+                             task instead (mesa live board keep --task <ID>)",
+                            board.id
+                        )));
+                    }
                     let project_id = resolve_project(store, &project)?;
                     let content_type = board.kind.content_type().ok_or_else(|| {
                         Error::Validation(format!(
@@ -6369,9 +6386,46 @@ fn run_live_board(store: &mut Store, cmd: LiveBoardCmd) -> Result<()> {
                             })?,
                         _ => board.body.clone().into_bytes(),
                     };
+                    // Read before anything is written, so ink gone from
+                    // disk costs the whole keep rather than half of it.
+                    let ink_png = match &ink {
+                        Some(turn) => {
+                            let path = turn.image_path.clone().unwrap_or_default();
+                            Some(std::fs::read(&path).map_err(|e| {
+                                if e.kind() == std::io::ErrorKind::NotFound {
+                                    Error::NotFound(format!(
+                                        "the ink on live board {} is missing on disk at {path}",
+                                        board.id
+                                    ))
+                                } else {
+                                    Error::Io(e)
+                                }
+                            })?)
+                        }
+                        None => None,
+                    };
                     let attachment =
                         store.create_attachment(task_id, &name, &bytes, Some("naru-live"))?;
-                    print_json(&attachment);
+                    match ink_png {
+                        // No ink: the attachment, exactly as before.
+                        None => print_json(&attachment),
+                        // With ink: a second attachment, reported under an
+                        // added `ink` key so every key a caller already read
+                        // is where it was.
+                        Some(png) => {
+                            let ink = store.create_attachment(
+                                task_id,
+                                &board::ink_filename(&name),
+                                &png,
+                                Some("naru-live"),
+                            )?;
+                            let mut out = serde_json::to_value(&attachment)
+                                .expect("an attachment serializes");
+                            out["ink"] =
+                                serde_json::to_value(&ink).expect("an attachment serializes");
+                            print_json(&out);
+                        }
+                    }
                 }
                 (None, None) => unreachable!("clap requires --project or --task"),
             }
@@ -7279,6 +7333,8 @@ mod tests {
             target: Some("#/projects/2".into()),
             notice: None,
             agent_id: Some("agent_abc".into()),
+            image_path: Some("/tmp/live-ink/2/1.png".into()),
+            board_id: Some(3),
             created_at: "2026-01-01 00:00:00".into(),
             delivered_at: Some("2026-01-01 00:00:01".into()),
             played_at: Some("2026-01-01 00:00:02".into()),
@@ -7794,6 +7850,11 @@ mod tests {
                 // 1252): a bounded id or null, and what locates a handoff in
                 // the sequence. Kept.
                 "agent_id",
+                // The annotated board (mesa task 1353): a path and an id, or
+                // null — bounded pointers, and the very thing a `listen`
+                // caller has to act on, so a quiet echo keeps both.
+                "image_path",
+                "board_id",
                 "created_at",
                 // Both bounded (a timestamp or null), and both are fields a
                 // command exists to write: `live listen` stamps `delivered_at`

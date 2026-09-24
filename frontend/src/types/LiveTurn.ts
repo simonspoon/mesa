@@ -44,6 +44,19 @@ notice: LiveNotice | null,
  */
 agent_id: string | null, 
 /**
+ * The person's **annotated board** (mesa task 1353): an absolute path to
+ * a PNG of the whiteboard with their ink drawn over it, flattened by the
+ * page and written beside the db when this turn was sent. Only a `user`
+ * turn carries one, and only when there was new ink since the last turn
+ * — null otherwise. A bounded pointer, so `--quiet` keeps it.
+ */
+image_path: string | null, 
+/**
+ * The board that ink was drawn on — present iff `image_path` is, until
+ * the board itself is pruned past the keep bound.
+ */
+board_id: number | null, 
+/**
  * When the turn was recorded (SQLite `datetime` text, UTC).
  */
 created_at: string, 

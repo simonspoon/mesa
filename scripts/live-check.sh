@@ -110,7 +110,14 @@
 #      in default mode AND under `--lan`, the absence of any board write
 #      route, and the render route answering 404 `not_found` once the
 #      conversation has ended (the row survives like a turn's; every read of
-#      it stops);
+#      it stops); plus ink (mesa task 1353): an utterance carrying a PNG and
+#      its board id writing the PNG byte-identical under MESA_LIVE_INK_DIR
+#      with `image_path`/`board_id` on the turn (null on a plain one),
+#      `listen` printing both and `--quiet` keeping them, bad base64 / a
+#      non-PNG / an unknown or foreign board / one byte over LIVE_INK_MAX
+#      each 422 validation writing nothing, and `board keep --task`
+#      attaching the ink as `<name>-ink.png` while `--project` refuses an
+#      inked board;
 #  14. live memory v2 (mesa task 1147): the `mesa live memory` notebook CLI
 #      round trip (list/show/add/replace/delete/touch) with the `--quiet` key
 #      set (drops `body` alone; `list --quiet`/`search --quiet` are usage
@@ -188,6 +195,9 @@ trap 'rm -rf "$TMP";
       [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null;
       [ -n "${LAN_PID:-}" ] && kill "$LAN_PID" 2>/dev/null; true' EXIT
 export MESA_DB="$TMP/mesa.db"
+# Where a user turn's annotated board is written (mesa task 1353, section 13):
+# never beside the developer's own db.
+export MESA_LIVE_INK_DIR="$TMP/live-ink"
 # This gate asserts the BUILT-IN `live-agent` template, so the developer's own
 # ~/.mesa/config.json must not leak in (config-check.sh owns the configured
 # half, under a throwaway HOME).
@@ -2478,6 +2488,109 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H 'Content-Type: appl
   fail "an HTTP write must not have changed the whiteboard"
 ok "no POST/DELETE board route exists: the CLI is the only writer"
 
+# ---- ink: the person's pen on a board, riding on their next turn (task 1353) ----
+#
+# A user turn may carry the whiteboard flattened with the person's ink — a
+# base64 PNG and the board it was drawn on. The PNG is written beside the db
+# (here MESA_LIVE_INK_DIR), byte-identical, and `listen` hands the agent its
+# path. Every rule refuses before anything is written.
+printf '\x89PNG\r\n\x1a\nmesa-live-ink' > "$TMP/ink.png"
+INK_B64=$(base64 < "$TMP/ink.png" | tr -d '\n')
+api 201 POST "/api/live/utterance" \
+  "{\"text\":\"look at what I circled\",\"ink\":{\"board_id\":$R_MD,\"png_base64\":\"$INK_B64\"}}"
+INK_TURN=$(jqb .id)
+INK_PATH=$(jqb .image_path)
+[ "$(jqb .role)" = "user" ] || fail "ink utterance: role must be user"
+[ "$(jqb .board_id)" = "$R_MD" ] || fail "ink utterance: board_id must be the board drawn on"
+[ "$INK_PATH" = "$TMP/live-ink/$BS/$INK_TURN.png" ] ||
+  fail "ink utterance: the PNG lands at <ink dir>/<session>/<turn>.png, got $INK_PATH"
+cmp -s "$INK_PATH" "$TMP/ink.png" || fail "ink utterance: the written PNG must be byte-identical"
+api 201 POST "/api/live/utterance" '{"text":"no pen this time"}'
+PLAIN_TURN=$(jqb .id)
+[ "$(jqb .image_path)" = "null" ] || fail "a plain utterance carries no image_path"
+[ "$(jqb .board_id)" = "null" ] || fail "a plain utterance carries no board_id"
+ok "POST /api/live/utterance with ink: 201, the PNG written byte-identical at <ink dir>/<session>/<turn>.png with image_path + board_id on the turn; a plain turn carries null for both"
+
+# listen prints both automatically, and --quiet keeps them (bounded pointers).
+run 0 "$MESA" live listen --wait 1
+[ "$(jqs .id)" = "$INK_TURN" ] || fail "live listen: the ink turn first"
+[ "$(jqs .image_path)" = "$INK_PATH" ] || fail "live listen: must print image_path"
+[ "$(jqs .board_id)" = "$R_MD" ] || fail "live listen: must print board_id"
+run 0 "$MESA" live listen --quiet --wait 1
+[ "$(jqs .id)" = "$PLAIN_TURN" ] || fail "live listen --quiet: the plain turn next"
+jq -e 'has("image_path") and has("board_id") and (has("text") | not)' <<<"$STDOUT" >/dev/null ||
+  fail "live listen --quiet must keep image_path and board_id and drop text: $STDOUT"
+ok "live listen: prints image_path and board_id; --quiet keeps both and drops text alone"
+
+# Every refusal is 422 validation, writes no turn and no file.
+ink_files() { find "$TMP/live-ink" -type f | wc -l | tr -d ' '; }
+FILES_BEFORE=$(ink_files)
+TURNS_BEFORE=$("$MESA" live turns | jq 'length')
+api 422 POST "/api/live/utterance" \
+  "{\"text\":\"bad\",\"ink\":{\"board_id\":$R_MD,\"png_base64\":\"!!not base64!!\"}}"
+[ "$(jqb .error.code)" = "validation" ] || fail "ink with bad base64: error.code"
+GIF_B64=$(printf 'GIF89a not a png' | base64 | tr -d '\n')
+api 422 POST "/api/live/utterance" \
+  "{\"text\":\"bad\",\"ink\":{\"board_id\":$R_MD,\"png_base64\":\"$GIF_B64\"}}"
+[ "$(jqb .error.code)" = "validation" ] || fail "ink that is not a PNG: error.code"
+grep -q 'PNG' <<<"$BODY" || fail "ink that is not a PNG: the message must say PNG"
+api 422 POST "/api/live/utterance" \
+  "{\"text\":\"bad\",\"ink\":{\"board_id\":999999,\"png_base64\":\"$INK_B64\"}}"
+[ "$(jqb .error.code)" = "validation" ] || fail "ink on an unknown board: error.code"
+# One byte over the cap, read out of the source: still 422 JSON, never axum's
+# bare 413 — the utterance route's body limit sits above the cap.
+INK_MAX=$(grep -Eo 'pub const LIVE_INK_MAX: usize = [0-9]+ \* [0-9]+ \* [0-9]+' src/core/store.rs |
+  grep -Eo '[0-9]+ \* [0-9]+ \* [0-9]+$')
+[ -n "$INK_MAX" ] || fail "could not read LIVE_INK_MAX from src/core/store.rs"
+INK_MAX=$((INK_MAX))
+{ printf '\x89PNG\r\n\x1a\n'; head -c $((INK_MAX - 7)) /dev/zero; } > "$TMP/ink-big.png"
+{ printf '{"text":"too big","ink":{"board_id":%s,"png_base64":"' "$R_MD"
+  base64 < "$TMP/ink-big.png" | tr -d '\n'
+  printf '"}}'; } > "$TMP/ink-big.json"
+raw POST "/api/live/utterance" -H 'Content-Type: application/json' --data-binary "@$TMP/ink-big.json"
+[ "$STATUS" = "422" ] || fail "ink one byte over LIVE_INK_MAX: expected 422, got $STATUS"
+[ "$(jqb .error.code)" = "validation" ] || fail "ink over the cap: error.code (still JSON)"
+# A board another conversation owns is refused like an unknown one. There is
+# only ever one live session, so the foreign board is planted on the oldest
+# (ended) session directly.
+if command -v sqlite3 >/dev/null; then
+  FOREIGN=$(sqlite3 "$MESA_DB" \
+    "INSERT INTO live_boards (session_id, kind, body, created_at)
+       VALUES ((SELECT MIN(id) FROM live_sessions), 'markdown', 'elsewhere', datetime('now'));
+     SELECT last_insert_rowid();")
+  api 422 POST "/api/live/utterance" \
+    "{\"text\":\"bad\",\"ink\":{\"board_id\":$FOREIGN,\"png_base64\":\"$INK_B64\"}}"
+  [ "$(jqb .error.code)" = "validation" ] || fail "ink on another conversation's board: error.code"
+else
+  echo "skip: sqlite3 is not installed — the foreign-board ink case needs it"
+fi
+[ "$("$MESA" live turns | jq 'length')" = "$TURNS_BEFORE" ] ||
+  fail "a refused ink must write no turn"
+[ "$(ink_files)" = "$FILES_BEFORE" ] || fail "a refused ink must write no file"
+ok "ink refusals are 422 validation writing nothing: bad base64, not a PNG, an unknown board, another conversation's board, and one byte over LIVE_INK_MAX (JSON, not a bare 413)"
+
+# keep: --task attaches the newest ink beside the board; --project refuses a
+# board with ink and names --task; a board with no ink keeps as before.
+api 201 POST "/api/live/utterance" \
+  "{\"text\":\"and this\",\"ink\":{\"board_id\":$R_MD,\"png_base64\":\"$INK_B64\"}}"
+INK_TASK=$("$MESA" task create "$PROJ" "Ink gate task" | jq -r .id)
+run 0 "$MESA" live board keep --id "$R_MD" --task "$INK_TASK"
+[ "$(jqs .filename)" = "Rendered plan.md" ] || fail "board keep with ink: the board is attached as before"
+[ "$(jqs .ink.filename)" = "Rendered plan-ink.png" ] ||
+  fail "board keep with ink: the ink is <name>-ink.png, got $(jqs .ink.filename)"
+[ "$(jqs .ink.size_bytes)" = "$(wc -c < "$TMP/ink.png" | tr -d ' ')" ] ||
+  fail "board keep with ink: the ink attachment is the PNG's own bytes"
+[ "$(jqs .ink.author)" = "naru-live" ] || fail "board keep with ink: author"
+[ "$("$MESA" attachment list "$INK_TASK" | jq 'length')" = "2" ] ||
+  fail "board keep with ink: the board and its ink, two attachments"
+run 1 "$MESA" live board keep --id "$R_MD" --project "$PROJ"
+[ "$(jqe .error.code)" = "validation" ] || fail "board keep --project on an inked board: error.code"
+grep -q -- '--task' <<<"$STDERR" || fail "board keep --project on an inked board: must name --task"
+run 0 "$MESA" live board keep --id "$R_IMG" --task "$INK_TASK"
+jq -e 'has("ink") | not' <<<"$STDOUT" >/dev/null ||
+  fail "board keep on a board with no ink must print the attachment exactly as before"
+ok "live board keep: --task attaches the newest ink as <name>-ink.png under an added \`ink\` key; --project refuses an inked board naming --task; an uninked board keeps exactly as before"
+
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 SERVER_PID=
@@ -3585,7 +3698,7 @@ NP=$(jqs .id)
 ok "live notice permission: a mesa turn with the fixed sentence, no action, notice=permission"
 
 run 0 "$MESA" live notice --quiet permission
-[ "$(jq -c 'keys' <<<"$STDOUT")" = '["action","agent_id","created_at","delivered_at","id","notice","played_at","role","session_id","target"]' ] ||
+[ "$(jq -c 'keys' <<<"$STDOUT")" = '["action","agent_id","board_id","created_at","delivered_at","id","image_path","notice","played_at","role","session_id","target"]' ] ||
   fail "notice --quiet: key set (got $(jq -c keys <<<"$STDOUT"))"
 [ "$(jqs .notice)" = "permission" ] || fail "notice --quiet keeps notice"
 [ "$(jqs .id)" = "$NP" ] || fail "dedupe: a second permission notice in one span must answer the existing id"

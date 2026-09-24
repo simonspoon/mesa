@@ -27,10 +27,10 @@ function board(id: number, patch: Partial<LiveBoardSummary> = {}): LiveBoardSumm
 }
 
 describe('boardRender', () => {
-  it('renders markdown itself and frames the two document kinds', () => {
+  it('renders markdown itself, frames HTML and shows a diagram as a picture', () => {
     expect(boardRender('markdown')).toBe('markdown')
     expect(boardRender('html')).toBe('frame')
-    expect(boardRender('diagram')).toBe('frame')
+    expect(boardRender('diagram')).toBe('image')
     expect(boardRender('image')).toBe('image')
   })
 

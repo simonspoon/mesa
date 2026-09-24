@@ -984,9 +984,17 @@ export function stopLive(): Promise<LiveSession> {
  * One dictated line from the person. Free text from a microphone by way of the
  * OS — untrusted data, which is why it goes into the store as a turn and
  * reaches the agent as one argument rather than anything a shell parses.
+ * `ink` is the whiteboard the person drew on, flattened to a base64 PNG, and
+ * the board it was drawn on (mesa task 1353) — sent only with new ink.
  */
-export function sendLiveUtterance(text: string): Promise<LiveTurn> {
-  return request('/api/live/utterance', jsonInit('POST', { text }))
+export function sendLiveUtterance(
+  text: string,
+  ink?: { board_id: number; png_base64: string },
+): Promise<LiveTurn> {
+  return request(
+    '/api/live/utterance',
+    jsonInit('POST', ink === undefined ? { text } : { text, ink }),
+  )
 }
 
 /**

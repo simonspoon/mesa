@@ -42,7 +42,7 @@ use crate::core::{
     ArtifactSummary, CcDashboard, CcLiveSession, CcUsage, DiagramPatch, DiagramType, EdgeMarker,
     EdgeNew, EdgePatch, EdgeStyle, Error, FileTreeEntry, FrameNew, FramePatch, FrameShape,
     GitCommit, GitCommitFile, GitFileDiff, GitRepoView, GitStatus, GitWorktree, InboxItem,
-    InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP, LibraryBuiltinAction, LibraryBundle,
+    InboxKind, LIVE_AUDIO_MAX, LIVE_BOARD_KEEP, LIVE_INK_MAX, LibraryBuiltinAction, LibraryBundle,
     LibraryImportResult, LibraryKind, LibraryPatch, LibraryScope, LiveBoardKind, LiveContext,
     LiveNotebookEntry, LiveNotice, LiveRole, LiveState, LiveStatus, LiveTranscript, LiveWindow,
     ModelRates, NaruVersion, NextResult, Priority, ProjectAgents, ProjectFileTree, ProjectGitLog,
@@ -2134,7 +2134,13 @@ fn router(state: AppState) -> Router {
             "/api/live/memory/{id}",
             patch(replace_live_memory).delete(delete_live_memory),
         )
-        .route("/api/live/utterance", post(live_utterance))
+        // The body limit is raised above `LIVE_INK_MAX` so a turn carrying
+        // the person's annotated board (mesa task 1353) is refused, when it
+        // is, in the standard JSON shape — the attachments' reason.
+        .route(
+            "/api/live/utterance",
+            post(live_utterance).layer(DefaultBodyLimit::max(UTTERANCE_BODY_LIMIT)),
+        )
         // mesa's own status report about the agent, written as a turn (mesa
         // task 1157): the page posts it off the same poll it speaks turns
         // from. An ordinary write like the utterance, and deduped by `Store`.
@@ -3819,6 +3825,18 @@ struct LiveUtterance {
     /// What the person dictated. Required and non-empty (`Store`'s rule for a
     /// `user` turn) — there is no such thing as an empty thing said.
     text: String,
+    /// The person's annotated board (mesa task 1353), present only when they
+    /// drew on it since the last turn they sent. Absent is an ordinary turn.
+    #[serde(default)]
+    ink: Option<LiveInkBody>,
+}
+
+/// A whiteboard flattened with the person's ink over it: the PNG, base64 in
+/// JSON for the reason [`TranscribeBody`] gives, and the board it was drawn on.
+#[derive(Deserialize)]
+struct LiveInkBody {
+    board_id: i64,
+    png_base64: String,
 }
 
 #[derive(Deserialize)]
@@ -4379,18 +4397,47 @@ async fn stop_live(
 /// `core::live`), it reaches the agent as JSON out of the store, and it starts
 /// no process of its own. mesa accepts no audio here and captures no
 /// microphone — the body is text the system's own dictation typed.
+///
+/// The turn may carry **ink** (mesa task 1353): the whiteboard flattened with
+/// what the person drew on it, as a base64 PNG and the board it was drawn on.
+/// Invalid base64 is 422 here; every other rule — the PNG signature,
+/// [`LIVE_INK_MAX`], the board belonging to this conversation — and the file
+/// write are `Store::add_live_ink_turn`'s, so the CLI and the API can never
+/// disagree about what a turn's ink is.
 async fn live_utterance(
     State(state): State<AppState>,
     body: Result<Json<LiveUtterance>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(body) = body?;
+    let ink = match &body.ink {
+        Some(ink) => Some((
+            ink.board_id,
+            base64::engine::general_purpose::STANDARD
+                .decode(ink.png_base64.as_bytes())
+                .map_err(|e| ApiError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "validation",
+                    message: format!("invalid base64 ink: {e}"),
+                })?,
+        )),
+        None => None,
+    };
     let mut store = state.store.lock().unwrap();
     let Some(session) = store.current_live_session()? else {
         return Err(no_live_session());
     };
-    let turn = store.add_live_turn(session.id, LiveRole::User, &body.text, None, None)?;
+    let turn = match ink {
+        Some((board_id, png)) => store.add_live_ink_turn(session.id, &body.text, board_id, &png)?,
+        None => store.add_live_turn(session.id, LiveRole::User, &body.text, None, None)?,
+    };
     Ok((StatusCode::CREATED, Json(turn)).into_response())
 }
+
+/// Upper bound on the raw HTTP request body for the utterance route, for the
+/// reason [`ATTACHMENT_BODY_LIMIT`] gives: a turn carrying an at-cap PNG must
+/// reach `Store`'s own [`LIVE_INK_MAX`] check and its JSON error, not axum's
+/// bare 2 MiB 413.
+const UTTERANCE_BODY_LIMIT: usize = LIVE_INK_MAX * 4 / 3 + 1024 * 1024;
 
 /// mesa's own report about the agent — blocked on a permission prompt, or
 /// silent too long — recorded as a `mesa` turn so it is spoken once (mesa
@@ -15904,6 +15951,7 @@ echo "backgrounded · deadbeef (idle — send a prompt to start)"
             State(state.clone()),
             Ok(Json(LiveUtterance {
                 text: "hello".into(),
+                ink: None,
             })),
         )
         .await

@@ -548,8 +548,14 @@ turns (schema enforces none of it, per CLAUDE.md):
   a caller bug, so it is a **`validation`** error rather than a swallowed
   write — and deliberately not `not_found`, because the session is right there,
   it is just over.
-- A **`user`** turn carries non-empty text and nothing else: the page dictates,
-  it does not drive itself.
+- A **`user`** turn carries non-empty text and no action: the page dictates,
+  it does not drive itself. It may also carry the person's **ink** — a PNG of
+  the whiteboard with what they drew on it, and the board it was drawn on
+  (`image_path`, `board_id`, mesa task 1353) — written only by
+  `Store::add_live_ink_turn`, which refuses anything but a PNG of at most
+  `LIVE_INK_MAX` (8 MiB) drawn on a board of this conversation, as
+  `validation`, before anything is written. No other role can carry ink. See
+  [Ink](#ink-the-persons-pen-on-a-board-mesa-task-1353).
 - A **`naru`** turn must say something **or** do something. Empty text is legal
   exactly on a pure action turn, which changes the page and speaks nothing.
   Naru's side is written as `naru` since mesa task 1319; a row written before
@@ -1287,7 +1293,7 @@ artifacts list.
 | --- | --- | --- |
 | `markdown` | markdown source | `text/markdown; charset=utf-8` — the page's own `<Markdown>` |
 | `html` | a whole HTML document | `text/html; charset=utf-8` in a sandboxed `<iframe>` |
-| `diagram` | SVG markup, rendered **at push time** | `image/svg+xml; charset=utf-8`, likewise sandboxed |
+| `diagram` | SVG markup, rendered **at push time** | `image/svg+xml; charset=utf-8`, served under the same CSP, shown in an `<img>` (mesa task 1353) |
 | `image` | base64 of the file's bytes | the allowlisted image mime, in an `<img>` |
 
 Two of those choices are load-bearing:
@@ -1365,6 +1371,64 @@ would be a framed document re-laying itself out on every frame. Only
 `clip-path` animates here, which is the same rule the open/close already
 follows.
 
+### Ink: the person's pen on a board (mesa task 1353)
+
+The panel's head carries a **pen** toggle. With it on, a drag draws on a canvas
+laid exactly over the board, with **undo** and **clear** beside it; with it off
+the canvas takes no pointer at all, so the board scrolls and an HTML mockup
+takes clicks exactly as before. The ink is the person's and **local**: held
+in the page per board id (`frontend/src/liveInk.ts`), never on a newly pushed
+board, and seen by the agent only when the person next sends a turn.
+
+- **The first unsent stroke freezes the layout.** Strokes are pixels over
+  content, so nothing may move the content under them: no resize handle, no
+  maximise or restore, no Escape, no stepping between boards, no closing the
+  panel, and no scroll — the content box's px width and height are pinned
+  inline and its overflow hidden (with the scrollbar's gutter kept where it
+  had one, so text does not reflow into the freed width), which holds even when
+  the browser window is resized. Size, maximise or collapse the board freely
+  *before* drawing. A board pushed meanwhile does **not** take the panel away
+  (`heldBoardView`); the moment the freeze lifts the ordinary "newest board is
+  showing" rule shows it. The freeze lifts when the turn carrying the ink is
+  sent, or when the ink is cleared.
+- **New ink rides on the next user turn.** "New" is a dirty flag: set by a
+  stroke, and by an undo that changes what the agent last saw; cleared when a
+  turn carrying it posts successfully (a failed post keeps it), and by
+  clearing. With no new ink a turn carries no image. A typed turn carries it;
+  a spoken recording flushed as several turns puts it on the **last** of them
+  (`inkCarrier`), and the mid-recording posts the 8 KiB cap forces carry none.
+  Sent ink stays drawn on its board for the rest of the session, in memory.
+- **Flattening is the page's**, on an offscreen canvas at the frozen size ×
+  `devicePixelRatio` (redrawn at 1× if the PNG would pass the cap), the board
+  underneath and the strokes on top in a saturated magenta:
+  - `image`: the `<img>`'s own pixels, drawn where it sits;
+  - `diagram`: the SVG fetched again from the same-origin render route and
+    drawn from a Blob URL where its `<img>` sits — which is why a diagram
+    board is now an `<img>` rather than a frame: an `<img>` lays the picture
+    out exactly as the flatten draws it back, and runs no script in it;
+  - `markdown`: the content box cloned with every element's computed style
+    inlined, into an SVG `<foreignObject>`, shifted by the frozen scroll and
+    cut to the visible window;
+  - `html`: an opaque sandboxed frame no page can read back, so a white sheet
+    with a caption strip naming the board's title and kind.
+  Any background that fails to draw, or taints the canvas (Safari's answer to
+  a `<foreignObject>`), falls back to that white-and-caption sheet. The ink
+  itself is never dropped.
+- **The server** takes it on `POST /api/live/utterance` as
+  `ink: {board_id, png_base64}` and writes it through `Store::add_live_ink_turn`:
+  PNG signature, `LIVE_INK_MAX` (8 MiB decoded) and the board belonging to this
+  session, else 422 `validation` with nothing written; then the turn, the file
+  at `<ink dir>/<session>/<turn>.png` and the row's `image_path`/`board_id`
+  as one savepoint, so a failed file write leaves no turn behind. The ink dir
+  is `live-ink/` beside the db, or `NARU_LIVE_INK_DIR`/`MESA_LIVE_INK_DIR`
+  (the gates' seam). `live_turns.image_path`/`board_id` arrive at migration
+  index **76**; `board_id` is `ON DELETE SET NULL`, so a board pruned past the
+  keep bound leaves the image and loses only the link.
+- **The agent** sees both on the turn `naru live listen` prints — `--quiet`
+  keeps them, bounded pointers — and its definition (rules 1 and 7) tells it
+  to open the PNG with its image tool before answering, and that `board_id`
+  works with `naru live board show`.
+
 ### CLI
 
 `mesa live board` — five verbs, each on THE current session like the rest of
@@ -1376,7 +1440,7 @@ the group (with none live, `not_found` naming `mesa live start`).
 | `live board show [ID]` (alias `get`) | `--quiet`; without an ID, the board that is showing | one `LiveBoard` |
 | `live board list` | `--limit <N>` (clamped to 1..=20) | a bare array of bodiless summaries, oldest first |
 | `live board clear` | `--quiet` | the summaries it destroyed |
-| `live board keep` | exactly one of `--project <ID\|NAME>` / `--task <ID>`; plus `--id <BOARD>`, `--name <NAME>`, `--quiet` | the created `Artifact` / `Attachment` |
+| `live board keep` | exactly one of `--project <ID\|NAME>` / `--task <ID>`; plus `--id <BOARD>`, `--name <NAME>`, `--quiet` | the created `Artifact` / `Attachment`, plus an `ink` key when `--task` keeps a board with ink |
 
 - **The source is a required `ArgGroup`**: exactly one of the body, `--file`,
   `--image` and `--diagram`. None or two is `usage`, exit 2. `--kind` names one
@@ -1408,7 +1472,13 @@ the group (with none live, `not_found` naming `mesa live start`).
   authored `naru-live`, carrying the decoded bytes for an image board and the
   document's own bytes otherwise. An `image` board **cannot** be an artifact —
   `ARTIFACT_CONTENT_TYPES` has no raster mime — and the refusal says so and
-  names `--task`. `--name` defaults from the board's title, else
+  names `--task`. **`keep` keeps the board with its ink** (mesa task 1353):
+  `--task` also attaches the newest PNG a turn carried for that board as
+  `<stem>-ink.png` (`board::ink_filename`, so `plan.md` keeps beside
+  `plan-ink.png`) and prints it under an added `ink` key — every key a caller
+  already read stays where it was — while `--project` refuses a board with ink
+  exactly as it refuses an image, naming `--task`. A board nobody drew on
+  keeps exactly as before. `--name` defaults from the board's title, else
   `board-<id>`, plus the extension its kind implies (`core::board::filename`,
   the same function the render route's `Content-Disposition` uses, so the two
   can never disagree).
@@ -1450,8 +1520,11 @@ the conversation panel's own: closing a picture is not a write.
 
 ### What is deliberately absent
 
-- **No annotation, no drawing, no pointing.** The person talks; the agent
-  pushes. A shared cursor is a different feature with a different transport.
+- **No live pointing, and no ink the agent draws.** The person has a pen
+  (mesa task 1353), but what they draw reaches the agent only on their next
+  turn, as a picture — there is no shared cursor and no stroke stream, which
+  would be a different feature with a different transport — and the agent
+  still speaks and pushes; it never draws on a board.
 - **No editing a board after the push.** Each push replaces what is showing,
   which is what makes a board a snapshot rather than a document with a history.
   A board that needs to change is a new board.
@@ -1672,7 +1745,7 @@ flag is an unknown argument, exit 2, exactly as on `turns`.
 | `live board show [ID]` (alias `get`) | without an ID, the board that is showing | one `LiveBoard` |
 | `live board list` | `--limit <N>` (clamped to 1..=20) | a bare array of bodiless summaries, oldest first |
 | `live board clear` | — | the summaries it destroyed |
-| `live board keep` | exactly one of `--project <ID\|NAME>` / `--task <ID>`, plus `--id`, `--name` | the created `Artifact` / `Attachment` |
+| `live board keep` | exactly one of `--project <ID\|NAME>` / `--task <ID>`, plus `--id`, `--name` | the created `Artifact` / `Attachment` — with an added `ink` key (the ink's own `Attachment`) when `--task` keeps a board the person drew on |
 
 `turns` is the **transcript**, not the queue: both roles, including turns
 already delivered or spoken, and reading it delivers nothing. Only `listen`
@@ -1792,7 +1865,7 @@ takes exactly one value.
 | `GET /api/live?after=<id>` | one `LiveState` | standard read |
 | `POST /api/live` `{project_id?}` | the started session | `require_agent_access` |
 | `DELETE /api/live` | the ended session | `require_agent_access` |
-| `POST /api/live/utterance` `{text}` | the dictated user turn | standard write |
+| `POST /api/live/utterance` `{text, ink?: {board_id, png_base64}}` | the dictated user turn, carrying the person's annotated board when `ink` is sent (mesa task 1353; body limit raised above `LIVE_INK_MAX`, so an over-cap PNG is 422 JSON) | standard write |
 | `POST /api/live/notice` `{kind}` | the notice turn, **200** created or existing (deduped per working span, mesa task 1157); an unknown `kind` is 422 | standard write |
 | `POST /api/live/route` `{route, context?, window?}` | the session, route, context **and window box** recorded — an omitted `context`/`window` leaves the stored one alone, an explicit `null` clears it | standard write |
 | `POST /api/live/speaker` `{client}` | the session, this client now its **speaker** (mesa task 1267) | `require_agent_access` |

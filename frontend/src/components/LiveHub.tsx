@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
 import { LiveBand } from './LiveBand'
-import { LiveBoardPanel } from './LiveBoardPanel'
+import { LiveBoardPanel, type InkFlatten } from './LiveBoardPanel'
 import { LiveMeter } from './LiveMeter'
 import {
   claimLiveSpeaker,
@@ -45,6 +45,14 @@ import {
 } from '../liveCapture'
 import { currentContext, sameContext, subscribeContext } from '../liveContext'
 import { mayHold, SegmentChain } from '../liveDrain'
+import {
+  emptyInkBook,
+  inkCarrier,
+  markInkSent,
+  pendingInk,
+  pruneInk,
+  type InkBook,
+} from '../liveInk'
 import { isPausePhrase } from '../livePausePhrase'
 import { liveClientId, spokenTurnVerdict } from '../liveSpeaker'
 import {
@@ -906,6 +914,23 @@ export function LiveHub({
   const nextBoardPanel = boardPanelFor(boardPanel, boards)
   if (nextBoardPanel !== boardPanel) setBoardPanel(nextBoardPanel)
 
+  // The person's ink on the boards (mesa task 1353), by board id — held here
+  // rather than in the panel because a turn this component sends is what
+  // carries it (`post`). Local to this browser until then. A board that leaves
+  // the history takes its ink with it; only once the poll has answered, since
+  // `boards` is empty before that and would read as every board gone.
+  const [ink, setInk] = useState<InkBook>(emptyInkBook)
+  if (data) {
+    const prunedInk = pruneInk(ink, boards)
+    if (prunedInk !== ink) setInk(prunedInk)
+  }
+  const inkRef = useRef(ink)
+  useEffect(() => {
+    inkRef.current = ink
+  }, [ink])
+  // The panel's flatten, which only it can perform — it sees the pixels.
+  const flattenInk = useRef<InkFlatten | null>(null)
+
   // The transcript follows the conversation: a spoken reply the reader cannot
   // see is the one thing the panel must never do. The clip-hidden closed state
   // still lays out, so this works whether or not it is open.
@@ -1195,7 +1220,9 @@ export function LiveHub({
   // The recognizer's handlers are set once per start and post sentences long
   // after the render that installed them, so they read through a ref rather
   // than a closure over a stale `post`.
-  const postRef = useRef<(text: string) => Promise<void>>(() => Promise.resolve())
+  const postRef = useRef<(text: string, carriesInk?: boolean) => Promise<void>>(() =>
+    Promise.resolve(),
+  )
   const draftRef = useRef('')
 
   /** The one write path for the draft: state for the render, a ref for `send`. */
@@ -1333,8 +1360,11 @@ export function LiveHub({
     setInterimNow('')
     if (!armed.current.live) return
     if (texts.length > 0 && typed.trim() !== '') updateDraft('')
-    texts.reduce(
-      (queue, text) => queue.then(() => postRef.current(text)),
+    // The ink, if there is new ink, rides on the last turn of the flush
+    // (mesa task 1353), with the whole of what was said about it.
+    const carrier = inkCarrier(texts.length)
+    texts.reduce<Promise<void>>(
+      (queue, text, i) => queue.then(() => postRef.current(text, i === carrier)),
       Promise.resolve(),
     )
   }, [setInterimNow, setRecordingNow, updateDraft])
@@ -1618,7 +1648,7 @@ export function LiveHub({
           // person's own switch is what ends it. `flush` is only the cap.
           const grown = heldWith(recordingRef.current, text)
           setRecordingNow(grown.held)
-          if (grown.flush !== null) void postRef.current(grown.flush)
+          if (grown.flush !== null) void postRef.current(grown.flush, false)
         }
       } catch (err: unknown) {
         if (!running && !outlives) return
@@ -2177,7 +2207,7 @@ export function LiveHub({
           // person's own switch is what ends it. `flush` is only the cap.
           const grown = heldWith(recordingRef.current, text)
           setRecordingNow(grown.held)
-          if (grown.flush !== null) void postRef.current(grown.flush)
+          if (grown.flush !== null) void postRef.current(grown.flush, false)
         }
       }
       engine.onerror = (event) => {
@@ -2676,21 +2706,44 @@ export function LiveHub({
    * recording that had to be split is still one thing the person said, and
    * two overlapping writes could land the halves the wrong way round.
    */
-  function post(text: string) {
-    return sendLiveUtterance(text).then(
-      () => {
-        refetch()
-      },
-      (err: unknown) => {
-        setActionError(err instanceof Error ? err.message : String(err))
-        // The failure is only visible inside the panel, so a closed one opens.
-        setOpen(true)
-        // The line was never recorded, so it belongs back in the box rather
-        // than lost — re-dictating it is the one thing a person cannot redo.
-        // It goes back in unmarked: Enter is simply how it is retried.
-        if (draftRef.current === '') updateDraft(text)
-      },
-    )
+  function post(text: string, carriesInk = true) {
+    // New ink on the whiteboard (mesa task 1353) rides on this turn as a PNG
+    // the panel flattens now — at the frozen size, since the layout stays
+    // frozen until the send succeeds. A turn that is a piece of a longer
+    // recording leaves it to the last piece. A flatten that fails sends the
+    // words alone and leaves the ink new, for the next turn to carry.
+    const pending = carriesInk ? pendingInk(inkRef.current) : null
+    const flatten = flattenInk.current
+    const drawn: Promise<string | null> =
+      pending !== null && pending.frame !== null && flatten !== null
+        ? flatten(pending.boardId, pending.strokes, pending.frame).catch(() => null)
+        : Promise.resolve(null)
+    return drawn
+      .then((png) => {
+        const carried = pending !== null && png !== null ? { ...pending, png } : null
+        return sendLiveUtterance(
+          text,
+          carried === null ? undefined : { board_id: carried.boardId, png_base64: carried.png },
+        ).then(() => carried)
+      })
+      .then(
+        (carried) => {
+          if (carried !== null) {
+            setInk((book) => markInkSent(book, carried.boardId, carried.strokes))
+          }
+          refetch()
+        },
+        (err: unknown) => {
+          setActionError(err instanceof Error ? err.message : String(err))
+          // The failure is only visible inside the panel, so a closed one opens.
+          setOpen(true)
+          // The line was never recorded, so it belongs back in the box rather
+          // than lost — re-dictating it is the one thing a person cannot redo.
+          // It goes back in unmarked: Enter is simply how it is retried. The
+          // ink it carried is not marked sent, so it is still new.
+          if (draftRef.current === '') updateDraft(text)
+        },
+      )
   }
   useEffect(() => {
     postRef.current = post
@@ -3297,6 +3350,9 @@ export function LiveHub({
             boards={boards}
             open={nextBoardPanel.open}
             onClose={() => setBoardPanel((panel) => ({ ...panel, open: false }))}
+            ink={ink}
+            onInk={setInk}
+            flattenRef={flattenInk}
           />,
           boardSlot,
         )}

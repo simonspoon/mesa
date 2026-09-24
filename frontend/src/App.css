@@ -9643,6 +9643,46 @@ button:focus-visible,
   white-space: nowrap;
 }
 
+/* The stage (mesa task 1353): the content box, and the ink canvas laid
+   exactly over it. Positioned so the canvas can sit at its top-left corner,
+   and it takes the room the content box used to take. */
+.live-board-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The ink. It does not scroll — the content under it does, and the strokes
+   are redrawn against that scroll — and it takes no pointer until the pen is
+   on, so a board with the pen down scrolls and its frame takes clicks exactly
+   as before. */
+.live-board-ink {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+
+.live-board-ink.drawing {
+  pointer-events: auto;
+  cursor: crosshair;
+  /* A finger on the phone tier draws rather than scrolls the page. */
+  touch-action: none;
+}
+
+/* Frozen for unsent ink, a framed document may not scroll either: its own
+   scroll would move the mockup out from under the strokes. */
+.live-board-content.inked iframe {
+  pointer-events: none;
+}
+
+.live-board-pen[aria-pressed='true'] {
+  color: #ff2bd6;
+  border-color: rgba(255, 43, 214, 0.5);
+}
+
 /* The board itself gets everything the head does not. `overflow: auto` on
    both axes: a board wider than the panel scrolls sideways rather than being
    cut off, which is the whole reason the panel can now be widened at all. */
@@ -9676,9 +9716,11 @@ button:focus-visible,
   object-fit: contain;
 }
 
+/* Grows to its content rather than scrolling itself, so the content box is
+   the one scroller on every kind — the one scroll the ink is drawn against
+   and the pen's freeze locks (mesa task 1353). */
 .live-board-markdown {
-  flex: 1;
-  overflow: auto;
+  flex: 1 0 auto;
 }
 
 /* The head (mesa task 1069): the panel's instrument cluster — three stacked

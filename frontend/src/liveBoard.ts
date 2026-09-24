@@ -26,8 +26,8 @@ import type { LiveBoardSummary } from './types/LiveBoardSummary'
 
 /**
  * How a board's body reaches the screen. Three answers for four kinds:
- * `html` and `diagram` are both documents served under the render CSP, and
- * the browser is what parses them — a sandboxed frame, never mesa's own DOM.
+ * `html` is a document served under the render CSP, and the browser is what
+ * parses it — a sandboxed frame, never mesa's own DOM.
  */
 export type BoardRender = 'markdown' | 'frame' | 'image'
 
@@ -39,13 +39,17 @@ export type BoardRender = 'markdown' | 'frame' | 'image'
  * one kind that is *never* framed as a document, which is why it can be
  * rendered in mesa's own DOM at all (`components/Markdown.tsx` passes no raw
  * HTML through). `image` is an `<img>`, so the browser never treats the
- * bytes as markup. Everything else is a frame: an unknown kind arriving from
- * a newer server must land on the *safest* branch, not the most permissive
- * one, so `frame` is the default rather than a special case.
+ * bytes as markup — and so is a `diagram` (mesa task 1353): its SVG is a
+ * static picture Naru rendered, an `<img>` runs no script in it at all, and
+ * it lays the picture out exactly as the pen's flatten draws it back, which
+ * a framed document's own layout does not promise. Everything else is a
+ * frame: an unknown kind arriving from a newer server must land on the
+ * *safest* branch, not the most permissive one, so `frame` is the default
+ * rather than a special case.
  */
 export function boardRender(kind: LiveBoardKind): BoardRender {
   if (kind === 'markdown') return 'markdown'
-  if (kind === 'image') return 'image'
+  if (kind === 'image' || kind === 'diagram') return 'image'
   return 'frame'
 }
 
